@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+# 中间结果（可由脚本重新生成）
+out/**/coarse_nojoint/
+out/raised25/fine_nonrobust/
+out/**/profile.pkl
