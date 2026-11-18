@@ -197,7 +197,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
       <h2 id="h-print">打印与装配</h2>
       <ol class="steps">
         <li id="step1"></li>
-        <li>横梁 40 mm 宽面贴床。三件都不需要加支撑。</li>
+        <li id="step2"></li>
         <li>PETG 或 PLA，层高 0.2 mm，3–4 圈墙，15–20% gyroid 填充。</li>
         <li>横梁两端的卡扣对准支撑上的方槽，用力推入，听到“咔”一声就扣住了。不需要螺钉。</li>
         <li>拆卸时从支撑外侧把两个卡钩往里捏，再把支撑拔出来。横梁建议用 PETG，反复拆装更耐用。</li>
@@ -244,7 +244,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     PARTS = {
       left:   {name: '支撑（左）', dims: dimS, mass: MASS.support_each, note: '左右两片完全相同，打印两份即可；任一侧面贴床', color: '--part'},
       right:  {name: '支撑（右）', dims: dimS, mass: MASS.support_each, note: '与左边是同一个零件，只是装配时翻过来', color: '--part'},
-      beam:   {name: '横梁', dims: dimB, mass: MASS.beam, note: '40 mm 宽面贴床，两端各一对卡扣，不用螺钉', color: '--beam'}
+      beam:   {name: '横梁 × ' + P.joints.length, dims: dimB, mass: MASS.beam, note: (P.joints.length > 1 ? P.joints.length + ' 根是同一个零件（' + P.joints.map(function(j){ return j.cn; }).join(' / ') + '），打印 ' + P.joints.length + ' 份；' : '') + '40 mm 宽面贴床，两端卡扣，不用螺钉', color: '--beam'}
     };
   }
 
@@ -262,7 +262,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
       ['外形 深 × 宽 × 高', fmt(SUP.size[0]) + ' × ' + fmt(P.S + P.T) + ' × ' + fmt(SUP.size[1]) + ' mm'],
       ['屏幕上沿离桌（估算）', '≈ ' + tip.push_height_mm + ' mm'],
       ['屏幕竖直需转轴开到', '≥ ' + (90 + P.theta) + '°'],
-      ['打印量（估算）', '≈ ' + MASS.total + ' g，共 3 件'],
+      ['打印量（估算）', '≈ ' + MASS.total + ' g，共 ' + (2 + (MASS.beams || 1)) + ' 件'],
       ['最小特征', '杆宽 ' + info.min_member_mm + ' mm · 孔宽 ' + info.min_hole_mm + ' mm'],
       ['150 N 误用', '最大应力 ' + maxVM.toFixed(1) + ' MPa' + (atLip ? '（在前挡区）' : '')]
     ];
@@ -279,7 +279,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     $('#fe tbody').innerHTML = fe.map(function(r){
       var vm = r['最大VonMises_MPa'], lip = r['前挡区最大VM_MPa'];
       var hot = lip !== undefined && Math.abs(lip - vm) < 1e-9;
-      return '<tr' + (/误用/.test(r['工况']) ? ' class="abuse"' : '') + '><td class="n">' + (NAME[r['工况']] || r['工况']) + '</td><td>' + (LOAD[r['工况']] || '') +
+      return '<tr' + (/误用/.test(r['工况']) ? ' class="abuse"' : '') + '><td class="n">' + (NAME[r['工况']] || r['工况'].replace('横梁·', '横梁传力·')) + '</td><td>' + (LOAD[r['工况']] || (/^横梁/.test(r['工况']) ? '8 / −15 N' : '')) +
         '</td><td class="r">' + (r['最大位移_mm'] * 1000).toFixed(1) + '</td><td class="r">' + vm.toFixed(2) +
         '</td><td class="r' + (hot ? ' hot' : '') + '">' + (lip === undefined ? '—' : lip.toFixed(2)) + '</td></tr>';
     }).join('');
@@ -288,6 +288,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     var oneTray = SUP.size[0] <= D.bed.w - 10 && 2 * SUP.size[1] + 10 <= D.bed.d - 10;
     $('#step1').textContent = '两片支撑是同一个零件，打印两份，任一侧面贴床。' +
       (oneTray ? '在 ' + D.bed.name + '（' + D.bed.w + ' × ' + D.bed.d + ' mm）上两片可以同一盘打印。' : '每片 ' + fmt(SUP.size[0]) + ' × ' + fmt(SUP.size[1]) + ' mm，' + D.bed.name + ' 上需各占一盘。');
+    $('#step2').textContent = (P.joints.length > 1 ? P.joints.length + ' 根横梁是同一个零件，打印 ' + P.joints.length + ' 份，可以排在同一盘；' : '横梁') + '40 mm 宽面贴床。所有零件都不需要加支撑。';
     $('#files').innerHTML = '模型文件在 <code>out/' + cur + '/model/</code>：support_left.stl、support_right.stl、beam.stl、assembly.step。改 <code>params.py</code> 后运行 <code>./run_all.sh</code> 重新生成。';
   }
 
@@ -311,8 +312,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     s.push('<path class="pf" fill-rule="evenodd" d="' + d + '"/>');
     s.push('<path class="lap" d="' + lap + '"/>');
     s.push('<text class="lbl mute" text-anchor="middle" x="' + tl[0].toFixed(1) + '" y="' + Y(tl[1]).toFixed(1) + '" transform="rotate(' + (-P.theta) + ' ' + tl[0].toFixed(1) + ' ' + Y(tl[1]).toFixed(1) + ')">笔记本底面（示意）</text>');
-    s.push('<rect class="pk" rx="1" x="' + (P.JX - pw / 2).toFixed(1) + '" y="' + Y(P.JY + ph / 2).toFixed(1) + '" width="' + pw.toFixed(1) + '" height="' + ph.toFixed(1) + '"/>');
-    s.push('<text class="lbl" text-anchor="end" x="' + (P.JX - pw / 2 - 5).toFixed(1) + '" y="' + (Y(P.JY) + 3).toFixed(1) + '">横梁接口</text>');
+    P.slots.forEach(function(r){ s.push('<path class="pk" d="' + ring(r) + '"/>'); });
     s.push('<path class="dim dash" d="M' + pt(R) + 'L' + pt([R[0] + r + 8, R[1]]) + 'M' + pt(R) + 'L' + pt(ray) + '"/>');
     s.push('<path class="dim" d="M' + pt(a1) + 'A' + r + ' ' + r + ' 0 0 0 ' + pt(a2) + '"/>');
     s.push('<text class="dt" x="' + (la[0] + 2).toFixed(1) + '" y="' + (Y(la[1]) + 3).toFixed(1) + '">' + P.theta + '°</text>');
@@ -384,7 +384,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     $('#density').hidden = which !== 'dens';
     $$('[data-fig]').forEach(function(b){ b.setAttribute('aria-pressed', String(b.getAttribute('data-fig') === which)); });
     $('#figcap').textContent = which === 'shape'
-      ? '蓝色为成品轮廓，虚线为笔记本底面，橙色虚线框为横梁卡扣穿过的贯通方槽。单位 mm。'
+      ? '蓝色为成品轮廓，虚线为笔记本底面，橙色虚线框为 ' + P.joints.length + ' 根横梁卡扣穿过的贯通方槽（' + P.joints.map(function(j){ return j.cn; }).join(' / ') + '）。单位 mm。'
       : '优化直接得到的材料密度（1 mm 网格，深色为实体），虚线为设计域。成品轮廓由它平滑后，再与顶面、前挡、底边、接口等非设计区合并得到。';
   }
 
@@ -490,41 +490,49 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
         var em = new THREE.LineBasicMaterial({color: new THREE.Color(css('--edge')), transparent: true, opacity: 0.3});
         mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 35), em));
         var grp = new THREE.Group(); grp.add(mesh); group.add(grp);
-        return {key: key, grp: grp, mesh: mesh, mat: mat, em: em};
+        return {key: key, grp: grp, mesh: mesh, mat: mat, em: em, colorVar: colorVar};
       }
-      o.parts = {
-        left: makePart(buildGeometry(SUP, false), 'left', '--part'),
-        right: makePart(buildGeometry(SUP, true), 'right', '--part'),
-        beam: makePart(buildGeometry(BM, false), 'beam', '--beam')
-      };
+      var nb = P.joints.length, beamGeo = buildGeometry(BM, false);
+      o.parts = {left: makePart(buildGeometry(SUP, false), 'left', '--part'), right: makePart(buildGeometry(SUP, true), 'right', '--part')};
+      P.joints.forEach(function(j, i){ o.parts['beam' + i] = makePart(beamGeo, 'beam', '--beam'); });
       var half = P.S / 2 + P.T / 2, zc = P.X_MAX / 2;
       var cx = SUP.min[0] + SUP.size[0] / 2, cy = SUP.min[1] + SUP.size[1] / 2;
-      var zBeam = zc - P.JX - P.BW / 2;
       o.POSES = {
-        asm:   {left: [new V3(-half, 0, zc), qAsm], right: [new V3(half, 0, zc), qAsm], beam: [new V3(0, P.JY, zBeam), qId]},
-        exp:   {left: [new V3(-half - EXP, 0, zc), qAsm], right: [new V3(half + EXP, 0, zc), qAsm], beam: [new V3(0, P.JY, zBeam), qId]},
-        print: null
+        asm:   {left: [new V3(-half, 0, zc), qAsm], right: [new V3(half, 0, zc), qAsm]},
+        exp:   {left: [new V3(-half - EXP, 0, zc), qAsm], right: [new V3(half + EXP, 0, zc), qAsm]},
+        print: {}
       };
-      /* 打印摆放：两片支撑放得下就同盘（上下排列），横梁另一盘；否则每件一盘 */
+      /* 横梁：打印坐标 X 沿轴、Y 为截面长边 a、Z 为短边 b；a 在支撑轮廓里与水平成 phi 角 */
+      P.joints.forEach(function(j, i){
+        var ph = j.phi * Math.PI / 180, c = Math.cos(ph), s = Math.sin(ph);
+        var q = quatBasis([1, 0, 0], [0, s, -c], [0, c, s]);
+        var p = new V3(0, j.y - P.BW / 2 * c, zc - (j.x + P.BW / 2 * s));
+        o.POSES.asm['beam' + i] = [p, q];
+        o.POSES.exp['beam' + i] = [p.clone(), q];
+      });
+      /* 打印摆放：两片支撑放得下就同盘（上下排列），横梁排在另一盘；否则每件一盘 */
       var sy = SUP.size[1], gap = 10;
+      function beamZ(i){ return (i - (nb - 1) / 2) * (P.BH + 15); }
       if (SUP.size[0] <= BED.w - 10 && 2 * sy + gap <= BED.d - 10){
         var ax = -(BED.w / 2 + 25), bx = BED.w / 2 + 25;
         o.plates = [ax, bx];
-        o.POSES.print = {left: [new V3(ax - cx, 0, cy - gap / 2 - sy / 2), qPL], right: [new V3(ax - cx, 0, -cy + gap / 2 + sy / 2), qPR], beam: [new V3(bx, 0, 0), qPL]};
-        o.labels = [{t: '第 1 盘 · 左右支撑 ' + dimS, p: new V3(ax, 0, BED.d / 2 + 14)}, {t: '第 2 盘 · 横梁 ' + dimB, p: new V3(bx, 0, BED.d / 2 + 14)}];
+        o.POSES.print.left = [new V3(ax - cx, 0, cy - gap / 2 - sy / 2), qPL];
+        o.POSES.print.right = [new V3(ax - cx, 0, -cy + gap / 2 + sy / 2), qPR];
+        P.joints.forEach(function(j, i){ o.POSES.print['beam' + i] = [new V3(bx, 0, beamZ(i)), qPL]; });
+        o.labels = [{t: '第 1 盘 · 支撑 ×2  ' + dimS, p: new V3(ax, 0, BED.d / 2 + 14)}, {t: '第 2 盘 · 横梁 ×' + nb + '  ' + dimB, p: new V3(bx, 0, BED.d / 2 + 14)}];
         o.printScale = 1;
       } else {
         var xs = [-(BED.w + 30), 0, BED.w + 30];
         o.plates = xs;
-        o.POSES.print = {left: [new V3(xs[0] - cx, 0, cy), qPL], right: [new V3(xs[1] - cx, 0, -cy), qPR], beam: [new V3(xs[2], 0, 0), qPL]};
-        o.labels = [{t: '左支撑 · ' + dimS, p: new V3(xs[0], 0, BED.d / 2 + 14)}, {t: '右支撑 · ' + dimS, p: new V3(xs[1], 0, BED.d / 2 + 14)}, {t: '横梁 · ' + dimB, p: new V3(xs[2], 0, BED.d / 2 + 14)}];
+        o.POSES.print.left = [new V3(xs[0] - cx, 0, cy), qPL];
+        o.POSES.print.right = [new V3(xs[1] - cx, 0, -cy), qPR];
+        P.joints.forEach(function(j, i){ o.POSES.print['beam' + i] = [new V3(xs[2], 0, beamZ(i)), qPL]; });
+        o.labels = [{t: '支撑 · ' + dimS, p: new V3(xs[0], 0, BED.d / 2 + 14)}, {t: '支撑 · ' + dimS, p: new V3(xs[1], 0, BED.d / 2 + 14)}, {t: '横梁 ×' + nb + ' · ' + dimB, p: new V3(xs[2], 0, BED.d / 2 + 14)}];
         o.printScale = 1.4;
       }
       o.screwMat = new THREE.MeshStandardMaterial({color: new THREE.Color(css('--metal')), roughness: 0.4, metalness: 0.3, transparent: true, opacity: 1});
-      var screwG = new THREE.LatheGeometry([new THREE.Vector2(0, 0), new THREE.Vector2(4, 0), new THREE.Vector2(2, 2), new THREE.Vector2(2, 15.4), new THREE.Vector2(1.3, 16), new THREE.Vector2(0, 16)], 28);
       o.screws = [];   /* 卡扣连接，不再有螺钉 */
-      screwG.dispose();
-      o.screwPos = function(s, mode){ var off = mode === 'asm' ? 0 : EXP + 45; return new V3(s.side * (half + off), P.JY + s.dy, zc - P.JX); };
+      o.screwPos = function(){ return new V3(); };
       o.lapMat = new THREE.MeshStandardMaterial({color: new THREE.Color(css('--laptop')), transparent: true, opacity: 0.22, roughness: 0.5, depthWrite: false});
       o.lapEdge = new THREE.LineBasicMaterial({color: new THREE.Color(css('--laptop')), transparent: true, opacity: 0.6});
       o.lap = new THREE.Group();
@@ -547,7 +555,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
         o.beds.add(b);
       });
       group.add(o.beds);
-      o.pickables = [o.parts.left.mesh, o.parts.right.mesh, o.parts.beam.mesh].concat(o.screws.map(function(s){ return s.m; }));
+      o.pickables = Object.keys(o.parts).map(function(k){ return o.parts[k].mesh; });
       return o;
     }
     function disposeVariant(o){
@@ -606,7 +614,8 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     function applyHighlight(){
       var key = state.hoverList || state.hoverCanvas;
       if (VG){
-        [VG.parts.left, VG.parts.right, VG.parts.beam].forEach(function(p){
+        Object.keys(VG.parts).forEach(function(k){
+          var p = VG.parts[k];
           if (p.key === key) p.mat.emissive.copy(p.mat.color).multiplyScalar(0.35); else p.mat.emissive.setRGB(0, 0, 0);
         });
         if (key === 'screws') VG.screwMat.emissive.setRGB(0.3, 0.3, 0.3); else VG.screwMat.emissive.setRGB(0, 0, 0);
@@ -639,8 +648,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
     function applyTheme(){
       scene.background = new THREE.Color(css('--scene'));
       if (VG){
-        VG.parts.left.mat.color.set(css('--part')); VG.parts.right.mat.color.set(css('--part')); VG.parts.beam.mat.color.set(css('--beam'));
-        [VG.parts.left, VG.parts.right, VG.parts.beam].forEach(function(p){ p.em.color.set(css('--edge')); });
+        Object.keys(VG.parts).forEach(function(k){ var p = VG.parts[k]; p.mat.color.set(css(p.colorVar)); p.em.color.set(css('--edge')); });
         VG.screwMat.color.set(css('--metal')); VG.lapMat.color.set(css('--laptop')); VG.lapEdge.color.set(css('--laptop'));
         VG.bedMat.color.set(css('--bed')); VG.bedEdge.color.set(css('--bed-edge'));
       }

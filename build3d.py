@@ -9,6 +9,7 @@
         卡扣臂在打印平面内弯曲，弯曲应力沿层内方向，不会把层间撕开。
 """
 import json
+import math
 import shapely
 from shapely.geometry import Polygon, LineString, box
 from shapely.geometry.polygon import orient
@@ -83,7 +84,11 @@ except Exception as e:
 # ---------------- 装配（世界坐标：X 左右，Y 前→后，Z 向上） ----------------
 left_w = support_left.moved(Location(Plane(origin=(-P.SPACING / 2 - P.T / 2, 0, 0), x_dir=(0, 1, 0), z_dir=(1, 0, 0))))
 right_w = mirror(left_w, about=Plane.YZ)
-beam_w = beam.moved(Location((0, P.JX + P.BEAM_W / 2, P.JY), (90, 0, 0)))
+beams_w = []
+for j in P.JOINTS:   # 横梁截面长边 a → (0,cos φ,sin φ)，短边 b → (0,−sin φ,cos φ)
+    c, s = math.cos(math.radians(j["phi"])), math.sin(math.radians(j["phi"]))
+    beams_w.append(beam.moved(Location(Plane(origin=(0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c),
+                                             x_dir=(1, 0, 0), z_dir=(0, -s, c)))))
 
 parts = {"support_left": support_left, "support_right": support_right, "beam": beam}
 report = {}
@@ -92,13 +97,15 @@ for nm, pt in parts.items():
     export_stl(pt, f"{OUT}/{nm}.stl", tolerance=0.01, angular_tolerance=0.1)
     bb = pt.bounding_box()
     report[nm] = dict(volume_cm3=round(pt.volume / 1000, 2), bbox_mm=[round(bb.size.X, 1), round(bb.size.Y, 1), round(bb.size.Z, 1)], valid=pt.is_valid)
-asm = Compound(label="laptop_stand", children=[left_w, right_w, beam_w])
+asm = Compound(label="laptop_stand", children=[left_w, right_w] + beams_w)
 export_step(asm, f"{OUT}/assembly.step")
 export_stl(asm, f"{OUT}/assembly.stl", tolerance=0.01, angular_tolerance=0.1)
 bb = asm.bounding_box()
 report["assembly"] = dict(bbox_mm=[round(bb.size.X, 1), round(bb.size.Y, 1), round(bb.size.Z, 1)])
-report["interference_beam_left_mm3"] = round((beam_w & left_w).volume, 3)
-report["interference_beam_right_mm3"] = round((beam_w & right_w).volume, 3)
+report["beams"] = [dict(name=j["name"], x=j["x"], y=j["y"], phi=j["phi"]) for j in P.JOINTS]
+report["interference_beam_left_mm3"] = round(sum((b & left_w).volume for b in beams_w), 3)
+report["interference_beam_right_mm3"] = round(sum((b & right_w).volume for b in beams_w), 3)
+report["interference_beam_beam_mm3"] = round(sum((a & b).volume for i, a in enumerate(beams_w) for b in beams_w[i + 1:]), 3)
 report["snap"] = dict(arm_t=P.ARM_T, flex_len_mm=round(P.ARM_ROOT + uc, 2), deflection_mm=round(P.HOOK_H - P.CLEAR, 2),
                       strain_pct=round(100 * P.snap_strain(), 2), hook_overlap_mm=round(P.HOOK_H - P.CLEAR, 2),
                       hook_protrude_mm=round(uL - P.T, 2))
