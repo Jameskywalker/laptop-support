@@ -29,11 +29,13 @@
    16.0
   ]
  },
+ "beams": 1,
  "tenon_in_left_slab_cm3": 1.2,
  "beam_support_clash_mm3": 0.0,
  "print_mass_g_est": {
   "support_each": 77,
   "beam": 55,
+  "beams": 1,
   "total": 208
  },
  "tipping": {

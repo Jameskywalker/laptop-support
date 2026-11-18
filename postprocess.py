@@ -38,8 +38,8 @@ for pg in rings[1:]:
     region = region.symmetric_difference(pg)
 
 domain, solids = P.geometry(True)
-jr = solids["joint"]
-solids["joint"] = jr.buffer(-3, join_style="mitre").buffer(3)      # 接口区倒圆 R3
+for k in [k for k in solids if k.startswith("joint_")]:
+    solids[k] = solids[k].buffer(-3, join_style="mitre").buffer(3)     # 接口区倒圆 R3
 shape = shapely.unary_union([region] + list(solids.values())).intersection(domain)
 shape = shape.buffer(1.5).buffer(-1.5)          # 闭运算：内凹处倒圆 R1.5
 shape = shape.buffer(-1.0).buffer(1.0)          # 开运算：外凸处倒圆 R1
@@ -143,8 +143,9 @@ ex = np.array(shape.exterior.coords); ax.fill(ex[:, 0], ex[:, 1], color="#4a78a8
 for it in shape.interiors:
     c = np.array(it.coords); ax.fill(c[:, 0], c[:, 1], color="white", lw=0)
 ax.plot(ex[:, 0], ex[:, 1], "k-", lw=0.6)
-pk = box(P.JX - (P.TENON_W + 2 * P.CLEAR) / 2, P.JY - (P.TENON_H + 2 * P.CLEAR) / 2, P.JX + (P.TENON_W + 2 * P.CLEAR) / 2, P.JY + (P.TENON_H + 2 * P.CLEAR) / 2)
-c = np.array(pk.exterior.coords); ax.plot(c[:, 0], c[:, 1], "r--", lw=1, label="横梁卡扣方槽（贯通）")
+for _i, _j in enumerate(P.JOINTS):
+    c = np.array(P.joint_slot(_j).exterior.coords)
+    ax.plot(c[:, 0], c[:, 1], "r--", lw=1, label="横梁卡扣方槽（贯通）" if _i == 0 else None)
 # 笔记本示意
 lx, ly = P.sn2xy([0, P.LAPTOP_D, P.LAPTOP_D, 0, 0], [0, 0, 16, 16, 0])
 ax.plot(lx, ly, color="#888", lw=1.2, label="笔记本（示意）")

@@ -1,5 +1,5 @@
 """
-校验 + 预览渲染：STL 水密性、榫头插入量、估算打印重量、装配/爆炸/打印摆放图
+校验 + 预览渲染：STL 水密性、卡扣臂插入量、估算打印重量、装配/爆炸/打印摆放图（支持多根横梁）
 用法: python render.py
 """
 import json, os
@@ -30,18 +30,25 @@ def T_support_left():
     M[:3, 3] = [-P.SPACING / 2 - P.T / 2, 0, 0]
     return M
 L = meshes["support_left"].copy(); L.apply_transform(T_support_left())
-R = L.copy(); R.apply_transform(np.diag([-1, 1, 1, 1])); R.invert()
-B = meshes["beam"].copy()
-Mb = np.eye(4); Mb[:3, :3] = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]); Mb[:3, 3] = [0, P.JX + P.BEAM_W / 2, P.JY]
-B.apply_transform(Mb)
+R = L.copy(); R.apply_transform(np.diag([-1, 1, 1, 1]))   # 镜像；trimesh 会自动翻转面朝向
+def T_beam(j):
+    """横梁打印坐标 → 世界坐标：X 沿横梁轴，截面长边 a → (0,cos φ,sin φ)，短边 b → (0,−sin φ,cos φ)"""
+    ph = np.deg2rad(j["phi"]); c, s = np.cos(ph), np.sin(ph)
+    M = np.eye(4)
+    M[:3, :3] = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    M[:3, 3] = [0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c]
+    return M
+Bs = [meshes["beam"].copy().apply_transform(T_beam(j)) for j in P.JOINTS]
+NB = len(Bs)
 
-# 榫头插入量：横梁落在左支撑板厚范围内的体积（应 ≈ 榫头体积 ≈ 4.5 cm³）
-slab = trimesh.creation.box(extents=[P.T, 400, 400]); slab.apply_translation([-P.SPACING / 2, 150, 100])
+# 卡扣臂插入量：横梁落在左支撑板厚范围内的体积（每根应 ≈ 2 × 2.5 × 16 × 15 = 1.2 cm³）
+slab = trimesh.creation.box(extents=[P.T, 600, 600]); slab.apply_translation([-P.SPACING / 2, 150, 100])
 try:
-    ins = trimesh.boolean.intersection([B, slab], engine="manifold").volume
-    clash = trimesh.boolean.intersection([B, L], engine="manifold").volume
+    ins = sum(trimesh.boolean.intersection([B, slab], engine="manifold").volume for B in Bs)
+    clash = sum(trimesh.boolean.intersection([B, S], engine="manifold").volume for B in Bs for S in (L, R))
 except Exception as e:
     ins = clash = float("nan"); print("boolean failed", e)
+chk["beams"] = NB
 chk["tenon_in_left_slab_cm3"] = round(ins / 1000, 2)
 chk["beam_support_clash_mm3"] = round(clash, 3)
 
@@ -58,14 +65,14 @@ v_beam = ((cs.area - cs.buffer(-wall).area) * Lb + cs.length * Lb * 0 + 2 * cs.a
 # 横梁平躺打印：上下表面为 skin，四周为墙
 core_h = P.BEAM_W - skin; core_w = P.BEAM_H - 2 * wall
 v_beam = (Lb * (P.BEAM_H * P.BEAM_W - core_w * core_h) + Lb * core_w * core_h * 0.15) / 1000
-chk["print_mass_g_est"] = dict(support_each=round(v_sup * 1.24), beam=round(v_beam * 1.24), total=round((2 * v_sup + v_beam) * 1.24))
+chk["print_mass_g_est"] = dict(support_each=round(v_sup * 1.24), beam=round(v_beam * 1.24), beams=NB, total=round((2 * v_sup + NB * v_beam) * 1.24))
 
 # --- 稳定性（倾覆）粗估：13-14 寸本 1.6 kg，机身 1.15 kg + 屏 0.45 kg，屏幕竖直 ---
 mb, ms = 1.15, 0.45
 xb, _ = P.sn2xy(110, 8)
 xh, yh = P.sn2xy(215, 16)
 x_cg = (mb * xb + ms * (xh + 3)) / (mb + ms)
-stand_mass = (2 * v_sup + v_beam) * 1.24 / 1000
+stand_mass = (2 * v_sup + NB * v_beam) * 1.24 / 1000
 x_stand = P.X_MAX / 2
 h_push = yh + 200
 W = 9.81 * (mb + ms); Ws = 9.81 * stand_mass
@@ -111,13 +118,13 @@ def setup(ax, lim, elev, azim):
 C_SUP, C_BEAM, C_LAP = "#4a78a8", "#e0913a", "#9a9a9a"
 fig = plt.figure(figsize=(16, 8))
 ax = fig.add_subplot(1, 2, 1, projection="3d")
-for m_, c_ in ((L, C_SUP), (R, C_SUP), (B, C_BEAM)): draw(ax, m_, c_)
+for m_, c_ in [(L, C_SUP), (R, C_SUP)] + [(B, C_BEAM) for B in Bs]: draw(ax, m_, c_)
 for lm in laptop_meshes(): draw(ax, lm, C_LAP, alpha=0.25)
 setup(ax, ((-170, 170), (-10, 260), (0, 440)), 18, -125)
 ax.set_title("装配 + 13/14 寸笔记本（半透明示意）")
 ax = fig.add_subplot(1, 2, 2, projection="3d")
 Le = L.copy(); Le.apply_translation([-60, 0, 0]); Re = R.copy(); Re.apply_translation([60, 0, 0])
-for m_, c_ in ((Le, C_SUP), (Re, C_SUP), (B, C_BEAM)): draw(ax, m_, c_)
+for m_, c_ in [(Le, C_SUP), (Re, C_SUP)] + [(B, C_BEAM) for B in Bs]: draw(ax, m_, c_)
 setup(ax, ((-200, 200), (-10, 260), (0, 200)), 22, -60)
 ax.set_title("爆炸视图（从后方看：横梁两端卡扣穿过支撑方槽，卡钩扣住外侧面）")
 fig.tight_layout(); fig.savefig(f"{OUT}/preview_assembly.png", dpi=110, bbox_inches="tight"); plt.close(fig)
@@ -134,11 +141,12 @@ def place(g, cx, cy):
 sy = pg.bounds[3] - pg.bounds[1]; gap = 10
 if 2 * sy + gap <= BD - 10 and (pg.bounds[2] - pg.bounds[0]) <= BW - 10:
     plates = [[(place(pg, BW / 2, BD / 2 + gap / 2 + sy / 2), C_SUP), (place(right_fl, BW / 2, BD / 2 - gap / 2 - sy / 2), C_SUP)],
-              [(place(beam_fl, BW / 2, BD / 2), C_BEAM)]]
-    titles = ["第 1 盘：左右支撑", "第 2 盘：横梁"]
+              [(place(beam_fl, BW / 2, BD / 2 + (i - (NB - 1) / 2) * (P.BEAM_H + 15)), C_BEAM) for i in range(NB)]]
+    titles = ["第 1 盘：支撑 ×2", f"第 2 盘：横梁 ×{NB}"]
 else:
-    plates = [[(place(pg, BW / 2, BD / 2), C_SUP)], [(place(right_fl, BW / 2, BD / 2), C_SUP)], [(place(beam_fl, BW / 2, BD / 2), C_BEAM)]]
-    titles = ["左支撑", "右支撑", "横梁"]
+    plates = [[(place(pg, BW / 2, BD / 2), C_SUP)], [(place(right_fl, BW / 2, BD / 2), C_SUP)],
+              [(place(beam_fl, BW / 2, BD / 2 + (i - (NB - 1) / 2) * (P.BEAM_H + 15)), C_BEAM) for i in range(NB)]]
+    titles = ["支撑", "支撑", f"横梁 ×{NB}"]
 fig, axs = plt.subplots(1, len(plates), figsize=(6 * len(plates), 5.6))
 for ax, items, tt in zip(np.atleast_1d(axs), plates, titles):
     ax.add_patch(plt.Rectangle((0, 0), BW, BD, fill=False, ls="--", color="gray"))

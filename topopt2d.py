@@ -124,12 +124,15 @@ def build_loads(m):
     f = new(); add(lipback, (-P.F_PUSH, 0), f); F.append(f); names.append("前推")
     # 前挡冲击：把笔记本滑进支架时沿斜面撞击前挡
     f = new(); add(lipback, -P.F_LIP_IMPACT * P.U, f); F.append(f); names.append("前挡冲击")
-    if "joint" in m.solids:
-        jr = P.joint_rect(P.BEAM_W, P.BEAM_H)
+    # 每根横梁一个工况：横梁传来的力（搬动、两侧受力不均），保证每个接口都被结构连上
+    for j in P.JOINTS:
+        if "joint_" + j["name"] not in m.solids:
+            continue
+        jr = P.joint_rect(P.BEAM_W, P.BEAM_H, j)
         joint = m.node_in & shapely.contains_xy(jr, m.xn, m.yn)
-        f = new(); add(joint, P.F_JOINT, f); F.append(f); names.append("横梁")
-    weights_imp = {"自重": 2.0, "前压": 1.0, "后压": 1.0, "后推": 0.5, "前推": 0.5, "前挡冲击": 1.0, "横梁": 0.5}
-    imp = np.array([weights_imp[k] for k in names])
+        f = new(); add(joint, P.F_JOINT, f); F.append(f); names.append("横梁·" + j["cn"])
+    weights_imp = {"自重": 2.0, "前压": 1.0, "后压": 1.0, "后推": 0.5, "前推": 0.5, "前挡冲击": 1.0}
+    imp = np.array([weights_imp.get(k, 0.5) for k in names])
     return np.stack(F, 1), names, imp
 
 
@@ -195,6 +198,9 @@ def main():
         return xp, dxp
 
     vd_star = a.vf
+    vmask = m.active if P.VF_MODE == "active" else m.in_dom      # 体积约束统计的区域
+    nd = int(vmask.sum())
+    print(f"体积约束: {P.VF_MODE}，目标 {a.vf}（统计 {nd} 个单元；非设计实体 {int(m.solid.sum())} 个）")
     xe, dxe = physics(x, beta, eta_e)
     for it in range(1, a.maxit + 1):
         sK = (KE.ravel()[None, :] * (Emin + xe[:, None] ** a.penal * (E0 - Emin))).ravel()
@@ -215,10 +221,10 @@ def main():
         dc_p = -a.penal * xe ** (a.penal - 1) * (E0 - Emin) * (ce @ wts)
         dc = H.T @ (dc_p * dxe / Hs)
         xdd, dxd = physics(x, beta, eta_d)
-        dv = H.T @ (m.in_dom * dxd / Hs) / nd
+        dv = H.T @ (vmask * dxd / Hs) / nd
         if a.robust and (it == 1 or it % 10 == 0):
             xi_, _ = physics(x, beta, 0.5)
-            vd_star = a.vf * xdd[m.in_dom].mean() / max(xi_[m.in_dom].mean(), 1e-9)
+            vd_star = a.vf * xdd[vmask].mean() / max(xi_[vmask].mean(), 1e-9)
         dc[~m.active] = 0; dc = np.minimum(dc, -1e-30)
         dv = np.maximum(dv, 1e-30)
         move = 0.1 if beta < 8 else 0.05
@@ -229,13 +235,13 @@ def main():
             xn = np.clip(xa * np.sqrt(-dc[m.active] / dv[m.active] / lm), np.maximum(0, xa - move), np.minimum(1, xa + move))
             xt = x.copy(); xt[m.active] = xn
             xpt, _ = physics(xt, beta, eta_d)
-            if xpt[m.in_dom].mean() > vd_star: l1 = lm
+            if xpt[vmask].mean() > vd_star: l1 = lm
             else: l2 = lm
         change = float(np.abs(xn - xa).max())
         x[m.active] = xn
         xe, dxe = physics(x, beta, eta_e)
         xp, _ = physics(x, beta, 0.5)
-        vol = float(xp[m.in_dom].mean())
+        vol = float(xp[vmask].mean())
         grey = float((4 * xp * (1 - xp))[m.in_dom].mean())
         hist.append(dict(it=it, c=c, vol=vol, change=change, beta=beta, grey=grey, comp=comp.tolist()))
         if it % 10 == 0 or it == 1:

@@ -1,6 +1,6 @@
 {
  "support_left": {
-  "volume_cm3": 97.76,
+  "volume_cm3": 121.38,
   "bbox_mm": [
    267.8,
    140.3,
@@ -9,7 +9,7 @@
   "valid": true
  },
  "support_right": {
-  "volume_cm3": 97.76,
+  "volume_cm3": 121.38,
   "bbox_mm": [
    267.8,
    140.3,
@@ -33,8 +33,29 @@
    140.3
   ]
  },
+ "beams": [
+  {
+   "name": "rear",
+   "x": 218.2,
+   "y": 63.3,
+   "phi": 90.0
+  },
+  {
+   "name": "front",
+   "x": 65.6,
+   "y": 27.3,
+   "phi": 40.0
+  },
+  {
+   "name": "bottom",
+   "x": 141.9,
+   "y": 13.0,
+   "phi": 0.0
+  }
+ ],
  "interference_beam_left_mm3": 0,
  "interference_beam_right_mm3": 0,
+ "interference_beam_beam_mm3": 0,
  "snap": {
   "arm_t": 2.5,
   "flex_len_mm": 30.15,

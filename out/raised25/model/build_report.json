@@ -33,8 +33,17 @@
    186.3
   ]
  },
+ "beams": [
+  {
+   "name": "rear",
+   "x": 212.0,
+   "y": 75.0,
+   "phi": 90.0
+  }
+ ],
  "interference_beam_left_mm3": 0,
  "interference_beam_right_mm3": 0,
+ "interference_beam_beam_mm3": 0,
  "snap": {
   "arm_t": 2.5,
   "flex_len_mm": 30.15,

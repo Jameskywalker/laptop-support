@@ -13,6 +13,7 @@ import os
 import re
 import numpy as np
 import shapely
+import shapely.affinity
 from shapely.geometry import Polygon, box, Point
 
 VARIANT = os.environ.get("STAND_VARIANT", "desk40")
@@ -47,7 +48,6 @@ if MODE == "raised":
     Y_CAP_REAR = 165.0
     FOOT_LEN = 28.0
     FRONT_FIX, REAR_FIX = "xy", "y"        # 前脚铰支，后脚滑动
-    _JOINT = (212.0, 75.0)
 else:
     LIP_H = 15.0                           # 倾角大，前挡加高
     # 让前挡最前点落在 x=0、顶面实体带最低点落在桌面 y=0 —— 前挡直接接触桌面
@@ -58,12 +58,11 @@ else:
     Y_CAP_REAR = float(_E[1] - 25.0)       # 顶面后端之后的区域限高（给转轴/屏幕下沿留空间）
     FOOT_LEN = 25.0
     FRONT_FIX, REAR_FIX = "y", "xy"        # 前挡下方只给竖向支撑：前挡推力必须由结构自身传到后脚，不靠桌面摩擦
-    # 横梁接口：放在"顶面后端 → 后脚"连线上、离地约 45% 的位置（后腿的天然传力路径上）
-    _Fr = np.array([X_MAX - FOOT_LEN / 2, 0.0])
-    _J = _E + 0.55 * (_Fr - _E)
-    _JOINT = (round(float(_J[0]), 1), round(float(_J[1]), 1))
 
-VOLFRAC = 0.25 if MODE == "raised" else 0.30   # 拓扑优化体积分数（相对设计域）
+# 拓扑优化体积约束：raised 方案按整个设计域计（上一版做法）；前挡落桌方案只按可优化区域计
+# （非设计区越多——比如加横梁接口——留给结构的材料也不会被挤占）
+VF_MODE = "domain" if MODE == "raised" else "active"
+VOLFRAC = 0.25 if MODE == "raised" else 0.20
 
 # ---------------- 打印机 ----------------
 PRINTER = "H3C"           # 拓竹 H3C，打印尺寸 330 × 320 × 325 mm
@@ -76,9 +75,10 @@ SPACING = 220.0           # 两支撑中心距
 # ---------------- 横梁接口：卡扣（无螺钉） ----------------
 # 横梁两端各一对弹性卡扣臂，穿过支撑上的贯通方槽，卡钩扣住支撑外侧面；梁身台肩顶住内侧面。
 # 卡扣臂在打印平面内弯曲（应力沿层内），卡钩/斜面/让位槽都是平面图形沿 z 拉伸 → 无悬空。
+# 所有横梁是同一个零件；每根横梁在支撑轮廓里的位置 (x, y) 和截面方向 phi 由 JOINTS 给出：
+#   phi = 横梁截面长边（40 mm，卡扣臂所在方向）与水平方向的夹角（度）。
 USE_JOINT = True
-JX, JY = _JOINT           # 横梁截面中心（在支撑轮廓平面内）
-BEAM_W, BEAM_H = 16.0, 40.0     # 横梁截面（x 向宽 × y 向高）
+BEAM_W, BEAM_H = 16.0, 40.0     # 横梁截面（短边 × 长边）
 TENON_W, TENON_H = 16.0, 30.0   # 卡扣臂外包络：与梁身同宽，上下各留 5 mm 台肩
 CLEAR = 0.2               # 方槽单边间隙
 JOINT_MARGIN = 5.0        # 接口周围实体壁厚
@@ -90,6 +90,25 @@ HOOK_H = 1.4              # 卡钩高度：扣住外侧面的搭接量 = HOOK_H 
 HOOK_FLAT = 1.0           # 卡钩顶部平台长
 HOOK_RAMP = 3.0           # 导入斜面长
 SNAP_PLAY = 0.15          # 卡钩与支撑外侧面之间的轴向间隙
+
+_HB = BEAM_W / 2 + JOINT_MARGIN          # 接口实体区半宽（短边方向）= 13
+_HA = BEAM_H / 2 + JOINT_MARGIN          # 接口实体区半长（长边方向）= 25
+if MODE == "raised":
+    JOINTS = [dict(name="rear", cn="后", x=212.0, y=75.0, phi=90.0)]
+else:
+    # 后横梁：放在"顶面后端 → 后脚"连线上、离地约 45% 处（后腿的天然传力路径上），截面竖放
+    _Fr = np.array([X_MAX - FOOT_LEN / 2, 0.0])
+    _J = _E + 0.55 * (_Fr - _E)
+    # 前横梁：截面与斜面平行，紧贴顶面实体带下方；尽量靠前，直到接口区最低角碰到桌面
+    _nc = -TB - _HB
+    _sc = _HA + ((_HB - _nc) * np.cos(TH) - P0[1]) / np.sin(TH) + 2.0
+    _Jf = P0 + _sc * U + _nc * N
+    # 底横梁：截面平放在底边上（离桌面 BASE_H），位于前后两根横梁中间
+    JOINTS = [
+        dict(name="rear", cn="后", x=round(float(_J[0]), 1), y=round(float(_J[1]), 1), phi=90.0),
+        dict(name="front", cn="前", x=round(float(_Jf[0]), 1), y=round(float(_Jf[1]), 1), phi=THETA_DEG),
+        dict(name="bottom", cn="底", x=round(float((_J[0] + _Jf[0]) / 2), 1), y=_HB, phi=0.0),
+    ]
 
 # ---------------- 材料（等效 PLA/PETG 打印件） ----------------
 E_MAT = 2500.0            # MPa，考虑填充/层间后的等效模量
@@ -119,15 +138,23 @@ def sn_rect(s0, s1, n0, n1):
     return Polygon(list(zip(xs, ys)))
 
 
-def joint_rect(w, h):
-    return box(JX - w / 2, JY - h / 2, JX + w / 2, JY + h / 2)
+def _place(g, j):
+    """局部坐标（u 沿横梁截面长边，v 沿短边）→ 支撑轮廓坐标"""
+    return shapely.affinity.translate(shapely.affinity.rotate(g, j["phi"], origin=(0, 0)), j["x"], j["y"])
 
 
-def joint_slot():
-    """支撑上供卡扣穿过的贯通方槽（含四角让位圆）"""
-    w, h = TENON_W + 2 * CLEAR, TENON_H + 2 * CLEAR
-    corners = [Point(JX + sx * w / 2, JY + sy * h / 2).buffer(SLOT_CORNER_R, quad_segs=8) for sx in (-1, 1) for sy in (-1, 1)]
-    return shapely.unary_union([joint_rect(w, h)] + corners)
+def joint_rect(b, a, j):
+    """以横梁 j 为中心、短边 b × 长边 a 的矩形"""
+    return _place(box(-a / 2, -b / 2, a / 2, b / 2), j)
+
+
+def joint_slot(j=None):
+    """支撑上供卡扣穿过的贯通方槽（含四角让位圆）；j=None 时返回所有横梁方槽的并集"""
+    if j is None:
+        return shapely.unary_union([joint_slot(jj) for jj in JOINTS])
+    a, b = TENON_H + 2 * CLEAR, TENON_W + 2 * CLEAR
+    corners = [Point(su * a / 2, sv * b / 2).buffer(SLOT_CORNER_R, quad_segs=8) for su in (-1, 1) for sv in (-1, 1)]
+    return _place(shapely.unary_union([box(-a / 2, -b / 2, a / 2, b / 2)] + corners), j)
 
 
 def snap_strain():
@@ -168,5 +195,6 @@ def geometry(use_joint=USE_JOINT):
         **extra,
     }
     if use_joint:
-        solids["joint"] = joint_rect(BEAM_W + 2 * JOINT_MARGIN, BEAM_H + 2 * JOINT_MARGIN)
+        for j in JOINTS:
+            solids["joint_" + j["name"]] = joint_rect(2 * _HB, 2 * _HA, j)
     return domain, solids

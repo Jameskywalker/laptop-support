@@ -54,7 +54,8 @@ for v in ORDER:
     verify = json.load(open(f"{md}/verify.json"))
     variants[v] = dict(
         label=LABELS.get(v, v),
-        params=dict(mode=P.MODE, S=P.SPACING, T=P.T, JX=P.JX, JY=P.JY, BW=P.BEAM_W, BH=P.BEAM_H, TW=P.TENON_W, TH=P.TENON_H,
+        params=dict(mode=P.MODE, S=P.SPACING, T=P.T, joints=[dict(name=j["name"], cn=j["cn"], x=j["x"], y=j["y"], phi=j["phi"]) for j in P.JOINTS],
+                    slots=[ring(P.joint_slot(j).exterior.coords) for j in P.JOINTS], BW=P.BEAM_W, BH=P.BEAM_H, TW=P.TENON_W, TH=P.TENON_H,
                     CLEAR=P.CLEAR, theta=P.THETA_DEG, P0=[float(x) for x in P.P0], S_END=P.S_END, X_MAX=P.X_MAX,
                     LIP_T=P.LIP_T, LIP_H=P.LIP_H, LW=P.LAPTOP_W, LD=P.LAPTOP_D),
         snap=snap_section(md),
