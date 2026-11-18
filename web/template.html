@@ -1,0 +1,746 @@
+<title>拓扑优化笔记本支架</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+/* Layout: 工作台 —— 左侧是带边框的三维舞台（主角），右侧是一栏规格单；窄屏上下堆叠 */
+:root{
+  --bg:#e7ebee; --surface:#f7f9fa; --ink:#15202a; --muted:#566570; --line:#cfd8de;
+  --scene:#dde3e7; --grid:#c8d1d7; --grid-strong:#a9b6bf; --edge:#0e1a22;
+  --part:#2a6c8b; --beam:#c7742a; --metal:#8f99a1; --laptop:#76828c;
+  --bed:#33383c; --bed-edge:#9a8657;
+  --warn:#9a5310; --warn-bg:#f3e5d5; --focus:#2a6c8b;
+  --f-display:"Space Grotesk","Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;
+  --f-body:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1417; --surface:#151c21; --ink:#e2e9ee; --muted:#93a2ad; --line:#26313a;
+    --scene:#12191d; --grid:#1f2930; --grid-strong:#2f3c46; --edge:#020405;
+    --part:#4b9bc1; --beam:#e8944a; --metal:#aab3ba; --laptop:#8a96a0;
+    --bed:#2a2f33; --bed-edge:#7d6d48;
+    --warn:#e4a566; --warn-bg:#2a2118; --focus:#6fb6d9;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1417; --surface:#151c21; --ink:#e2e9ee; --muted:#93a2ad; --line:#26313a;
+  --scene:#12191d; --grid:#1f2930; --grid-strong:#2f3c46; --edge:#020405;
+  --part:#4b9bc1; --beam:#e8944a; --metal:#aab3ba; --laptop:#8a96a0;
+  --bed:#2a2f33; --bed-edge:#7d6d48;
+  --warn:#e4a566; --warn-bg:#2a2118; --focus:#6fb6d9;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:14px;line-height:1.6}
+.app{height:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,400px);gap:16px;padding-block:16px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.stage{position:relative;min-width:0;min-height:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--scene)}
+#view{position:absolute;inset:0;display:block;width:100%;height:100%;touch-action:none}
+.hud{position:absolute;left:12px;right:12px;display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center;pointer-events:none;z-index:2}
+.hud>*{pointer-events:auto}
+.hud-top{top:12px}
+.hud-bottom{bottom:12px;align-items:flex-end}
+.seg{display:inline-flex;flex-wrap:wrap;padding:3px;gap:2px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.seg button{border:0;background:transparent;color:var(--muted);font:500 13px/1 var(--f-body);padding:8px 12px;border-radius:6px;cursor:pointer}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--surface)}
+.seg.small button{padding:6px 10px;font-size:12.5px}
+.toggles{display:flex;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);font-size:13px;line-height:1;cursor:pointer;color:var(--ink)}
+.chip input{accent-color:var(--part);margin:0}
+.readout{margin:0;font-size:12.5px;color:var(--muted);background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:6px 10px;max-width:100%}
+button:focus-visible,.chip:focus-within,.part:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+#labels{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:1}
+.label3d{position:absolute;transform:translate(-50%,0);font:500 12px var(--f-mono);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:3px 8px;white-space:nowrap}
+.fallback{position:absolute;inset:0;margin:0;display:grid;place-items:center;padding:24px;text-align:center;color:var(--muted)}
+.sheet{min-width:0;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:24px;padding-right:4px;padding-bottom:8px}
+h1,h2{font-family:var(--f-display);text-wrap:balance;margin:0}
+.head{display:flex;flex-direction:column;gap:6px}
+.eyebrow{margin:0;font-family:var(--f-mono);font-size:11.5px;letter-spacing:.06em;color:var(--muted)}
+h1{font-size:26px;line-height:1.2;font-weight:700;letter-spacing:-0.01em}
+.lede{margin:0;color:var(--muted);max-width:60ch}
+.variant{display:flex;flex-direction:column;gap:6px}
+.vlabel{margin:0;font-size:12.5px;color:var(--muted)}
+.specs{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 16px;margin:0;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.specs dt{color:var(--muted);font-size:12.5px}
+.specs dd{margin:0;font-family:var(--f-mono);font-size:13px;font-variant-numeric:tabular-nums;text-align:right}
+section{display:flex;flex-direction:column;gap:10px;min-width:0}
+h2{font-size:15px;font-weight:700}
+.sechead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.parts{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.part{width:100%;display:grid;grid-template-columns:14px minmax(0,1fr);gap:2px 10px;text-align:left;padding:9px 11px;border:1px solid var(--line);border-radius:7px;background:transparent;color:inherit;font:inherit;cursor:default}
+.part:hover,.part.on{border-color:var(--focus);background:var(--bg)}
+.sw{width:14px;height:14px;border-radius:3px;margin-top:5px}
+.pn{font-weight:500}
+.part small{grid-column:2;color:var(--muted);font-size:12px;line-height:1.5}
+.part small.mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+.fig{border:1px solid var(--line);border-radius:8px;background:var(--scene);padding:8px}
+.fig svg{display:block;width:100%;height:auto}
+#density{display:block;width:100%;height:auto}
+.cap{margin:0;font-size:12.5px;color:var(--muted)}
+.pf{fill:var(--part)}
+.lap{fill:none;stroke:var(--muted);stroke-width:.8;stroke-dasharray:3 2}
+.dim{fill:none;stroke:var(--muted);stroke-width:.6}
+.dash{stroke-dasharray:2 2}
+.dt{fill:var(--muted);font:500 9px var(--f-mono)}
+.lbl{fill:var(--ink);font:9px var(--f-body)}
+.lbl.mute{fill:var(--muted)}
+.pk{fill:none;stroke:var(--beam);stroke-width:1.1;stroke-dasharray:2.5 1.5}
+.hole{fill:var(--scene)}
+.sp{fill:var(--part)}
+.sb{fill:var(--beam);fill-opacity:.88}
+.st{fill:var(--muted);font:2.5px var(--f-body)}
+.sl{fill:none;stroke:var(--muted);stroke-width:.2}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{font-weight:500;color:var(--muted);text-align:left;padding:6px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:6px;border-bottom:1px solid var(--line);font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.n{font-family:var(--f-body)}
+.r{text-align:right}
+tr.abuse td{background:var(--bg)}
+td.hot{color:var(--warn);font-weight:500}
+.steps{margin:0;padding-left:1.4em;display:flex;flex-direction:column;gap:4px}
+.note{background:var(--warn-bg);border-radius:8px;padding:12px 14px;gap:6px}
+.note p{margin:0}
+.pill{display:inline-block;font:500 11px/1 var(--f-body);letter-spacing:.04em;color:var(--warn-bg);background:var(--warn);border-radius:999px;padding:4px 8px;margin-right:8px;vertical-align:2px}
+.files p{margin:0;font-size:12.5px;color:var(--muted)}
+code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
+@media (max-width:900px){
+  html,body{height:auto}
+  .app{height:auto;grid-template-columns:minmax(0,1fr)}
+  .stage{height:62vh;min-height:380px}
+  .sheet{overflow:visible;padding-right:0}
+}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="app">
+  <main class="stage" id="stage">
+    <canvas id="view" aria-label="笔记本支架三维模型，拖动旋转，滚轮缩放"></canvas>
+    <div class="hud hud-top">
+      <div class="seg" aria-label="显示方式">
+        <button type="button" id="mode-asm" data-mode="asm" aria-pressed="true">装配</button>
+        <button type="button" id="mode-exp" data-mode="exp" aria-pressed="false">爆炸</button>
+        <button type="button" id="mode-print" data-mode="print" aria-pressed="false">打印摆放</button>
+      </div>
+      <div class="toggles">
+        <label class="chip" for="t-laptop"><input type="checkbox" id="t-laptop" checked>笔记本</label>
+        <label class="chip" for="t-spin"><input type="checkbox" id="t-spin">自动旋转</label>
+      </div>
+    </div>
+    <div class="hud hud-bottom">
+      <div class="seg" aria-label="视角">
+        <button type="button" id="v-iso" data-view="iso">等轴</button>
+        <button type="button" id="v-front" data-view="front">正面</button>
+        <button type="button" id="v-side" data-view="side">侧面</button>
+        <button type="button" id="v-top" data-view="top">俯视</button>
+      </div>
+      <p class="readout" id="readout" aria-live="polite">拖动旋转 · 滚轮缩放 · 右键平移</p>
+    </div>
+    <div id="labels"></div>
+    <p class="fallback" id="fallback" hidden></p>
+  </main>
+
+  <aside class="sheet">
+    <header class="head">
+      <p class="eyebrow" id="eyebrow"></p>
+      <h1>拓扑优化笔记本支架</h1>
+      <p class="lede" id="lede"></p>
+    </header>
+    <div class="variant">
+      <p class="vlabel">倾角方案</p>
+      <div class="seg" id="variants" aria-label="倾角方案"></div>
+    </div>
+    <dl class="specs" id="specs"></dl>
+
+    <section aria-labelledby="h-parts">
+      <h2 id="h-parts">零件</h2>
+      <ul class="parts" id="parts"></ul>
+    </section>
+
+    <section aria-labelledby="h-prof">
+      <div class="sechead">
+        <h2 id="h-prof">侧面轮廓</h2>
+        <div class="seg small" aria-label="轮廓图类型">
+          <button type="button" id="f-shape" data-fig="shape" aria-pressed="true">成品轮廓</button>
+          <button type="button" id="f-dens" data-fig="dens" aria-pressed="false">密度场</button>
+        </div>
+      </div>
+      <div class="fig">
+        <svg id="profile" role="img" aria-label="支撑侧面轮廓与主要尺寸，单位毫米"></svg>
+        <canvas id="density" hidden aria-label="拓扑优化得到的材料密度场"></canvas>
+      </div>
+      <p class="cap" id="figcap"></p>
+    </section>
+
+    <section aria-labelledby="h-snap">
+      <h2 id="h-snap">横梁卡扣</h2>
+      <div class="fig"><svg id="snap" role="img" aria-label="横梁卡扣剖面，单位毫米"></svg></div>
+      <p class="cap" id="snapcap"></p>
+    </section>
+
+    <section aria-labelledby="h-fe">
+      <h2 id="h-fe">有限元复核</h2>
+      <div class="tablewrap">
+        <table id="fe">
+          <thead><tr><th>工况（单侧支撑）</th><th>载荷</th><th class="r">位移 µm</th><th class="r">最大应力 MPa</th><th class="r">前挡区 MPa</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="cap">在最终几何上用 0.5 mm 网格计算，等效模量 2500 MPa。竖直按压沿斜面的分量全部算在前挡上（不计摩擦）。前挡区指前挡及其根部 25 mm 范围；最大应力出现在前挡区时标为橙色。PLA 层内强度约 45 MPa。</p>
+    </section>
+
+    <section aria-labelledby="h-print">
+      <h2 id="h-print">打印与装配</h2>
+      <ol class="steps">
+        <li id="step1"></li>
+        <li>横梁 40 mm 宽面贴床。三件都不需要加支撑。</li>
+        <li>PETG 或 PLA，层高 0.2 mm，3–4 圈墙，15–20% gyroid 填充。</li>
+        <li>横梁两端的卡扣对准支撑上的方槽，用力推入，听到“咔”一声就扣住了。不需要螺钉。</li>
+        <li>拆卸时从支撑外侧把两个卡钩往里捏，再把支撑拔出来。横梁建议用 PETG，反复拆装更耐用。</li>
+        <li>顶面贴硅胶防滑条，前后脚底贴橡胶垫。</li>
+      </ol>
+    </section>
+
+    <section class="note" aria-labelledby="h-tip">
+      <h2 id="h-tip"><span class="pill">注意</span>倾覆</h2>
+      <p id="tip"></p>
+    </section>
+
+    <footer class="files">
+      <p id="files"></p>
+    </footer>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+  var D = /*__DATA__*/null;
+  var root = document.documentElement;
+  function $(s){ return document.querySelector(s); }
+  function $$(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); }
+  function css(n){ return getComputedStyle(root).getPropertyValue(n).trim(); }
+  var reduceMotion = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var coarse = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+  function fmt(v){ return String(Math.round(v * 10) / 10); }
+  function b64bytes(s){ var b = atob(s), n = b.length, a = new Uint8Array(n); for (var i = 0; i < n; i++) a[i] = b.charCodeAt(i); return a; }
+  function hex(c){ c = c.replace('#', ''); return [parseInt(c.slice(0, 2), 16), parseInt(c.slice(2, 4), 16), parseInt(c.slice(4, 6), 16)]; }
+  function isDark(){ var c = hex(css('--bg')); return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) < 128; }
+
+  /* ---------- 当前方案 ---------- */
+  var cur = null, V, P, TH, CO, SI, SUP, BM, MASS, dimS, dimB, PARTS;
+  function sn(s, n){ return [P.P0[0] + s * CO - n * SI, P.P0[1] + s * SI + n * CO]; }
+  function select(key){
+    cur = key; V = D.variants[key]; P = V.params;
+    TH = P.theta * Math.PI / 180; CO = Math.cos(TH); SI = Math.sin(TH);
+    SUP = V.meshes.support; BM = V.meshes.beam; MASS = V.check.print_mass_g_est;
+    dimS = fmt(SUP.size[0]) + ' × ' + fmt(SUP.size[1]) + ' × ' + fmt(SUP.size[2]) + ' mm';
+    dimB = fmt(BM.size[0]) + ' × ' + fmt(BM.size[1]) + ' × ' + fmt(BM.size[2]) + ' mm';
+    PARTS = {
+      left:   {name: '支撑（左）', dims: dimS, mass: MASS.support_each, note: '左右两片完全相同，打印两份即可；任一侧面贴床', color: '--part'},
+      right:  {name: '支撑（右）', dims: dimS, mass: MASS.support_each, note: '与左边是同一个零件，只是装配时翻过来', color: '--part'},
+      beam:   {name: '横梁', dims: dimB, mass: MASS.beam, note: '40 mm 宽面贴床，两端各一对卡扣，不用螺钉', color: '--beam'}
+    };
+  }
+
+  /* ---------- 规格单 ---------- */
+  function fillSheet(){
+    var info = V.info, fe = V.fe, tip = V.check.tipping, desk = P.mode === 'desk';
+    $('#eyebrow').textContent = desk ? ('13–14 寸 · 前挡落桌 · ' + P.theta + '° 倾角') : '13–14 寸 · 整体抬高 · 25° 倾角（上一版）';
+    $('#lede').textContent = desk
+      ? '前挡直接落在桌面，靠 ' + P.theta + '° 倾角把屏幕抬高。左右两片支撑的侧面轮廓经过二维拓扑优化后沿厚度拉伸；侧放打印，所有侧壁竖直，不需要加支撑。'
+      : '上一版：笔记本前沿离桌约 100 mm，25° 倾角整体抬高。侧面轮廓同样经过二维拓扑优化后沿厚度拉伸。';
+    var maxVM = 0, maxRow = null;
+    fe.forEach(function(r){ if (r['最大VonMises_MPa'] > maxVM){ maxVM = r['最大VonMises_MPa']; maxRow = r; } });
+    var atLip = maxRow && maxRow['前挡区最大VM_MPa'] !== undefined && Math.abs(maxRow['前挡区最大VM_MPa'] - maxVM) < 1e-9;
+    var specs = [
+      ['外形 深 × 宽 × 高', fmt(SUP.size[0]) + ' × ' + fmt(P.S + P.T) + ' × ' + fmt(SUP.size[1]) + ' mm'],
+      ['屏幕上沿离桌（估算）', '≈ ' + tip.push_height_mm + ' mm'],
+      ['屏幕竖直需转轴开到', '≥ ' + (90 + P.theta) + '°'],
+      ['打印量（估算）', '≈ ' + MASS.total + ' g，共 3 件'],
+      ['最小特征', '杆宽 ' + info.min_member_mm + ' mm · 孔宽 ' + info.min_hole_mm + ' mm'],
+      ['150 N 误用', '最大应力 ' + maxVM.toFixed(1) + ' MPa' + (atLip ? '（在前挡区）' : '')]
+    ];
+    $('#specs').innerHTML = specs.map(function(r){ return '<dt>' + r[0] + '</dt><dd>' + r[1] + '</dd>'; }).join('');
+    $('#parts').innerHTML = Object.keys(PARTS).map(function(k){
+      var p = PARTS[k];
+      return '<li><button type="button" class="part" id="part-' + k + '" data-part="' + k + '">' +
+        '<span class="sw" style="background:var(' + p.color + ')"></span><span class="pn">' + p.name + '</span>' +
+        '<small class="mono">' + p.dims + (p.mass ? ' · ≈ ' + p.mass + ' g' : '') + '</small>' +
+        '<small>' + p.note + '</small></button></li>';
+    }).join('');
+    var NAME = {'自重': '笔记本自重', '前压': '前部按压', '后压': '转轴处按压', '后推': '向后推屏', '前推': '向前推机身', '前挡冲击': '滑入撞击前挡', '横梁': '横梁传力', '前部误用150N': '前部手肘撑压', '后部误用150N': '后部手肘撑压'};
+    var LOAD = {'自重': '14.7 N', '前压': '30 N', '后压': '30 N', '后推': '10 N', '前推': '10 N', '前挡冲击': '40 N', '横梁': '8 / −15 N', '前部误用150N': '150 N', '后部误用150N': '150 N'};
+    $('#fe tbody').innerHTML = fe.map(function(r){
+      var vm = r['最大VonMises_MPa'], lip = r['前挡区最大VM_MPa'];
+      var hot = lip !== undefined && Math.abs(lip - vm) < 1e-9;
+      return '<tr' + (/误用/.test(r['工况']) ? ' class="abuse"' : '') + '><td class="n">' + (NAME[r['工况']] || r['工况']) + '</td><td>' + (LOAD[r['工况']] || '') +
+        '</td><td class="r">' + (r['最大位移_mm'] * 1000).toFixed(1) + '</td><td class="r">' + vm.toFixed(2) +
+        '</td><td class="r' + (hot ? ' hot' : '') + '">' + (lip === undefined ? '—' : lip.toFixed(2)) + '</td></tr>';
+    }).join('');
+    $('#tip').textContent = '调整屏幕时请扶住机身。按 1.6 kg 的笔记本估算，在屏幕顶端（离桌面约 ' + tip.push_height_mm + ' mm）向后推约 ' +
+      tip.F_tip_backward_N + ' N、向前推约 ' + tip.F_tip_forward_N + ' N，整个支架就会翻倒。笔记本转轴一般 3–5 N 就能推动。';
+    var oneTray = SUP.size[0] <= D.bed.w - 10 && 2 * SUP.size[1] + 10 <= D.bed.d - 10;
+    $('#step1').textContent = '两片支撑是同一个零件，打印两份，任一侧面贴床。' +
+      (oneTray ? '在 ' + D.bed.name + '（' + D.bed.w + ' × ' + D.bed.d + ' mm）上两片可以同一盘打印。' : '每片 ' + fmt(SUP.size[0]) + ' × ' + fmt(SUP.size[1]) + ' mm，' + D.bed.name + ' 上需各占一盘。');
+    $('#files').innerHTML = '模型文件在 <code>out/' + cur + '/model/</code>：support_left.stl、support_right.stl、beam.stl、assembly.step。改 <code>params.py</code> 后运行 <code>./run_all.sh</code> 重新生成。';
+  }
+
+  /* ---------- 侧面轮廓 SVG ---------- */
+  function drawProfile(){
+    var lapTop = sn(P.LD, 16), tl = sn(P.LD * 0.5, 24), Hh = SUP.size[1];
+    var topY = Math.max(lapTop[1], tl[1] + 8, Hh) + 10;
+    function Y(y){ return topY - y; }
+    function pt(p){ return p[0].toFixed(1) + ' ' + Y(p[1]).toFixed(1); }
+    function ring(r){ return 'M' + r.map(pt).join('L') + 'Z'; }
+    var d = ring(V.profile.ext) + V.profile.holes.map(ring).join('');
+    var lap = ring([[0, 0], [P.LD, 0], [P.LD, 16], [0, 16]].map(function(a){ return sn(a[0], a[1]); }));
+    var pw = P.TW + 2 * P.CLEAR, ph = P.TH + 2 * P.CLEAR;
+    var L = P.X_MAX;
+    var R = sn(P.S_END, 0), r = 40;
+    var a1 = [R[0] + r, R[1]], a2 = [R[0] + r * CO, R[1] + r * SI];
+    var la = [R[0] + (r + 7) * Math.cos(TH / 2), R[1] + (r + 7) * Math.sin(TH / 2)];
+    var ray = sn(P.S_END + 50, 0);
+    var lipTop = sn(-P.LIP_T / 2, P.LIP_H);
+    var s = [];
+    s.push('<path class="pf" fill-rule="evenodd" d="' + d + '"/>');
+    s.push('<path class="lap" d="' + lap + '"/>');
+    s.push('<text class="lbl mute" text-anchor="middle" x="' + tl[0].toFixed(1) + '" y="' + Y(tl[1]).toFixed(1) + '" transform="rotate(' + (-P.theta) + ' ' + tl[0].toFixed(1) + ' ' + Y(tl[1]).toFixed(1) + ')">笔记本底面（示意）</text>');
+    s.push('<rect class="pk" rx="1" x="' + (P.JX - pw / 2).toFixed(1) + '" y="' + Y(P.JY + ph / 2).toFixed(1) + '" width="' + pw.toFixed(1) + '" height="' + ph.toFixed(1) + '"/>');
+    s.push('<text class="lbl" text-anchor="end" x="' + (P.JX - pw / 2 - 5).toFixed(1) + '" y="' + (Y(P.JY) + 3).toFixed(1) + '">横梁接口</text>');
+    s.push('<path class="dim dash" d="M' + pt(R) + 'L' + pt([R[0] + r + 8, R[1]]) + 'M' + pt(R) + 'L' + pt(ray) + '"/>');
+    s.push('<path class="dim" d="M' + pt(a1) + 'A' + r + ' ' + r + ' 0 0 0 ' + pt(a2) + '"/>');
+    s.push('<text class="dt" x="' + (la[0] + 2).toFixed(1) + '" y="' + (Y(la[1]) + 3).toFixed(1) + '">' + P.theta + '°</text>');
+    var yb = Y(-12);
+    s.push('<path class="dim" d="M0 ' + yb + 'H' + L + 'M0 ' + (yb - 4) + 'v8M' + L + ' ' + (yb - 4) + 'v8"/>');
+    s.push('<text class="dt" text-anchor="middle" x="' + (L / 2) + '" y="' + (yb + 11) + '">' + fmt(L) + '</text>');
+    s.push('<text class="lbl mute" x="0" y="' + (yb + 11) + '">前</text><text class="lbl mute" text-anchor="end" x="' + L + '" y="' + (yb + 11) + '">后</text>');
+    var xh = L + 12, yt = Y(Hh).toFixed(1), ym = Y(Hh / 2).toFixed(1);
+    s.push('<path class="dim" d="M' + xh + ' ' + Y(0) + 'V' + yt + 'M' + (xh - 4) + ' ' + Y(0) + 'h8M' + (xh - 4) + ' ' + yt + 'h8"/>');
+    s.push('<text class="dt" text-anchor="middle" x="' + (xh + 11) + '" y="' + ym + '" transform="rotate(-90 ' + (xh + 11) + ' ' + ym + ')">' + fmt(Hh) + '</text>');
+    s.push('<path class="dim" d="M' + pt([lipTop[0] - 3, lipTop[1] + 3]) + 'L' + pt([-8, lipTop[1] + 12]) + '"/>');
+    s.push('<text class="lbl" text-anchor="end" x="-10" y="' + (Y(lipTop[1] + 12) + 3).toFixed(1) + '">前挡 ' + P.LIP_H + '</text>');
+    var svg = $('#profile');
+    svg.setAttribute('viewBox', '-48 0 ' + (L + 88).toFixed(0) + ' ' + (topY + 30).toFixed(0));
+    svg.innerHTML = s.join('');
+  }
+
+  /* ---------- 密度场 ---------- */
+  function drawDensity(){
+    var cv = $('#density'), w = V.density.w, h = V.density.h, k = 3;
+    var off = document.createElement('canvas'); off.width = w; off.height = h;
+    var octx = off.getContext('2d'), img = octx.createImageData(w, h);
+    var bytes = b64bytes(V.density.data), c0 = hex(css('--scene')), c1 = hex(css('--part'));
+    for (var i = 0; i < w * h; i++){
+      var t = bytes[i] / 255;
+      img.data[4 * i] = c0[0] + (c1[0] - c0[0]) * t;
+      img.data[4 * i + 1] = c0[1] + (c1[1] - c0[1]) * t;
+      img.data[4 * i + 2] = c0[2] + (c1[2] - c0[2]) * t;
+      img.data[4 * i + 3] = 255;
+    }
+    octx.putImageData(img, 0, 0);
+    cv.width = w * k; cv.height = h * k;
+    var ctx = cv.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(off, 0, 0, w * k, h * k);
+    var hm = V.density.hmm;
+    ctx.strokeStyle = css('--muted'); ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    V.domain.forEach(function(p, j){ var x = p[0] / hm * k, y = (h - p[1] / hm) * k; if (j) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+    ctx.closePath(); ctx.stroke();
+  }
+
+  /* ---------- 卡扣剖面 ---------- */
+  function drawSnap(){
+    var S = V.snap, T = S.T, sh = S.slot_h, jh = S.joint_h, s = [];
+    function pt(p){ return p[0].toFixed(2) + ' ' + (-p[1]).toFixed(2); }
+    function ring(r){ return 'M' + r.map(pt).join('L') + 'Z'; }
+    s.push('<rect class="sp" x="0" y="' + (-jh).toFixed(2) + '" width="' + T + '" height="' + (jh - sh).toFixed(2) + '"/>');
+    s.push('<rect class="sp" x="0" y="' + sh.toFixed(2) + '" width="' + T + '" height="' + (jh - sh).toFixed(2) + '"/>');
+    s.push('<path class="sb" fill-rule="evenodd" d="' + S.beam.map(function(p){ return ring(p.ext) + p.holes.map(ring).join(''); }).join('') + '"/>');
+    s.push('<text class="st" text-anchor="middle" x="' + (T / 2) + '" y="' + (-jh - 1.5).toFixed(2) + '">支撑</text>');
+    s.push('<text class="st" x="-23" y="' + (-jh - 1.5).toFixed(2) + '">横梁</text>');
+    s.push('<text class="st" text-anchor="end" x="-1" y="' + (-sh - 6.5).toFixed(2) + '">台肩顶住内侧面</text>');
+    var hx = T + S.hook_protrude_mm / 2, hy = sh + 1.2;
+    s.push('<path class="sl" d="M' + hx.toFixed(2) + ' ' + (-hy).toFixed(2) + 'L' + (hx + 3).toFixed(2) + ' ' + (-hy - 5).toFixed(2) + '"/>');
+    s.push('<text class="st" x="' + (hx + 3.5).toFixed(2) + '" y="' + (-hy - 5.5).toFixed(2) + '">卡钩扣住外侧面</text>');
+    s.push('<text class="st" x="' + (T + 1) + '" y="1">两臂向内弯 ' + S.deflection_mm + ' mm 通过方槽</text>');
+    var svg = $('#snap');
+    svg.setAttribute('viewBox', '-24 ' + (-jh - 6) + ' 66 ' + (2 * jh + 9));
+    svg.innerHTML = s.join('');
+    $('#snapcap').textContent = '剖面图，单位 mm。横梁端部（橙）插入支撑方槽（蓝），台肩和卡钩把支撑夹在中间。卡扣臂厚 ' + S.arm_t +
+      ' mm、弹性段长 ' + S.flex_len_mm + ' mm，扣入时最大应变约 ' + S.strain_pct + '%（PLA 可反复拆装）。卡钩伸出支撑外侧面约 ' + S.hook_protrude_mm + ' mm。';
+  }
+
+  var figMode = 'shape';
+  function setFig(which){
+    figMode = which;
+    $('#profile').hidden = which !== 'shape';
+    $('#density').hidden = which !== 'dens';
+    $$('[data-fig]').forEach(function(b){ b.setAttribute('aria-pressed', String(b.getAttribute('data-fig') === which)); });
+    $('#figcap').textContent = which === 'shape'
+      ? '蓝色为成品轮廓，虚线为笔记本底面，橙色虚线框为横梁卡扣穿过的贯通方槽。单位 mm。'
+      : '优化直接得到的材料密度（1 mm 网格，深色为实体），虚线为设计域。成品轮廓由它平滑后，再与顶面、前挡、底边、接口等非设计区合并得到。';
+  }
+
+  /* ---------- 三维 ---------- */
+  function fail(msg){
+    var f = $('#fallback'); f.textContent = msg; f.hidden = false;
+    $('#view').hidden = true;
+    $$('.hud').forEach(function(e){ e.hidden = true; });
+    return null;
+  }
+
+  function buildGeometry(m, mirrorZ){
+    var q = new Uint16Array(b64bytes(m.pos).buffer), ix = new Uint16Array(b64bytes(m.idx).buffer);
+    var nv = m.nv, nf = m.nf, Vv = new Float32Array(nv * 3), i, j, f;
+    for (i = 0; i < nv; i++) for (j = 0; j < 3; j++) Vv[3 * i + j] = m.min[j] + q[3 * i + j] / 65535 * m.size[j];
+    if (mirrorZ) for (i = 0; i < nv; i++) Vv[3 * i + 2] = -Vv[3 * i + 2];
+    var F = new Uint32Array(nf * 3);
+    for (f = 0; f < nf; f++){
+      F[3 * f] = ix[3 * f];
+      F[3 * f + 1] = mirrorZ ? ix[3 * f + 2] : ix[3 * f + 1];
+      F[3 * f + 2] = mirrorZ ? ix[3 * f + 1] : ix[3 * f + 2];
+    }
+    var FN = new Float32Array(nf * 3);
+    for (f = 0; f < nf; f++){
+      var a = F[3 * f] * 3, b = F[3 * f + 1] * 3, c = F[3 * f + 2] * 3;
+      var ux = Vv[b] - Vv[a], uy = Vv[b + 1] - Vv[a + 1], uz = Vv[b + 2] - Vv[a + 2];
+      var vx = Vv[c] - Vv[a], vy = Vv[c + 1] - Vv[a + 1], vz = Vv[c + 2] - Vv[a + 2];
+      FN[3 * f] = uy * vz - uz * vy; FN[3 * f + 1] = uz * vx - ux * vz; FN[3 * f + 2] = ux * vy - uy * vx;
+    }
+    var start = new Uint32Array(nv + 1);
+    for (i = 0; i < nf * 3; i++) start[F[i] + 1]++;
+    for (i = 0; i < nv; i++) start[i + 1] += start[i];
+    var fillp = start.slice(0, nv), adj = new Uint32Array(nf * 3);
+    for (f = 0; f < nf; f++) for (j = 0; j < 3; j++){ var v0 = F[3 * f + j]; adj[fillp[v0]++] = f; }
+    var pos = new Float32Array(nf * 9), nor = new Float32Array(nf * 9), cosT = Math.cos(35 * Math.PI / 180);
+    for (f = 0; f < nf; f++){
+      var nx = FN[3 * f], ny = FN[3 * f + 1], nz = FN[3 * f + 2], nl = Math.hypot(nx, ny, nz) || 1;
+      for (j = 0; j < 3; j++){
+        var v = F[3 * f + j], sx = 0, sy = 0, sz = 0;
+        for (var kk = start[v]; kk < start[v + 1]; kk++){
+          var g = adj[kk], gx = FN[3 * g], gy = FN[3 * g + 1], gz = FN[3 * g + 2], gl = Math.hypot(gx, gy, gz) || 1;
+          if ((gx * nx + gy * ny + gz * nz) / (gl * nl) > cosT){ sx += gx; sy += gy; sz += gz; }
+        }
+        var sl = Math.hypot(sx, sy, sz) || 1, o = f * 9 + j * 3;
+        pos[o] = Vv[3 * v]; pos[o + 1] = Vv[3 * v + 1]; pos[o + 2] = Vv[3 * v + 2];
+        nor[o] = sx / sl; nor[o + 1] = sy / sl; nor[o + 2] = sz / sl;
+      }
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    geo.computeBoundingSphere();
+    return geo;
+  }
+
+  function init3D(){
+    if (!window.THREE || !THREE.OrbitControls) return fail('三维库没有加载成功（可能是网络问题）。右侧的轮廓和数据仍可查看。');
+    var canvas = $('#view'), stage = $('#stage'), renderer;
+    try { renderer = new THREE.WebGLRenderer({canvas: canvas, antialias: true}); }
+    catch (e) { return fail('当前浏览器无法启用 WebGL，三维视图不可用。右侧的轮廓和数据仍可查看。'); }
+    var V3 = THREE.Vector3;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    var scene = new THREE.Scene();
+    var camera = new THREE.PerspectiveCamera(32, 1, 5, 6000);
+    camera.position.set(560, 380, 640);
+    var controls = new THREE.OrbitControls(camera, canvas);
+    controls.enableDamping = true; controls.dampingFactor = 0.08;
+    controls.maxPolarAngle = Math.PI * 0.495; controls.minDistance = 120; controls.maxDistance = 2600;
+    controls.autoRotateSpeed = 0.8;
+    controls.target.set(0, 150, -10);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a96a0, 0.62));
+    var sun = new THREE.DirectionalLight(0xffffff, 0.78);
+    sun.position.set(380, 720, 520); sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    var sc = sun.shadow.camera; sc.left = -720; sc.right = 720; sc.top = 720; sc.bottom = -720; sc.near = 50; sc.far = 2400;
+    sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.8;
+    scene.add(sun);
+    var rim = new THREE.DirectionalLight(0xffffff, 0.3); rim.position.set(-520, 320, -480); scene.add(rim);
+    var ground = new THREE.Mesh(new THREE.PlaneGeometry(5000, 5000), new THREE.ShadowMaterial({opacity: 0.16}));
+    ground.rotation.x = -Math.PI / 2; ground.position.y = -0.4; ground.receiveShadow = true; scene.add(ground);
+    var grid = null;
+    var EXP = 70, BED = D.bed;
+    var labelBox = $('#labels');
+    var LBL = [];
+
+    function quatBasis(c1, c2, c3){
+      var m = new THREE.Matrix4().makeBasis(new V3(c1[0], c1[1], c1[2]), new V3(c2[0], c2[1], c2[2]), new V3(c3[0], c3[1], c3[2]));
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    }
+    var qAsm = quatBasis([0, 0, -1], [0, 1, 0], [1, 0, 0]);
+    var qId = new THREE.Quaternion();
+    var qPL = quatBasis([1, 0, 0], [0, 0, -1], [0, 1, 0]);
+    var qPR = quatBasis([1, 0, 0], [0, 0, 1], [0, -1, 0]);
+
+    /* 与方案相关的全部物体放在一个组里，切换方案时整体重建 */
+    function buildVariant(){
+      var group = new THREE.Group(), o = {group: group};
+      function makePart(geo, key, colorVar){
+        var mat = new THREE.MeshStandardMaterial({color: new THREE.Color(css(colorVar)), roughness: 0.6, metalness: 0});
+        var mesh = new THREE.Mesh(geo, mat); mesh.castShadow = true; mesh.receiveShadow = true; mesh.userData.key = key;
+        var em = new THREE.LineBasicMaterial({color: new THREE.Color(css('--edge')), transparent: true, opacity: 0.3});
+        mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 35), em));
+        var grp = new THREE.Group(); grp.add(mesh); group.add(grp);
+        return {key: key, grp: grp, mesh: mesh, mat: mat, em: em};
+      }
+      o.parts = {
+        left: makePart(buildGeometry(SUP, false), 'left', '--part'),
+        right: makePart(buildGeometry(SUP, true), 'right', '--part'),
+        beam: makePart(buildGeometry(BM, false), 'beam', '--beam')
+      };
+      var half = P.S / 2 + P.T / 2, zc = P.X_MAX / 2;
+      var cx = SUP.min[0] + SUP.size[0] / 2, cy = SUP.min[1] + SUP.size[1] / 2;
+      var zBeam = zc - P.JX - P.BW / 2;
+      o.POSES = {
+        asm:   {left: [new V3(-half, 0, zc), qAsm], right: [new V3(half, 0, zc), qAsm], beam: [new V3(0, P.JY, zBeam), qId]},
+        exp:   {left: [new V3(-half - EXP, 0, zc), qAsm], right: [new V3(half + EXP, 0, zc), qAsm], beam: [new V3(0, P.JY, zBeam), qId]},
+        print: null
+      };
+      /* 打印摆放：两片支撑放得下就同盘（上下排列），横梁另一盘；否则每件一盘 */
+      var sy = SUP.size[1], gap = 10;
+      if (SUP.size[0] <= BED.w - 10 && 2 * sy + gap <= BED.d - 10){
+        var ax = -(BED.w / 2 + 25), bx = BED.w / 2 + 25;
+        o.plates = [ax, bx];
+        o.POSES.print = {left: [new V3(ax - cx, 0, cy - gap / 2 - sy / 2), qPL], right: [new V3(ax - cx, 0, -cy + gap / 2 + sy / 2), qPR], beam: [new V3(bx, 0, 0), qPL]};
+        o.labels = [{t: '第 1 盘 · 左右支撑 ' + dimS, p: new V3(ax, 0, BED.d / 2 + 14)}, {t: '第 2 盘 · 横梁 ' + dimB, p: new V3(bx, 0, BED.d / 2 + 14)}];
+        o.printScale = 1;
+      } else {
+        var xs = [-(BED.w + 30), 0, BED.w + 30];
+        o.plates = xs;
+        o.POSES.print = {left: [new V3(xs[0] - cx, 0, cy), qPL], right: [new V3(xs[1] - cx, 0, -cy), qPR], beam: [new V3(xs[2], 0, 0), qPL]};
+        o.labels = [{t: '左支撑 · ' + dimS, p: new V3(xs[0], 0, BED.d / 2 + 14)}, {t: '右支撑 · ' + dimS, p: new V3(xs[1], 0, BED.d / 2 + 14)}, {t: '横梁 · ' + dimB, p: new V3(xs[2], 0, BED.d / 2 + 14)}];
+        o.printScale = 1.4;
+      }
+      o.screwMat = new THREE.MeshStandardMaterial({color: new THREE.Color(css('--metal')), roughness: 0.4, metalness: 0.3, transparent: true, opacity: 1});
+      var screwG = new THREE.LatheGeometry([new THREE.Vector2(0, 0), new THREE.Vector2(4, 0), new THREE.Vector2(2, 2), new THREE.Vector2(2, 15.4), new THREE.Vector2(1.3, 16), new THREE.Vector2(0, 16)], 28);
+      o.screws = [];   /* 卡扣连接，不再有螺钉 */
+      screwG.dispose();
+      o.screwPos = function(s, mode){ var off = mode === 'asm' ? 0 : EXP + 45; return new V3(s.side * (half + off), P.JY + s.dy, zc - P.JX); };
+      o.lapMat = new THREE.MeshStandardMaterial({color: new THREE.Color(css('--laptop')), transparent: true, opacity: 0.22, roughness: 0.5, depthWrite: false});
+      o.lapEdge = new THREE.LineBasicMaterial({color: new THREE.Color(css('--laptop')), transparent: true, opacity: 0.6});
+      o.lap = new THREE.Group();
+      function lapBox(w, h, d, x, y, z, rx){
+        var g = new THREE.BoxGeometry(w, h, d), mm = new THREE.Mesh(g, o.lapMat);
+        mm.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), o.lapEdge));
+        mm.position.set(x, y, z); mm.rotation.x = rx; o.lap.add(mm);
+      }
+      var bc = sn(P.LD / 2, 8), hc = sn(P.LD - 4, 16);
+      lapBox(P.LW, 16, P.LD, 0, bc[1], zc - bc[0], TH);
+      lapBox(P.LW, 210, 6, 0, hc[1] + 105, zc - hc[0] - 3, 0);
+      group.add(o.lap);
+      o.bedMat = new THREE.MeshStandardMaterial({color: new THREE.Color(css('--bed')), roughness: 0.9, transparent: true, opacity: 0});
+      o.bedEdge = new THREE.LineBasicMaterial({color: new THREE.Color(css('--bed-edge')), transparent: true, opacity: 0});
+      o.beds = new THREE.Group();
+      o.plates.forEach(function(x){
+        var g = new THREE.BoxGeometry(BED.w, 2, BED.d), b = new THREE.Mesh(g, o.bedMat);
+        b.position.set(x, -1.05, 0); b.receiveShadow = true;
+        b.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), o.bedEdge));
+        o.beds.add(b);
+      });
+      group.add(o.beds);
+      o.pickables = [o.parts.left.mesh, o.parts.right.mesh, o.parts.beam.mesh].concat(o.screws.map(function(s){ return s.m; }));
+      return o;
+    }
+    function disposeVariant(o){
+      scene.remove(o.group);
+      o.group.traverse(function(x){
+        if (x.geometry) x.geometry.dispose();
+        if (x.material) x.material.dispose();
+      });
+    }
+
+    var VG = null;
+    var state = {mode: 'asm', laptop: true, hoverCanvas: null, hoverList: null, camGoal: null, pointerIn: false, pointerDirty: false};
+    var fades = {lap: 1, screws: 1, beds: 0}, fadeGoal = {lap: 1, screws: 1, beds: 0};
+    var aspect = 1;
+    var VIEWS = {
+      asm:   {iso: [560, 380, 640], front: [0, 170, 950], side: [960, 170, -10], top: [0, 1050, -9]},
+      exp:   {iso: [680, 440, 740], front: [0, 160, 1050], side: [1000, 160, -10], top: [0, 1150, -9]},
+      print: {iso: [0, 620, 600], front: [0, 260, 1050], side: [1050, 320, 0], top: [0, 1150, 1]}
+    };
+    function target(mode){
+      var top = V.check.tipping.push_height_mm;
+      return mode === 'print' ? [0, 0, 0] : [0, (mode === 'exp' ? 0.3 : 0.42) * top, -10];
+    }
+    function setView(view, instant){
+      var t = target(state.mode), p = VIEWS[state.mode][view];
+      var tv = new V3(t[0], t[1], t[2]), pv = new V3(p[0], p[1] + t[1] - (state.mode === 'print' ? 0 : 150), p[2]);
+      var f = aspect < 1.25 ? Math.min(2.3, 1.25 / aspect) : 1;
+      if (state.mode === 'print' && VG) f *= VG.printScale;
+      pv.sub(tv).multiplyScalar(f).add(tv);
+      if (instant || reduceMotion){ camera.position.copy(pv); controls.target.copy(tv); state.camGoal = null; controls.update(); }
+      else state.camGoal = {t: tv, p: pv};
+    }
+    function snapParts(){
+      var mode = state.mode;
+      for (var k in VG.parts){ VG.parts[k].grp.position.copy(VG.POSES[mode][k][0]); VG.parts[k].grp.quaternion.copy(VG.POSES[mode][k][1]); }
+      VG.screws.forEach(function(s){ s.m.position.copy(VG.screwPos(s, mode === 'print' ? 'exp' : mode)); });
+      for (var q in fades) fades[q] = fadeGoal[q];
+    }
+    function setMode(mode, instant){
+      state.mode = mode;
+      fadeGoal.lap = (mode === 'asm' && state.laptop) ? 1 : 0;
+      fadeGoal.screws = mode === 'print' ? 0 : 1;
+      fadeGoal.beds = mode === 'print' ? 1 : 0;
+      $$('[data-mode]').forEach(function(b){ b.setAttribute('aria-pressed', String(b.getAttribute('data-mode') === mode)); });
+      setView('iso', instant);
+      if (instant) snapParts();
+      updateReadout();
+    }
+    controls.addEventListener('start', function(){ state.camGoal = null; });
+
+    function updateReadout(){
+      var key = state.hoverList || state.hoverCanvas, el = $('#readout');
+      if (key){ var p = PARTS[key]; el.textContent = p.name + ' · ' + p.dims + (p.mass ? ' · ≈ ' + p.mass + ' g' : ''); return; }
+      el.textContent = state.mode === 'print' ? '深色板为 ' + BED.name + ' 热床 ' + BED.w + ' × ' + BED.d + ' mm' : (coarse ? '单指旋转 · 双指缩放' : '拖动旋转 · 滚轮缩放 · 右键平移');
+    }
+    function applyHighlight(){
+      var key = state.hoverList || state.hoverCanvas;
+      if (VG){
+        [VG.parts.left, VG.parts.right, VG.parts.beam].forEach(function(p){
+          if (p.key === key) p.mat.emissive.copy(p.mat.color).multiplyScalar(0.35); else p.mat.emissive.setRGB(0, 0, 0);
+        });
+        if (key === 'screws') VG.screwMat.emissive.setRGB(0.3, 0.3, 0.3); else VG.screwMat.emissive.setRGB(0, 0, 0);
+      }
+      $$('.part').forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-part') === key); });
+      updateReadout();
+    }
+
+    var ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+    canvas.addEventListener('pointermove', function(e){
+      var r = canvas.getBoundingClientRect();
+      ndc.set((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1);
+      state.pointerIn = true; state.pointerDirty = true;
+    });
+    canvas.addEventListener('pointerleave', function(){ state.pointerIn = false; state.hoverCanvas = null; applyHighlight(); });
+    function pick(){
+      if (!state.pointerIn || !VG) return;
+      ray.setFromCamera(ndc, camera);
+      var hits = ray.intersectObjects(VG.pickables.filter(function(o){ return o.visible; }), false);
+      var key = hits.length ? hits[0].object.userData.key : null;
+      if (key !== state.hoverCanvas){ state.hoverCanvas = key; applyHighlight(); }
+    }
+    var list = $('#parts');
+    function partOf(e){ var b = e.target && e.target.closest ? e.target.closest('.part') : null; return b ? b.getAttribute('data-part') : null; }
+    list.addEventListener('mouseover', function(e){ var k = partOf(e); if (k !== state.hoverList){ state.hoverList = k; applyHighlight(); } });
+    list.addEventListener('mouseleave', function(){ state.hoverList = null; applyHighlight(); });
+    list.addEventListener('focusin', function(e){ state.hoverList = partOf(e); applyHighlight(); });
+    list.addEventListener('focusout', function(){ state.hoverList = null; applyHighlight(); });
+
+    function applyTheme(){
+      scene.background = new THREE.Color(css('--scene'));
+      if (VG){
+        VG.parts.left.mat.color.set(css('--part')); VG.parts.right.mat.color.set(css('--part')); VG.parts.beam.mat.color.set(css('--beam'));
+        [VG.parts.left, VG.parts.right, VG.parts.beam].forEach(function(p){ p.em.color.set(css('--edge')); });
+        VG.screwMat.color.set(css('--metal')); VG.lapMat.color.set(css('--laptop')); VG.lapEdge.color.set(css('--laptop'));
+        VG.bedMat.color.set(css('--bed')); VG.bedEdge.color.set(css('--bed-edge'));
+      }
+      if (grid){ scene.remove(grid); grid.geometry.dispose(); grid.material.dispose(); }
+      grid = new THREE.GridHelper(1500, 30, new THREE.Color(css('--grid-strong')), new THREE.Color(css('--grid')));
+      grid.position.y = -0.3; scene.add(grid);
+      ground.material.opacity = isDark() ? 0.4 : 0.16;
+      applyHighlight();
+    }
+    function rebuild(first){
+      if (VG) disposeVariant(VG);
+      VG = buildVariant(); scene.add(VG.group);
+      LBL.forEach(function(L){ labelBox.removeChild(L.el); });
+      LBL = VG.labels.map(function(l){
+        var el = document.createElement('div'); el.className = 'label3d'; el.hidden = true; el.textContent = l.t; labelBox.appendChild(el);
+        return {el: el, p: l.p};
+      });
+      applyTheme();
+      fadeGoal.lap = (state.mode === 'asm' && state.laptop) ? 1 : 0;
+      snapParts();
+      setView('iso', !!first);
+      updateReadout();
+    }
+
+    function resize(){
+      var w = stage.clientWidth, h = stage.clientHeight;
+      if (!w || !h) return;
+      renderer.setSize(w, h, false); aspect = w / h; camera.aspect = aspect; camera.updateProjectionMatrix();
+    }
+    if (window.ResizeObserver) new ResizeObserver(resize).observe(stage); else window.addEventListener('resize', resize);
+    resize();
+
+    var tmp = new V3();
+    function labels(){
+      var show = fades.beds > 0.6, w = canvas.clientWidth, h = canvas.clientHeight;
+      LBL.forEach(function(L){
+        if (!show){ if (!L.el.hidden) L.el.hidden = true; return; }
+        tmp.copy(L.p).project(camera);
+        L.el.hidden = tmp.z > 1;
+        L.el.style.left = ((tmp.x + 1) / 2 * w).toFixed(1) + 'px';
+        L.el.style.top = ((1 - tmp.y) / 2 * h).toFixed(1) + 'px';
+      });
+    }
+
+    var last = performance.now();
+    function frame(now){
+      var dt = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now;
+      var k = reduceMotion ? 1 : 1 - Math.exp(-dt * 7);
+      var goal = VG.POSES[state.mode];
+      for (var key in VG.parts){ var g = VG.parts[key].grp; g.position.lerp(goal[key][0], k); g.quaternion.slerp(goal[key][1], k); }
+      var sm = state.mode === 'print' ? 'exp' : state.mode;
+      VG.screws.forEach(function(s){ s.m.position.lerp(VG.screwPos(s, sm), k); });
+      for (var f in fades) fades[f] += (fadeGoal[f] - fades[f]) * k;
+      VG.lapMat.opacity = 0.22 * fades.lap; VG.lapEdge.opacity = 0.6 * fades.lap; VG.lap.visible = fades.lap > 0.01;
+      VG.screwMat.opacity = fades.screws; VG.screws.forEach(function(s){ s.m.visible = fades.screws > 0.01; });
+      VG.bedMat.opacity = fades.beds; VG.bedEdge.opacity = fades.beds; VG.beds.visible = fades.beds > 0.01;
+      if (state.camGoal){
+        var kc = reduceMotion ? 1 : 1 - Math.exp(-dt * 5);
+        camera.position.lerp(state.camGoal.p, kc); controls.target.lerp(state.camGoal.t, kc);
+        if (camera.position.distanceTo(state.camGoal.p) < 0.5 && controls.target.distanceTo(state.camGoal.t) < 0.5) state.camGoal = null;
+      }
+      controls.update();
+      if (state.pointerDirty){ state.pointerDirty = false; pick(); }
+      renderer.render(scene, camera);
+      labels();
+      requestAnimationFrame(frame);
+    }
+
+    $$('[data-mode]').forEach(function(b){ b.addEventListener('click', function(){ setMode(b.getAttribute('data-mode')); }); });
+    $$('[data-view]').forEach(function(b){ b.addEventListener('click', function(){ setView(b.getAttribute('data-view')); }); });
+    $('#t-laptop').addEventListener('change', function(e){ state.laptop = e.target.checked; fadeGoal.lap = (state.mode === 'asm' && state.laptop) ? 1 : 0; });
+    $('#t-spin').addEventListener('change', function(e){ controls.autoRotate = e.target.checked; });
+
+    rebuild(true);
+    setMode('asm', true);
+    requestAnimationFrame(frame);
+    return {applyTheme: applyTheme, rebuild: function(){ rebuild(false); }};
+  }
+
+  /* ---------- 方案切换 ---------- */
+  var viewer = null;
+  function go(key, writeHash){
+    if (!D.variants[key]) key = D['default'];
+    select(key);
+    $$('[data-variant]').forEach(function(b){ b.setAttribute('aria-pressed', String(b.getAttribute('data-variant') === key)); });
+    fillSheet(); drawProfile(); drawSnap(); drawDensity(); setFig(figMode);
+    if (viewer) viewer.rebuild();
+    if (writeHash && location.hash.slice(1) !== key) location.hash = key;
+  }
+  $('#variants').innerHTML = D.order.map(function(k){
+    return '<button type="button" id="var-' + k + '" data-variant="' + k + '" aria-pressed="false">' + D.variants[k].label + '</button>';
+  }).join('');
+  $$('[data-variant]').forEach(function(b){ b.addEventListener('click', function(){ go(b.getAttribute('data-variant'), true); }); });
+  $$('[data-fig]').forEach(function(b){ b.addEventListener('click', function(){ setFig(b.getAttribute('data-fig')); }); });
+  var startKey = location.hash.slice(1);
+  go(D.variants[startKey] ? startKey : D['default'], false);
+  try { viewer = init3D(); } catch (e) { fail('三维视图初始化失败：' + e.message); }
+  window.addEventListener('hashchange', function(){ var k = location.hash.slice(1); if (D.variants[k] && k !== cur) go(k, false); });
+  function themeChanged(){ drawDensity(); if (viewer) viewer.applyTheme(); }
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', themeChanged); } catch (e) {}
+  new MutationObserver(themeChanged).observe(root, {attributes: true, attributeFilter: ['data-theme']});
+})();
+</script>

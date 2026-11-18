@@ -1,0 +1,46 @@
+{
+ "support_left": {
+  "volume_cm3": 130.41,
+  "bbox_mm": [
+   255.0,
+   186.3,
+   15.0
+  ],
+  "valid": true
+ },
+ "support_right": {
+  "volume_cm3": 130.41,
+  "bbox_mm": [
+   255.0,
+   186.3,
+   15.0
+  ],
+  "valid": true
+ },
+ "beam": {
+  "volume_cm3": 120.71,
+  "bbox_mm": [
+   243.3,
+   40.0,
+   16.0
+  ],
+  "valid": true
+ },
+ "assembly": {
+  "bbox_mm": [
+   243.3,
+   255.0,
+   186.3
+  ]
+ },
+ "interference_beam_left_mm3": 0,
+ "interference_beam_right_mm3": 0,
+ "snap": {
+  "arm_t": 2.5,
+  "flex_len_mm": 30.15,
+  "deflection_mm": 1.2,
+  "strain_pct": 0.5,
+  "hook_overlap_mm": 1.2,
+  "hook_protrude_mm": 4.15
+ }
+}

@@ -1,0 +1,72 @@
+"""
+生成网页预览：把各方案的网格 / 轮廓 / 密度场 / 复核数据嵌入 web/template.html → web/stand_preview.html
+用法: python make_web.py [方案...]   默认 desk35 desk40 desk45 raised25（需先跑完对应方案的 run_all.sh）
+"""
+import os, sys, json, base64, importlib
+import numpy as np
+import trimesh
+from shapely.geometry import Polygon, box
+import params as P
+
+LABELS = {"desk35": "35°", "desk40": "40° · 选定", "desk45": "45°", "raised25": "25° · 上一版"}
+ORDER = sys.argv[1:] or ["desk35", "desk40", "desk45", "raised25"]
+DEFAULT = "desk40" if "desk40" in ORDER else ORDER[0]
+
+
+def b64(a):
+    return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
+
+
+def pack(fn):
+    m = trimesh.load(fn)
+    v = np.asarray(m.vertices); f = np.asarray(m.faces)
+    assert len(v) < 65536
+    mn = v.min(0); sz = v.max(0) - mn; sz[sz == 0] = 1
+    q = np.round((v - mn) / sz * 65535).astype("<u2")
+    return dict(min=mn.round(5).tolist(), size=sz.round(5).tolist(), pos=b64(q), idx=b64(f.astype("<u2")), nv=int(len(v)), nf=int(len(f)))
+
+
+ring = lambda c: [[round(x, 1), round(y, 1)] for x, y in c]
+
+
+def snap_section(md):
+    """横梁右端卡扣剖面（u = 离支撑内侧面的距离），供网页画剖面图"""
+    bo = json.load(open(f"{md}/beam_outline.json"))
+    half = bo["half"]
+    g = Polygon(bo["exterior"], bo["holes"]).intersection(box(half - 24, -30, half + 30, 30))
+    polys = list(g.geoms) if hasattr(g, "geoms") else [g]
+    r2 = lambda c: [[round(x - half, 2), round(y, 2)] for x, y in c]
+    rep = json.load(open(f"{md}/build_report.json"))["snap"]
+    return dict(beam=[dict(ext=r2(p.exterior.coords), holes=[r2(h.coords) for h in p.interiors]) for p in polys],
+                T=P.T, slot_h=P.TENON_H / 2 + P.CLEAR, joint_h=P.BEAM_H / 2 + P.JOINT_MARGIN, **rep)
+variants = {}
+for v in ORDER:
+    os.environ["STAND_VARIANT"] = v
+    importlib.reload(P)
+    md, td = P.MODEL_DIR, P.TOPO_DIR
+    prof = json.load(open(f"{md}/profile.json"))
+    pg = Polygon(prof["exterior"], prof["holes"]).simplify(0.08)
+    domain, _ = P.geometry(True)
+    dom = max(domain.geoms, key=lambda g: g.area) if hasattr(domain, "geoms") else domain
+    r = np.load(f"{td}/result.npz")
+    nelx, nely = int(r["nelx"]), int(r["nely"])
+    G = r["xphys"].reshape(nelx, nely).T[::-1]
+    verify = json.load(open(f"{md}/verify.json"))
+    variants[v] = dict(
+        label=LABELS.get(v, v),
+        params=dict(mode=P.MODE, S=P.SPACING, T=P.T, JX=P.JX, JY=P.JY, BW=P.BEAM_W, BH=P.BEAM_H, TW=P.TENON_W, TH=P.TENON_H,
+                    CLEAR=P.CLEAR, theta=P.THETA_DEG, P0=[float(x) for x in P.P0], S_END=P.S_END, X_MAX=P.X_MAX,
+                    LIP_T=P.LIP_T, LIP_H=P.LIP_H, LW=P.LAPTOP_W, LD=P.LAPTOP_D),
+        snap=snap_section(md),
+        meshes=dict(support=pack(f"{md}/support_left.stl"), beam=pack(f"{md}/beam.stl")),
+        profile=dict(ext=ring(pg.exterior.coords), holes=[ring(h.coords) for h in pg.interiors]),
+        domain=ring(dom.exterior.coords),
+        density=dict(w=nelx, h=nely, hmm=float(r["h"]), data=b64(np.clip(np.round(G * 255), 0, 255).astype(np.uint8))),
+        fe=verify["fe"], info=verify["info"], check=json.load(open(f"{md}/check.json")),
+    )
+data = dict(order=ORDER, default=DEFAULT, variants=variants, bed=dict(name=P.PRINTER, w=P.BED_W, d=P.BED_D))
+html = open("web/template.html", encoding="utf-8").read()
+assert "/*__DATA__*/null" in html
+out = html.replace("/*__DATA__*/null", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+open("web/stand_preview.html", "w", encoding="utf-8").write(out)
+print("web/stand_preview.html", len(out.encode()), "bytes;", ", ".join(f"{k}: {v['meshes']['support']['nf']} 面" for k, v in variants.items()))
