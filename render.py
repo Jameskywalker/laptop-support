@@ -19,7 +19,8 @@ for f in ("/mnt/c/Windows/Fonts/msyh.ttc",):
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "DejaVu Sans"]; plt.rcParams["axes.unicode_minus"] = False
 OUT = P.MODEL_DIR
 
-meshes = {nm: trimesh.load(f"{OUT}/{nm}.stl") for nm in ("support_left", "support_right", "beam")}
+HAS_PANEL = bool(P.panel_joints())
+meshes = {nm: trimesh.load(f"{OUT}/{nm}.stl") for nm in ("support_left", "support_right", "beam") + (("panel",) if HAS_PANEL else ())}
 chk = {nm: dict(watertight=bool(m.is_watertight), faces=len(m.faces), volume_cm3=round(m.volume / 1000, 2),
                 extents=[round(v, 1) for v in m.extents]) for nm, m in meshes.items()}
 
@@ -38,17 +39,22 @@ def T_beam(j):
     M[:3, :3] = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
     M[:3, 3] = [0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c]
     return M
-Bs = [meshes["beam"].copy().apply_transform(T_beam(j)) for j in P.JOINTS]
+Bs = [meshes["beam"].copy().apply_transform(T_beam(j)) for j in P.JOINTS if j.get("part", "beam") == "beam"]
 NB = len(Bs)
+# 面板：打印坐标 Y=0 在前卡扣中心，按前接口摆放（与横梁同一套变换）
+Pn = meshes["panel"].copy().apply_transform(T_beam(P.panel_joints()[0])) if HAS_PANEL else None
+LINKS = Bs + ([Pn] if HAS_PANEL else [])
 
-# 卡扣臂插入量：横梁落在左支撑板厚范围内的体积（每根应 ≈ 2 × 2.5 × 16 × 15 = 1.2 cm³）
+# 卡扣臂插入量：横梁和面板落在左支撑板厚范围内的体积（每个卡扣应 ≈ 2 × 2.5 × 16 × 15 = 1.2 cm³）
 slab = trimesh.creation.box(extents=[P.T, 600, 600]); slab.apply_translation([-P.SPACING / 2, 150, 100])
 try:
-    ins = sum(trimesh.boolean.intersection([B, slab], engine="manifold").volume for B in Bs)
-    clash = sum(trimesh.boolean.intersection([B, S], engine="manifold").volume for B in Bs for S in (L, R))
+    ins = sum(trimesh.boolean.intersection([B, slab], engine="manifold").volume for B in LINKS)
+    clash = sum(trimesh.boolean.intersection([B, S], engine="manifold").volume for B in LINKS for S in (L, R))
 except Exception as e:
     ins = clash = float("nan"); print("boolean failed", e)
 chk["beams"] = NB
+chk["panel"] = HAS_PANEL
+chk["tenons_per_side"] = NB + (2 if HAS_PANEL else 0)
 chk["tenon_in_left_slab_cm3"] = round(ins / 1000, 2)
 chk["beam_support_clash_mm3"] = round(clash, 3)
 
@@ -65,14 +71,20 @@ v_beam = ((cs.area - cs.buffer(-wall).area) * Lb + cs.length * Lb * 0 + 2 * cs.a
 # 横梁平躺打印：上下表面为 skin，四周为墙
 core_h = P.BEAM_W - skin; core_w = P.BEAM_H - 2 * wall
 v_beam = (Lb * (P.BEAM_H * P.BEAM_W - core_w * core_h) + Lb * core_w * core_h * 0.15) / 1000
-chk["print_mass_g_est"] = dict(support_each=round(v_sup * 1.24), beam=round(v_beam * 1.24), beams=NB, total=round((2 * v_sup + NB * v_beam) * 1.24))
+v_panel = 0.0
+if HAS_PANEL:     # 面板平放打印：四周为墙、上下为表皮、中间填充，与支撑同一算法
+    _po = json.load(open(f"{P.OUT_DIR}/panel/panel_outline.json"))
+    pp = Polygon(_po["exterior"], _po["holes"])
+    v_panel = ((pp.area - pp.buffer(-wall).area) * P.PANEL_T + pp.buffer(-wall).area * skin + pp.buffer(-wall).area * (P.PANEL_T - skin) * 0.15) / 1000
+chk["print_mass_g_est"] = dict(support_each=round(v_sup * 1.24), beam=round(v_beam * 1.24), beams=NB, panel=round(v_panel * 1.24),
+                               total=round((2 * v_sup + NB * v_beam + v_panel) * 1.24))
 
 # --- 稳定性（倾覆）粗估：13-14 寸本 1.6 kg，机身 1.15 kg + 屏 0.45 kg，屏幕竖直 ---
 mb, ms = 1.15, 0.45
 xb, _ = P.sn2xy(110, 8)
 xh, yh = P.sn2xy(215, 16)
 x_cg = (mb * xb + ms * (xh + 3)) / (mb + ms)
-stand_mass = (2 * v_sup + NB * v_beam) * 1.24 / 1000
+stand_mass = (2 * v_sup + NB * v_beam + v_panel) * 1.24 / 1000
 x_stand = P.X_MAX / 2
 h_push = yh + 200
 W = 9.81 * (mb + ms); Ws = 9.81 * stand_mass
@@ -118,15 +130,15 @@ def setup(ax, lim, elev, azim):
 C_SUP, C_BEAM, C_LAP = "#4a78a8", "#e0913a", "#9a9a9a"
 fig = plt.figure(figsize=(16, 8))
 ax = fig.add_subplot(1, 2, 1, projection="3d")
-for m_, c_ in [(L, C_SUP), (R, C_SUP)] + [(B, C_BEAM) for B in Bs]: draw(ax, m_, c_)
+for m_, c_ in [(L, C_SUP), (R, C_SUP)] + [(B, C_BEAM) for B in LINKS]: draw(ax, m_, c_)
 for lm in laptop_meshes(): draw(ax, lm, C_LAP, alpha=0.25)
 setup(ax, ((-170, 170), (-10, 260), (0, 440)), 18, -125)
 ax.set_title("装配 + 13/14 寸笔记本（半透明示意）")
 ax = fig.add_subplot(1, 2, 2, projection="3d")
 Le = L.copy(); Le.apply_translation([-60, 0, 0]); Re = R.copy(); Re.apply_translation([60, 0, 0])
-for m_, c_ in [(Le, C_SUP), (Re, C_SUP)] + [(B, C_BEAM) for B in Bs]: draw(ax, m_, c_)
+for m_, c_ in [(Le, C_SUP), (Re, C_SUP)] + [(B, C_BEAM) for B in LINKS]: draw(ax, m_, c_)
 setup(ax, ((-200, 200), (-10, 260), (0, 200)), 22, -60)
-ax.set_title("爆炸视图（从后方看：横梁两端卡扣穿过支撑方槽，卡钩扣住外侧面）")
+ax.set_title("爆炸视图（从后方看：横梁和面板的卡扣穿过支撑方槽，卡钩扣住外侧面）" if HAS_PANEL else "爆炸视图（从后方看：横梁两端卡扣穿过支撑方槽，卡钩扣住外侧面）")
 fig.tight_layout(); fig.savefig(f"{OUT}/preview_assembly.png", dpi=110, bbox_inches="tight"); plt.close(fig)
 
 # 打印摆放（俯视）：H3C 热床；两片支撑放得下就同盘，横梁另一盘
@@ -135,18 +147,33 @@ BW, BD = P.BED_W, P.BED_D
 right_fl = affinity.scale(pg, 1, -1, origin=(0, 0))
 _bo = json.load(open(f"{OUT}/beam_outline.json"))
 beam_fl = Polygon(_bo["exterior"], _bo["holes"])
+panel_fl = Polygon(_po["exterior"], _po["holes"]) if HAS_PANEL else None
+
+
+def links_plate(cy0):
+    """第 2 盘：面板 + 横梁，自上而下排"""
+    items, y = [], BD - 10
+    if HAS_PANEL:
+        ph = panel_fl.bounds[3] - panel_fl.bounds[1]
+        items.append((place(panel_fl, BW / 2, y - ph / 2), C_BEAM)); y -= ph + 15
+    for i in range(NB):
+        items.append((place(beam_fl, BW / 2, y - P.BEAM_H / 2), C_BEAM)); y -= P.BEAM_H + 15
+    assert y >= 0, "面板和横梁一盘放不下"
+    return items
+
+
 def place(g, cx, cy):
     mnx, mny, mxx, mxy = g.bounds
     return affinity.translate(g, cx - (mnx + mxx) / 2, cy - (mny + mxy) / 2)
 sy = pg.bounds[3] - pg.bounds[1]; gap = 10
 if 2 * sy + gap <= BD - 10 and (pg.bounds[2] - pg.bounds[0]) <= BW - 10:
     plates = [[(place(pg, BW / 2, BD / 2 + gap / 2 + sy / 2), C_SUP), (place(right_fl, BW / 2, BD / 2 - gap / 2 - sy / 2), C_SUP)],
-              [(place(beam_fl, BW / 2, BD / 2 + (i - (NB - 1) / 2) * (P.BEAM_H + 15)), C_BEAM) for i in range(NB)]]
-    titles = ["第 1 盘：支撑 ×2", f"第 2 盘：横梁 ×{NB}"]
+              links_plate(BD / 2)]
+    titles = ["第 1 盘：支撑 ×2", f"第 2 盘：面板 + 横梁 ×{NB}" if HAS_PANEL else f"第 2 盘：横梁 ×{NB}"]
 else:
     plates = [[(place(pg, BW / 2, BD / 2), C_SUP)], [(place(right_fl, BW / 2, BD / 2), C_SUP)],
-              [(place(beam_fl, BW / 2, BD / 2 + (i - (NB - 1) / 2) * (P.BEAM_H + 15)), C_BEAM) for i in range(NB)]]
-    titles = ["支撑", "支撑", f"横梁 ×{NB}"]
+              links_plate(BD / 2)]
+    titles = ["支撑", "支撑", f"面板 + 横梁 ×{NB}" if HAS_PANEL else f"横梁 ×{NB}"]
 fig, axs = plt.subplots(1, len(plates), figsize=(6 * len(plates), 5.6))
 for ax, items, tt in zip(np.atleast_1d(axs), plates, titles):
     ax.add_patch(plt.Rectangle((0, 0), BW, BD, fill=False, ls="--", color="gray"))
@@ -155,6 +182,6 @@ for ax, items, tt in zip(np.atleast_1d(axs), plates, titles):
         for it in g.interiors:
             xs, ys = it.xy; ax.fill(xs, ys, color="white")
     ax.set_aspect("equal"); ax.set_xlim(-5, BW + 5); ax.set_ylim(-5, BD + 5); ax.set_title(tt)
-fig.suptitle(f"打印摆放（虚线 = {P.PRINTER} 热床 {BW:.0f}×{BD:.0f} mm；支撑任一侧面贴床（方槽贯通）；横梁 40 mm 面贴床；图为第一层截面）")
+fig.suptitle(f"打印摆放（虚线 = {P.PRINTER} 热床 {BW:.0f}×{BD:.0f} mm；支撑任一侧面贴床（方槽贯通）；横梁 40 mm 面贴床、面板平放；图为第一层截面）")
 fig.savefig(f"{OUT}/preview_print_layout.png", dpi=100, bbox_inches="tight"); plt.close(fig)
 print("rendered")

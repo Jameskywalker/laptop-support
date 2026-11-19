@@ -39,7 +39,7 @@ for pg in rings[1:]:
 
 domain, solids = P.geometry(True)
 for k in [k for k in solids if k.startswith("joint_")]:
-    solids[k] = solids[k].buffer(-3, join_style="mitre").buffer(3)     # 接口区倒圆 R3
+    solids[k] = Polygon(solids[k].exterior).buffer(-3, join_style="mitre").buffer(3).difference(P.joint_slot())   # 外轮廓倒圆 R3（方槽两侧薄壁不能参与开运算）
 shape = shapely.unary_union([region] + list(solids.values())).intersection(domain)
 shape = shape.buffer(1.5).buffer(-1.5)          # 闭运算：内凹处倒圆 R1.5
 shape = shape.buffer(-1.0).buffer(1.0)          # 开运算：外凸处倒圆 R1

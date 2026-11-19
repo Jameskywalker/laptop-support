@@ -56,15 +56,8 @@ def beam_outline():
     parts = [box(-half, -P.BEAM_H / 2, half, P.BEAM_H / 2)]
     cuts = []
     for sx in (1, -1):
-        def T_(u, y):
-            return (sx * (half + u), y)
-        for sy in (1, -1):
-            parts.append(Polygon([T_(-1, sy * yI), T_(uL, sy * yI), T_(uL, sy * yA), T_(-1, sy * yA)]))          # 卡扣臂
-            parts.append(Polygon([T_(uc, sy * (yA - 0.01)), T_(uc, sy * (yA + P.HOOK_H)),
-                                  T_(uc + P.HOOK_FLAT, sy * (yA + P.HOOK_H)), T_(uL, sy * (yA - 0.01))]))         # 卡钩 + 导入斜面
-            w = P.RELIEF_W
-            cuts.append(LineString([T_(-P.ARM_ROOT + w / 2, sy * (yA + w / 2)), T_(2, sy * (yA + w / 2))]).buffer(w / 2))  # 外侧让位槽
-        cuts.append(Polygon([T_(-P.ARM_ROOT, -yI), T_(3, -yI), T_(3, yI), T_(-P.ARM_ROOT, yI)]).buffer(-2).buffer(2))     # 两臂之间让位
+        p_, c_ = P.snap_end(sx, half)
+        parts += p_; cuts += c_
     g = shapely.unary_union(parts).difference(shapely.unary_union(cuts))
     assert g.geom_type == "Polygon", g.geom_type
     return orient(g, 1.0)
@@ -84,28 +77,39 @@ except Exception as e:
 # ---------------- 装配（世界坐标：X 左右，Y 前→后，Z 向上） ----------------
 left_w = support_left.moved(Location(Plane(origin=(-P.SPACING / 2 - P.T / 2, 0, 0), x_dir=(0, 1, 0), z_dir=(1, 0, 0))))
 right_w = mirror(left_w, about=Plane.YZ)
-beams_w = []
-for j in P.JOINTS:   # 横梁截面长边 a → (0,cos φ,sin φ)，短边 b → (0,−sin φ,cos φ)
+def at_joint(part, j):
+    """打印坐标（X 沿横向、Y 沿截面长边、Z 沿短边 0..BEAM_W）→ 装配位置；截面长边 a → (0,cos φ,sin φ)，短边 b → (0,−sin φ,cos φ)"""
     c, s = math.cos(math.radians(j["phi"])), math.sin(math.radians(j["phi"]))
-    beams_w.append(beam.moved(Location(Plane(origin=(0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c),
-                                             x_dir=(1, 0, 0), z_dir=(0, -s, c)))))
+    return part.moved(Location(Plane(origin=(0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c),
+                                     x_dir=(1, 0, 0), z_dir=(0, -s, c))))
 
+
+BEAM_J = [j for j in P.JOINTS if j.get("part", "beam") == "beam"]
+beams_w = [at_joint(beam, j) for j in BEAM_J]
 parts = {"support_left": support_left, "support_right": support_right, "beam": beam}
+# 面板（前、顶两个接口合成一块，见 panel.py）：打印坐标的 Y=0 在前卡扣中心，所以按前接口摆放
+panel_w = None
+if P.panel_joints():
+    po = json.load(open(f"{P.OUT_DIR}/panel/panel_outline.json"))
+    panel = extrude_poly(Polygon(po["exterior"], po["holes"]), P.PANEL_T)
+    parts["panel"] = panel
+    panel_w = at_joint(panel, P.panel_joints()[0])
+links_w = beams_w + ([panel_w] if panel_w is not None else [])
 report = {}
 for nm, pt in parts.items():
     export_step(pt, f"{OUT}/{nm}.step")
     export_stl(pt, f"{OUT}/{nm}.stl", tolerance=0.01, angular_tolerance=0.1)
     bb = pt.bounding_box()
     report[nm] = dict(volume_cm3=round(pt.volume / 1000, 2), bbox_mm=[round(bb.size.X, 1), round(bb.size.Y, 1), round(bb.size.Z, 1)], valid=pt.is_valid)
-asm = Compound(label="laptop_stand", children=[left_w, right_w] + beams_w)
+asm = Compound(label="laptop_stand", children=[left_w, right_w] + links_w)
 export_step(asm, f"{OUT}/assembly.step")
 export_stl(asm, f"{OUT}/assembly.stl", tolerance=0.01, angular_tolerance=0.1)
 bb = asm.bounding_box()
 report["assembly"] = dict(bbox_mm=[round(bb.size.X, 1), round(bb.size.Y, 1), round(bb.size.Z, 1)])
-report["beams"] = [dict(name=j["name"], x=j["x"], y=j["y"], phi=j["phi"]) for j in P.JOINTS]
-report["interference_beam_left_mm3"] = round(sum((b & left_w).volume for b in beams_w), 3)
-report["interference_beam_right_mm3"] = round(sum((b & right_w).volume for b in beams_w), 3)
-report["interference_beam_beam_mm3"] = round(sum((a & b).volume for i, a in enumerate(beams_w) for b in beams_w[i + 1:]), 3)
+report["beams"] = [dict(name=j["name"], x=j["x"], y=j["y"], phi=j["phi"], part=j.get("part", "beam")) for j in P.JOINTS]
+report["interference_beam_left_mm3"] = round(sum((b & left_w).volume for b in links_w), 3)      # 横梁和面板都算
+report["interference_beam_right_mm3"] = round(sum((b & right_w).volume for b in links_w), 3)
+report["interference_beam_beam_mm3"] = round(sum((a & b).volume for i, a in enumerate(links_w) for b in links_w[i + 1:]), 3)
 report["snap"] = dict(arm_t=P.ARM_T, flex_len_mm=round(P.ARM_ROOT + uc, 2), deflection_mm=round(P.HOOK_H - P.CLEAR, 2),
                       strain_pct=round(100 * P.snap_strain(), 2), hook_overlap_mm=round(P.HOOK_H - P.CLEAR, 2),
                       hook_protrude_mm=round(uL - P.T, 2))

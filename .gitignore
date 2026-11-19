@@ -5,3 +5,7 @@ __pycache__/
 out/**/coarse_nojoint/
 out/raised25/fine_nonrobust/
 out/**/profile.pkl
+# 三维优化试验的输出（体积大、可由 topopt3d.py / export3d.py / make_web3d.py 重新生成）
+out/**/topo3d/
+out/**/model3d/
+web/support3d_preview.html

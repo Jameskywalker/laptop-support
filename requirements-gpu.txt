@@ -1,0 +1,5 @@
+# 可选：拓扑优化放到 NVIDIA 显卡上（topopt2d.py --gpu；run_all.sh 检测到就自动用）
+# 需要 CUDA 12 驱动；会连带安装 cuBLAS/cuSPARSE/cuDSS 等 CUDA 库，.venv 约增加 3.6 GB
+-r requirements.txt
+cupy-cuda12x==14.2.0
+nvmath-python[cu12]==1.0.1

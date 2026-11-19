@@ -1,9 +1,9 @@
 """
 二维 SIMP 拓扑优化（平面应力，Q4 单元，密度过滤 + Heaviside 投影 + β 续进，OC 更新）
 多工况加权柔度最小化，体积约束。支撑件侧面轮廓 → 拉伸后打印无悬空。
-用法: STAND_VARIANT=desk40 python topopt2d.py [--robust] [--h 1.0] [--vf 0.28] [--rmin 3.0] [--nojoint] [--out 目录]
+用法: STAND_VARIANT=desk40 python topopt2d.py [--robust] [--h 1.0] [--vf 0.28] [--rmin 3.0] [--nojoint] [--gpu] [--out 目录]
 """
-import argparse, json, os, time
+import argparse, functools, json, os, time
 import numpy as np
 import scipy.sparse as sp
 import shapely
@@ -36,9 +36,10 @@ def element_stiffness(nu):
 
 
 class Mesh:
-    def __init__(self, h, use_joint):
+    def __init__(self, h, use_joint, geom=None):
+        """geom=(设计域, 非设计实体 dict)；不给则用支撑的几何 P.geometry()。设计域需从原点开始"""
         self.h = h
-        self.domain, self.solids = P.geometry(use_joint)
+        self.domain, self.solids = geom if geom is not None else P.geometry(use_joint)
         minx, miny, maxx, maxy = self.domain.bounds
         self.nelx = int(np.ceil(maxx / h)); self.nely = int(np.ceil(maxy / h))
         nelx, nely = self.nelx, self.nely
@@ -124,13 +125,15 @@ def build_loads(m):
     f = new(); add(lipback, (-P.F_PUSH, 0), f); F.append(f); names.append("前推")
     # 前挡冲击：把笔记本滑进支架时沿斜面撞击前挡
     f = new(); add(lipback, -P.F_LIP_IMPACT * P.U, f); F.append(f); names.append("前挡冲击")
-    # 每根横梁一个工况：横梁传来的力（搬动、两侧受力不均），保证每个接口都被结构连上
+    # 每根横梁一个工况：横梁传来的力（搬动、两侧受力不均），保证每个接口都被结构连上。
+    # 力经卡扣臂顶在方槽槽壁上传给支撑，只加在受压一侧的槽壁节点上
     for j in P.JOINTS:
         if "joint_" + j["name"] not in m.solids:
             continue
-        jr = P.joint_rect(P.BEAM_W, P.BEAM_H, j)
-        joint = m.node_in & shapely.contains_xy(jr, m.xn, m.yn)
-        f = new(); add(joint, P.F_JOINT, f); F.append(f); names.append("横梁·" + j["cn"])
+        w = P.slot_bearing(j, m.xn, m.yn, P.F_JOINT, 0.75 * m.h) * m.node_in
+        assert w.sum() > 0, "方槽槽壁上没有节点"
+        f = new(); f[0::2] += P.F_JOINT[0] * w / w.sum(); f[1::2] += P.F_JOINT[1] * w / w.sum()
+        F.append(f); names.append("横梁·" + j["cn"])
     weights_imp = {"自重": 2.0, "前压": 1.0, "后压": 1.0, "后推": 0.5, "前推": 0.5, "前挡冲击": 1.0}
     imp = np.array([weights_imp.get(k, 0.5) for k in names])
     return np.stack(F, 1), names, imp
@@ -151,40 +154,172 @@ def build_bc(m):
 
 def project(xt, beta, eta=0.5):
     a = np.tanh(beta * eta); b = np.tanh(beta * (1 - eta))
-    xp = (a + np.tanh(beta * (xt - eta))) / (a + b)
-    dxp = beta * (1 - np.tanh(beta * (xt - eta)) ** 2) / (a + b)
+    if not isinstance(xt, np.ndarray):                   # cupy 数组：同一公式合成一个 kernel
+        return _project_kernel()(xt, beta, eta, a, a + b)
+    t = np.tanh(beta * (xt - eta))
+    xp = (a + t) / (a + b)
+    dxp = beta * (1 - t ** 2) / (a + b)
     return xp, dxp
 
 
-def main():
-    ap = argparse.ArgumentParser()
+@functools.cache
+def _project_kernel():
+    import cupy as cp
+    return cp.ElementwiseKernel(
+        "float64 xt, float64 beta, float64 eta, float64 a, float64 ab", "float64 xp, float64 dxp",
+        "double t = tanh(beta * (xt - eta)); xp = (a + t) / ab; dxp = beta * (1 - t * t) / ab;",
+        "topopt_project")
+
+
+class CpuFE:
+    """CPU 有限元：每轮组装整体 K，PARDISO 分解并求解全部工况（原实现）"""
+
+    def __init__(self, m, KE, F, free):
+        self.m, self.KE, self.F, self.free = m, KE, F, free
+        self.solver = pypardiso.PyPardisoSolver(mtype=2)
+
+    def solve(self, Ek):
+        m, free = self.m, self.free
+        sK = (self.KE.ravel()[None, :] * Ek[:, None]).ravel()
+        K = sp.csr_matrix((sK, (m.iK, m.jK)), shape=(m.ndof, m.ndof))
+        Kf = sp.triu(K[free][:, free], format="csr")
+        U = np.zeros((m.ndof, self.F.shape[1]))
+        U[free] = self.solver.solve(Kf, self.F[free]).reshape(free.size, -1)
+        self.solver.free_memory()
+        return U
+
+    def close(self):
+        pass
+
+
+class GpuFE:
+    """GPU 有限元：稀疏模式和排序只做一次；每轮在显卡上按单元刚度 scatter 出上三角 K，
+    cuDSS 做 Cholesky 数值分解并一次回代全部工况。"""
+
+    def __init__(self, m, KE, F, free):
+        import logging
+        import cupy as cp
+        import cupyx.scipy.sparse as csp
+        from nvmath.sparse.advanced import DirectSolver, DirectSolverMatrixType, DirectSolverMatrixViewType
+        self.cp = cp
+        nf = free.size
+        fmap = np.full(m.ndof, -1, np.int64); fmap[free] = np.arange(nf)
+        r, c = fmap[m.iK], fmap[m.jK]
+        keep = (r >= 0) & (c >= 0) & (r <= c)                 # 只留自由度之间的上三角项
+        ukey, pos = np.unique(r[keep] * nf + c[keep], return_inverse=True)   # 排序后正是 CSR 顺序
+        rows, cols = ukey // nf, ukey % nf
+        indptr = np.concatenate([[0], np.cumsum(np.bincount(rows, minlength=nf))])
+        self.nnz = ukey.size
+        self.keep = cp.asarray(np.nonzero(keep)[0]); self.pos = cp.asarray(pos)
+        self.KE = cp.asarray(KE.ravel())
+        self.K = csp.csr_matrix((cp.zeros(self.nnz), cp.asarray(cols, dtype=cp.int32), cp.asarray(indptr, dtype=cp.int32)),
+                                shape=(nf, nf))
+        self.Ff = cp.asfortranarray(cp.asarray(F[free]))      # cuDSS 要求右端项列优先
+        self.free = cp.asarray(free); self.ndof = m.ndof; self.nlc = F.shape[1]
+        quiet = logging.getLogger("topopt2d.cudss"); quiet.setLevel(logging.ERROR)
+        self.solver = DirectSolver(self.K, self.Ff, options=dict(
+            sparse_system_type=DirectSolverMatrixType.SPD, sparse_system_view=DirectSolverMatrixViewType.UPPER, logger=quiet))
+        self.planned = False
+
+    def solve(self, Ek):
+        cp = self.cp
+        vals = (self.KE[None, :] * Ek[:, None]).ravel()[self.keep]
+        self.K.data[...] = cp.bincount(self.pos, weights=vals, minlength=self.nnz)   # 原地更新，求解器持有同一块显存
+        if not self.planned:
+            self.solver.plan(); self.planned = True
+        self.solver.factorize()
+        U = cp.zeros((self.ndof, self.nlc))
+        U[self.free] = self.solver.solve().reshape(-1, self.nlc)
+        return U
+
+    def close(self):
+        self.solver.free()
+
+
+class MultiFE:
+    """不同工况用不同约束：每组约束各建一个求解器，解按工况拼回去。groups: [(F 子矩阵, free, 工况下标)]"""
+
+    def __init__(self, m, KE, groups, gpu):
+        self.m, self.gpu = m, gpu
+        self.parts = [((GpuFE if gpu else CpuFE)(m, KE, Fg, free), idx) for Fg, free, idx in groups]
+        self.nlc = sum(len(g[2]) for g in groups)
+
+    def solve(self, Ek):
+        if self.gpu:
+            import cupy as xp_
+        else:
+            xp_ = np
+        U = xp_.zeros((self.m.ndof, self.nlc))
+        for fe, idx in self.parts:
+            U[:, idx] = fe.solve(Ek)
+        return U
+
+    def close(self):
+        for fe, _ in self.parts:
+            fe.close()
+
+
+def add_args(ap, vf):
     ap.add_argument("--h", type=float, default=1.0)
-    ap.add_argument("--vf", type=float, default=P.VOLFRAC)
+    ap.add_argument("--vf", type=float, default=vf)
     ap.add_argument("--rmin", type=float, default=3.0)
     ap.add_argument("--penal", type=float, default=3.0)
     ap.add_argument("--maxit", type=int, default=400)
     ap.add_argument("--beta_max", type=float, default=32.0)
-    ap.add_argument("--nojoint", action="store_true")
     ap.add_argument("--robust", action="store_true", help="腐蚀/中间/膨胀三场鲁棒公式，保证实体和孔洞最小尺寸")
     ap.add_argument("--eta_e", type=float, default=0.7)
     ap.add_argument("--eta_d", type=float, default=0.3)
+    ap.add_argument("--gpu", action="store_true", help="迭代全部放到 CUDA 上（需要 requirements-gpu.txt）")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    add_args(ap, P.VOLFRAC)
+    ap.add_argument("--nojoint", action="store_true")
     ap.add_argument("--out", default=P.TOPO_DIR)
     a = ap.parse_args()
-    os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     m = Mesh(a.h, not a.nojoint)
-    H, Hs = build_filter(m, a.rmin)
     F, names, imp = build_loads(m)
     free, fixed = build_bc(m)
+    optimize(m, F, names, imp, free, fixed, a, thick=P.T, vf_mode=P.VF_MODE, t0=t0)
+
+
+def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_groups=None, t0=None):
+    """SIMP + 密度过滤 + Heaviside 投影（可选鲁棒三场）+ β 续进 + OC。结果写到 a.out。
+    fe_groups 不给时所有工况共用约束 free；给了就按组用不同约束（MultiFE）。"""
+    t0 = t0 or time.time()
+    os.makedirs(a.out, exist_ok=True)
+    H, Hs = build_filter(m, a.rmin)
     KE = element_stiffness(P.NU)
-    E0 = P.E_MAT * P.T; Emin = E0 * 1e-9
+    E0 = P.E_MAT * thick; Emin = E0 * 1e-9
     nlc = F.shape[1]
     print(f"网格 {m.nelx}x{m.nely}, 设计域单元 {m.in_dom.sum()}, 可设计 {m.active.sum()}, 自由度 {free.size}, 工况 {names}")
 
-    x = np.where(m.solid, 1.0, np.where(m.void, 0.0, a.vf))
+    # 计算后端：nx 是 numpy 或 cupy，迭代里的数组都放在对应设备上；project() 里的 np.tanh 会自动分派到 cupy
+    if a.gpu:
+        import cupy as nx
+        import cupyx.scipy.sparse as nsp
+        fe = MultiFE(m, KE, fe_groups, True) if fe_groups else GpuFE(m, KE, F, free)
+        H = nsp.csr_matrix(H)
+        host = nx.asnumpy
+        print(f"后端: GPU（{nx.cuda.runtime.getDeviceProperties(0)['name'].decode()}，cuDSS）")
+    else:
+        nx = np
+        fe = MultiFE(m, KE, fe_groups, False) if fe_groups else CpuFE(m, KE, F, free)
+        host = np.asarray
+        print("后端: CPU（PARDISO）")
+    dev = nx.asarray
+    vmask = m.active if vf_mode == "active" else m.in_dom      # 体积约束统计的区域
+    nd = int(vmask.sum())
+    Hs = dev(Hs); KEd = dev(KE); imp = dev(imp); edof = dev(m.edof); vmf = dev(vmask.astype(float))
+    idx = lambda mask: dev(np.nonzero(mask)[0])               # 下标数组：cupy 上用布尔掩码赋值每次都要同步
+    solid, void, fixed_el = idx(m.solid), idx(m.void), idx(m.solid | m.void)
+    act, inact = idx(m.active), idx(~m.active)
+    vidx, dom = idx(vmask), idx(m.in_dom)
+
+    x = dev(np.where(m.solid, 1.0, np.where(m.void, 0.0, a.vf)))
     beta = 1.0; loop_beta = 0; change = 1.0
-    nd = m.in_dom.sum()
-    solver = pypardiso.PyPardisoSolver(mtype=2)
     hist = []; wts = None
 
     eta_e = a.eta_e if a.robust else 0.5
@@ -193,27 +328,20 @@ def main():
     def physics(x, beta, eta=0.5):
         xt = (H @ x) / Hs
         xp, dxp = project(xt, beta, eta)
-        xp[m.solid] = 1.0; xp[m.void] = 0.0
-        dxp[m.solid | m.void] = 0.0
+        xp[solid] = 1.0; xp[void] = 0.0
+        dxp[fixed_el] = 0.0
         return xp, dxp
 
     vd_star = a.vf
-    vmask = m.active if P.VF_MODE == "active" else m.in_dom      # 体积约束统计的区域
-    nd = int(vmask.sum())
-    print(f"体积约束: {P.VF_MODE}，目标 {a.vf}（统计 {nd} 个单元；非设计实体 {int(m.solid.sum())} 个）")
+    print(f"体积约束: {vf_mode}，目标 {a.vf}（统计 {nd} 个单元；非设计实体 {int(m.solid.sum())} 个）")
     xe, dxe = physics(x, beta, eta_e)
     for it in range(1, a.maxit + 1):
-        sK = (KE.ravel()[None, :] * (Emin + xe[:, None] ** a.penal * (E0 - Emin))).ravel()
-        K = sp.csr_matrix((sK, (m.iK, m.jK)), shape=(m.ndof, m.ndof))
-        Kf = sp.triu(K[free][:, free], format="csr")
-        U = np.zeros((m.ndof, nlc))
-        U[free] = solver.solve(Kf, F[free]) if nlc > 1 else solver.solve(Kf, F[free]).reshape(-1, 1)
-        solver.free_memory()
-        ce = np.zeros((m.nel, nlc))
-        for k in range(nlc):
-            ue = U[m.edof, k]
-            ce[:, k] = np.einsum("ij,jk,ik->i", ue, KE, ue)
         Ek = Emin + xe ** a.penal * (E0 - Emin)
+        U = fe.solve(Ek)
+        ce = nx.zeros((m.nel, nlc))
+        for k in range(nlc):
+            ue = U[edof, k]
+            ce[:, k] = nx.einsum("ij,jk,ik->i", ue, KEd, ue)
         comp = (Ek[:, None] * ce).sum(0)
         if wts is None:
             wts = imp / comp
@@ -221,49 +349,52 @@ def main():
         dc_p = -a.penal * xe ** (a.penal - 1) * (E0 - Emin) * (ce @ wts)
         dc = H.T @ (dc_p * dxe / Hs)
         xdd, dxd = physics(x, beta, eta_d)
-        dv = H.T @ (vmask * dxd / Hs) / nd
+        dv = H.T @ (vmf * dxd / Hs) / nd
         if a.robust and (it == 1 or it % 10 == 0):
             xi_, _ = physics(x, beta, 0.5)
-            vd_star = a.vf * xdd[vmask].mean() / max(xi_[vmask].mean(), 1e-9)
-        dc[~m.active] = 0; dc = np.minimum(dc, -1e-30)
-        dv = np.maximum(dv, 1e-30)
+            vd_star = a.vf * float(xdd[vidx].mean()) / max(float(xi_[vidx].mean()), 1e-9)
+        dc[inact] = 0; dc = nx.minimum(dc, -1e-30)
+        dv = nx.maximum(dv, 1e-30)
         move = 0.1 if beta < 8 else 0.05
         l1, l2 = 0.0, 1e12
-        xa = x[m.active]
+        xa = x[act]
+        q = -dc[act] / dv[act]; lo = nx.maximum(0, xa - move); hi = nx.minimum(1, xa + move)
         while (l2 - l1) / (l1 + l2 + 1e-30) > 1e-5:
             lm = 0.5 * (l1 + l2)
-            xn = np.clip(xa * np.sqrt(-dc[m.active] / dv[m.active] / lm), np.maximum(0, xa - move), np.minimum(1, xa + move))
-            xt = x.copy(); xt[m.active] = xn
+            xn = nx.clip(xa * nx.sqrt(q / lm), lo, hi)
+            xt = x.copy(); xt[act] = xn
             xpt, _ = physics(xt, beta, eta_d)
-            if xpt[vmask].mean() > vd_star: l1 = lm
+            if float(xpt[vidx].mean()) > vd_star: l1 = lm
             else: l2 = lm
-        change = float(np.abs(xn - xa).max())
-        x[m.active] = xn
+        change = float(nx.abs(xn - xa).max())
+        x[act] = xn
         xe, dxe = physics(x, beta, eta_e)
         xp, _ = physics(x, beta, 0.5)
-        vol = float(xp[vmask].mean())
-        grey = float((4 * xp * (1 - xp))[m.in_dom].mean())
-        hist.append(dict(it=it, c=c, vol=vol, change=change, beta=beta, grey=grey, comp=comp.tolist()))
+        vol = float(xp[vidx].mean())
+        grey = float((4 * xp * (1 - xp))[dom].mean())
+        hist.append(dict(it=it, c=c, vol=vol, change=change, beta=beta, grey=grey, comp=host(comp).tolist()))
         if it % 10 == 0 or it == 1:
             print(f"it {it:4d} c={c:.4f} vol={vol:.3f} ch={change:.3f} beta={beta:g} grey={grey:.3f} t={time.time()-t0:.0f}s", flush=True)
         loop_beta += 1
         if beta < a.beta_max and (loop_beta >= 50 or (change < 0.01 and loop_beta >= 20)):
             beta *= 2; loop_beta = 0
             xe, dxe = physics(x, beta, eta_e)
-            fig_save(m, xp, f"{a.out}/xphys_beta{int(beta/2)}.png", f"beta={beta/2:g} it={it}")
+            fig_save(m, host(xp), f"{a.out}/xphys_beta{int(beta/2)}.png", f"beta={beta/2:g} it={it}")
         elif beta >= a.beta_max and loop_beta >= 30:
             c10 = hist[-11]["c"]
             if change < 0.005 or abs(c10 - c) / c < 2e-4:
                 break
 
     xdd, _ = physics(x, beta, eta_d)
+    fe.close()
+    x, xp, xe, xdd, comp = (host(v) for v in (x, xp, xe, xdd, comp))
     np.savez(f"{a.out}/result.npz", x=x, xphys=xp, xero=xe, xdil=xdd, nelx=m.nelx, nely=m.nely, h=m.h,
              in_dom=m.in_dom, solid=m.solid, comp=comp, names=np.array(names))
     with open(f"{a.out}/history.json", "w") as fh:
         json.dump(dict(args=vars(a), names=names, hist=hist), fh, ensure_ascii=False)
     fig_save(m, xp, f"{a.out}/xphys_final.png", f"final it={it} c={c:.3f} vol={vol:.3f} grey={grey:.3f}")
     fig_setup(m, F, free, fixed, f"{a.out}/setup.png")
-    print(f"完成: it={it} c={c:.4f} vol={vol:.3f} grey={grey:.3f} 用时 {time.time()-t0:.0f}s")
+    print(f"完成: it={it} c={c:.4f} vol={vol:.3f} grey={grey:.3f} 用时 {time.time()-t0:.0f}s（{'GPU' if a.gpu else 'CPU'}）")
     for k, nm in enumerate(names):
         print(f"  工况 {nm}: 柔度 {comp[k]:.4e} N·mm")
 
