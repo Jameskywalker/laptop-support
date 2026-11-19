@@ -54,12 +54,15 @@ for v in ORDER:
     verify = json.load(open(f"{md}/verify.json"))
     variants[v] = dict(
         label=LABELS.get(v, v),
-        params=dict(mode=P.MODE, S=P.SPACING, T=P.T, joints=[dict(name=j["name"], cn=j["cn"], x=j["x"], y=j["y"], phi=j["phi"]) for j in P.JOINTS],
+        params=dict(mode=P.MODE, S=P.SPACING, T=P.T, joints=[dict(name=j["name"], cn=j["cn"], x=j["x"], y=j["y"], phi=j["phi"], part=j.get("part", "beam")) for j in P.JOINTS],
+                    panel_ref=(P.panel_joints()[0]["name"] if P.panel_joints() else None),
                     slots=[ring(P.joint_slot(j).exterior.coords) for j in P.JOINTS], BW=P.BEAM_W, BH=P.BEAM_H, TW=P.TENON_W, TH=P.TENON_H,
                     CLEAR=P.CLEAR, theta=P.THETA_DEG, P0=[float(x) for x in P.P0], S_END=P.S_END, X_MAX=P.X_MAX,
                     LIP_T=P.LIP_T, LIP_H=P.LIP_H, LW=P.LAPTOP_W, LD=P.LAPTOP_D),
         snap=snap_section(md),
-        meshes=dict(support=pack(f"{md}/support_left.stl"), beam=pack(f"{md}/beam.stl")),
+        meshes=dict(support=pack(f"{md}/support_left.stl"), beam=pack(f"{md}/beam.stl"),
+                    **({"panel": pack(f"{md}/panel.stl")} if P.panel_joints() else {})),
+        panel=json.load(open(f"{P.OUT_DIR}/panel/verify.json")) if P.panel_joints() else None,
         profile=dict(ext=ring(pg.exterior.coords), holes=[ring(h.coords) for h in pg.interiors]),
         domain=ring(dom.exterior.coords),
         density=dict(w=nelx, h=nely, hmm=float(r["h"]), data=b64(np.clip(np.round(G * 255), 0, 255).astype(np.uint8))),

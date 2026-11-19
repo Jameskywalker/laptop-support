@@ -1,8 +1,8 @@
 {
  "support_left": {
   "watertight": true,
-  "faces": 7732,
-  "volume_cm3": 130.41,
+  "faces": 8984,
+  "volume_cm3": 135.87,
   "extents": [
    255.0,
    186.3,
@@ -11,8 +11,8 @@
  },
  "support_right": {
   "watertight": true,
-  "faces": 7732,
-  "volume_cm3": 130.41,
+  "faces": 8984,
+  "volume_cm3": 135.87,
   "extents": [
    255.0,
    186.3,
@@ -33,10 +33,10 @@
  "tenon_in_left_slab_cm3": 1.2,
  "beam_support_clash_mm3": 0.0,
  "print_mass_g_est": {
-  "support_each": 77,
+  "support_each": 81,
   "beam": 55,
   "beams": 1,
-  "total": 208
+  "total": 217
  },
  "tipping": {
   "cg_x_mm": 145.0,

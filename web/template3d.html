@@ -1,0 +1,284 @@
+<title>支架三维优化</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* 布局：标题 → 左侧大视窗（下接控制条）+ 右侧数据栏；窄屏时数据栏落到视窗下方 */
+:root {
+  --bg: #ECEFF2; --panel: #FFFFFF; --fg: #17202A; --muted: #5A6773; --line: #D2D9E0;
+  --accent: #2958CC; --accent-fg: #FFFFFF; --view: #E2E7EC; --bed: #C7D0D8; --grid: #AEB9C4;
+  --flat: #6E8AA8; --ref: #8A96A3;
+  --v0: #440154; --v1: #3B528B; --v2: #21918C; --v3: #5EC962; --v4: #FDE725;
+  --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0E1318; --panel: #151C23; --fg: #E2E8EE; --muted: #8C99A6; --line: #27313B;
+  --accent: #7FA4FF; --accent-fg: #0E1318; --view: #111820; --bed: #26313C; --grid: #3A4652;
+  --flat: #7F9BBA; --ref: #6F7C89; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0E1318; --panel: #151C23; --fg: #E2E8EE; --muted: #8C99A6; --line: #27313B;
+  --accent: #7FA4FF; --accent-fg: #0E1318; --view: #111820; --bed: #26313C; --grid: #3A4652;
+  --flat: #7F9BBA; --ref: #6F7C89; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); line-height: 1.55 }
+.wrap { max-width: 1320px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 22px 36px; display: grid; gap: 18px }
+header { display: grid; gap: 6px; max-width: 72ch }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .06em; color: var(--muted) }
+h1 { font-size: clamp(22px, 3vw, 30px); line-height: 1.2; margin: 0; font-weight: 650; text-wrap: balance }
+header p { margin: 0; color: var(--muted); font-size: 15px }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; align-items: start }
+@media (max-width: 960px) { .main { grid-template-columns: minmax(0, 1fr) } }
+.stage { display: grid; gap: 10px; min-width: 0 }
+.viewer { position: relative; background: var(--view); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; height: clamp(340px, 64vh, 700px) }
+.viewer canvas { display: block; width: 100%; height: 100% }
+.hint { position: absolute; right: 12px; top: 10px; font-size: 12px; color: var(--muted); pointer-events: none }
+.legend { position: absolute; left: 12px; bottom: 12px; display: grid; gap: 4px; font-family: var(--mono); font-size: 11px; color: var(--muted); background: color-mix(in srgb, var(--view) 82%, transparent); padding: 6px 8px; border-radius: 6px }
+.legend .bar { width: 180px; height: 9px; border-radius: 2px; background: linear-gradient(90deg, var(--v0), var(--v1), var(--v2), var(--v3), var(--v4)) }
+.legend .ticks { display: flex; justify-content: space-between; width: 180px }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel) }
+.seg button { font: inherit; font-size: 13px; border: 0; background: transparent; color: var(--fg); padding: 6px 12px; cursor: pointer }
+.seg button + button { border-left: 1px solid var(--line) }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg) }
+.seg button:focus-visible, .play:focus-visible, input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+.lbl { font-size: 12px; color: var(--muted); margin-right: 6px }
+.layer { display: flex; align-items: center; gap: 10px; flex: 1 1 320px; min-width: 0 }
+.layer input { flex: 1; min-width: 0; accent-color: var(--accent) }
+.layer output { font-family: var(--mono); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; min-width: 15ch }
+.play { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 8px; padding: 5px 10px; cursor: pointer }
+.layer.off { opacity: .45; pointer-events: none }
+aside { display: grid; gap: 14px; min-width: 0 }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 10px; min-width: 0 }
+h2 { font-size: 13px; margin: 0; font-weight: 650; letter-spacing: .02em }
+.sub { font-size: 12px; color: var(--muted); margin: -6px 0 0 }
+dl.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 13px }
+dl.facts dt { color: var(--muted) }
+dl.facts dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right }
+table { width: 100%; border-collapse: collapse; font-size: 13px }
+th { font-weight: 500; color: var(--muted); text-align: left; font-size: 12px; padding-bottom: 4px }
+td { padding: 3px 0; vertical-align: middle }
+td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; padding-left: 8px; white-space: nowrap }
+td.barc { width: 42%; padding-left: 10px }
+.bar { position: relative; height: 8px; background: color-mix(in srgb, var(--line) 60%, transparent); border-radius: 2px }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 2px }
+.bar b { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--fg); opacity: .55 }
+svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
+.notes { margin: 0; padding-left: 1.1em; font-size: 13px; color: var(--muted); display: grid; gap: 4px }
+.key { display: flex; gap: 14px; font-size: 12px; color: var(--muted) }
+.key span::before { content: ""; display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; background: var(--accent) }
+.key span.ref::before { background: var(--ref) }
+.err { color: var(--muted); padding: 20px }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">DESK40 · 40° 前挡落桌 · 单侧支撑</div>
+    <h1>支架三维优化</h1>
+    <p id="lead">在二维轮廓的基础上，按 0.2 mm 层高逐层分配厚度。优化时按实际打印结构计算刚度和用料：墙和上下表皮是实心，中间是稀疏填充。平面贴床打印，材料只从上往下去掉，每一层都落在下一层之上。</p>
+  </header>
+  <div class="main">
+    <div class="stage">
+      <div class="viewer" id="viewer">
+        <div class="hint" id="hint">拖动旋转 · 滚轮缩放 · 右键平移</div>
+        <div class="legend" id="legend"><span>厚度（mm）</span><div class="bar"></div><div class="ticks"><span>0</span><span>5</span><span>10</span><span>15</span><span id="tmaxlbl">19.2</span></div></div>
+      </div>
+      <div class="controls">
+        <div><span class="lbl">视图</span><span class="seg" id="seg-view"><button id="v-print" data-v="print" aria-pressed="true">打印姿态</button><button id="v-asm" data-v="asm" aria-pressed="false">装配</button></span></div>
+        <div><span class="lbl">模型</span><span class="seg" id="seg-model"><button id="m-3d" data-m="3d" aria-pressed="true">三维优化</button><button id="m-2d" data-m="2d" aria-pressed="false">二维方案</button></span></div>
+        <div><span class="lbl">着色</span><span class="seg" id="seg-color"><button id="c-h" data-c="height" aria-pressed="true">按厚度</button><button id="c-p" data-c="plain" aria-pressed="false">单色</button></span></div>
+        <div class="layer" id="layerbox">
+          <button class="play" id="play" type="button">逐层播放</button>
+          <input type="range" id="layer" min="1" max="96" value="96" aria-label="显示到第几层">
+          <output id="layerout" for="layer"></output>
+        </div>
+      </div>
+    </div>
+    <aside>
+      <section>
+        <h2>概况</h2>
+        <dl class="facts" id="facts"></dl>
+      </section>
+      <section>
+        <h2>每层截面积</h2>
+        <p class="sub">自下而上只减不增，所以没有悬空</p>
+        <svg id="chart" viewBox="0 0 320 150" role="img" aria-label="每层截面积"></svg>
+        <div class="key"><span>三维优化</span><span class="ref">二维方案（15 mm 拉伸）</span></div>
+      </section>
+      <section>
+        <h2>各工况刚度</h2>
+        <p class="sub">按打印结构，柔度 三维 / 二维，越小越硬；竖线为二维方案</p>
+        <table id="comp"></table>
+      </section>
+      <section>
+        <h2>后部 150 N 误用工况应力</h2>
+        <p class="sub">墙和表皮里实心材料的应力，99.9% 分位，MPa</p>
+        <table id="stress"></table>
+      </section>
+      <section>
+        <h2>说明</h2>
+        <ul class="notes">
+          <li>横梁接口区厚度固定 15 mm，卡扣和横梁不用改。</li>
+          <li>左右两片是镜像件（support3d_left / right），都是平面朝下打印。</li>
+          <li id="warpnote"></li>
+          <li>最薄处 3 mm，两侧连着厚筋；没有做屈曲分析。</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script type="application/json" id="data">/*__DATA__*/</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function () {
+  const D = JSON.parse(document.getElementById('data').textContent);
+  const $ = (id) => document.getElementById(id);
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const fmt = (v, d) => Number(v).toFixed(d);
+
+  // ---------- 面板 ----------
+  $('tmaxlbl').textContent = fmt(D.tmax, 1);
+  $('lead').textContent += '用料和二维方案相同，加权柔度' + (D.weighted < 1 ? '低 ' + Math.round((1 - D.weighted) * 100) + '%' : '高 ' + Math.round((D.weighted - 1) * 100) + '%') + '（柔度越低越硬）。';
+  $('warpnote').textContent = '平底、单侧加厚，截面不对称：后部 150 N 误用时面内位移 ' + fmt(D.inplane[1] * 1000, 0) + ' µm（二维 ' + fmt(D.inplane[0] * 1000, 0) +
+    ' µm），但会向厚度方向翘曲 ' + fmt(D.warp[1] * 1000, 0) + ' µm（二维 ' + fmt(D.warp[0] * 1000, 0) + ' µm）。刚度目标没有计入翘曲。';
+  const facts = [
+    ['打印设置', D.setting.nwall + ' 圈墙 · 上下 ' + D.setting.nskin + ' 层 · ' + Math.round(D.setting.infill * 100) + '% 填充'],
+    ['单片用料（PETG）', fmt(D.mass3, 0) + ' g'], ['二维方案', fmt(D.mass2, 0) + ' g'],
+    ['外形体积', fmt(D.vol3, 1) + ' cm³（二维 ' + fmt(D.vol2, 1) + '）'],
+    ['层数 · 最高', D.nz + ' 层 · ' + fmt(D.tmax, 1) + ' mm'], ['层高', fmt(D.dz, 1) + ' mm'],
+    ['加权柔度（二维 = 1）', fmt(D.weighted, 2)], ['若按实心打印', fmt(D.weighted_solid, 2)], ['z 向模量折减', fmt(D.kz, 1)],
+  ];
+  $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
+  $('comp').innerHTML = '<tr><th>工况</th><th class="num">比值</th><th></th></tr>' + D.table.map(r =>
+    '<tr><td>' + r.name + '</td><td class="num">' + fmt(r.ratio, 2) + '</td><td class="barc"><div class="bar"><i style="width:' +
+    (Math.min(r.ratio, 1.1) / 1.1 * 100).toFixed(1) + '%"></i><b style="left:' + (100 / 1.1).toFixed(1) + '%"></b></div></td></tr>').join('');
+  $('stress').innerHTML = '<tr><th></th><th class="num">二维</th><th class="num">三维</th></tr>' + D.stress.map(r =>
+    '<tr><td>' + r[0] + '</td><td class="num">' + fmt(r[1], 2) + '</td><td class="num">' + fmt(r[2], 2) + '</td></tr>').join('');
+
+  // 每层截面积图（同一比例尺）
+  const svg = $('chart'), W = 320, H = 150, L = 34, R = 8, T = 8, B = 24;
+  const amax = Math.max(...D.area3, ...D.area2), ymax = Math.ceil(amax / 20) * 20;
+  const X = (k) => L + (k - 0.5) / D.nz * (W - L - R), Y = (a) => T + (1 - a / ymax) * (H - T - B);
+  const step = (arr) => { let p = ''; arr.forEach((a, i) => { const x0 = L + i / D.nz * (W - L - R), x1 = L + (i + 1) / D.nz * (W - L - R); p += (i ? 'L' : 'M') + x0.toFixed(1) + ',' + Y(a).toFixed(1) + 'L' + x1.toFixed(1) + ',' + Y(a).toFixed(1); }); return p; };
+  let g = '';
+  for (let a = 0; a <= ymax; a += ymax / 4) g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(a) + '" y2="' + Y(a) + '" stroke="var(--line)" stroke-width="1"/><text x="' + (L - 5) + '" y="' + (Y(a) + 3) + '" text-anchor="end">' + Math.round(a) + '</text>';
+  [1, 24, 48, 75, 96].filter(k => k <= D.nz).forEach(k => g += '<text x="' + X(k) + '" y="' + (H - 8) + '" text-anchor="middle">' + k + '</text>');
+  g += '<text x="' + (L - 5) + '" y="' + (T - 0) + '" text-anchor="end" dy="-1">cm²</text>';
+  g += '<path d="' + step(D.area2) + '" fill="none" stroke="var(--ref)" stroke-width="1.5" stroke-dasharray="4 3"/>';
+  g += '<path d="' + step(D.area3) + '" fill="none" stroke="var(--accent)" stroke-width="2"/>';
+  g += '<line id="cursor" y1="' + T + '" y2="' + (H - B) + '" stroke="var(--fg)" stroke-width="1" opacity=".6"/>';
+  svg.innerHTML = g;
+
+  if (!window.THREE || !THREE.OrbitControls) { $('viewer').innerHTML = '<p class="err">三维视图加载失败（three.js 没有加载上）。右侧数据不受影响。</p>'; return; }
+
+  // ---------- 网格 ----------
+  const u8 = (s) => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
+  const stops = ['--v0', '--v1', '--v2', '--v3', '--v4'].map(n => new THREE.Color(css(n)));
+  function ramp(t) { t = Math.min(1, Math.max(0, t)) * 4; const i = Math.min(3, Math.floor(t)); return stops[i].clone().lerp(stops[i + 1], t - i); }
+  function geom(pk) {
+    const q = new Uint16Array(u8(pk.pos).buffer), n = q.length / 3, pos = new Float32Array(q.length), col = new Float32Array(q.length);
+    for (let i = 0; i < n; i++) {
+      for (let d = 0; d < 3; d++) pos[3 * i + d] = pk.min[d] + q[3 * i + d] / 65535 * pk.size[d];
+      const c = ramp(pos[3 * i + 2] / D.tmax); col[3 * i] = c.r; col[3 * i + 1] = c.g; col[3 * i + 2] = c.b;
+    }
+    const idx = pk.u32 ? new Uint32Array(u8(pk.idx).buffer) : new Uint16Array(u8(pk.idx).buffer);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    return g;
+  }
+  const G = { '3d': geom(D.mesh3), '2d': geom(D.mesh2) }, Gb = geom(D.beam);
+
+  const viewer = $('viewer');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.localClippingEnabled = true;
+  viewer.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(35, 1, 1, 5000);
+  camera.up.set(0, 0, 1);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.75));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.75); sun.position.set(-0.5, -0.8, 1.2); scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.25); fill.position.set(0.8, 0.6, -0.4); scene.add(fill);
+
+  const clip = new THREE.Plane(new THREE.Vector3(0, 0, -1), D.tmax);
+  const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.65, metalness: 0 });
+  const matBeam = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.7, metalness: 0, color: 0xb9c2cc });
+  const M4 = (a) => new THREE.Matrix4().set(...a);
+
+  // 打印姿态：H3C 热床 330 × 320 mm
+  const print = new THREE.Group(); scene.add(print);
+  const bedMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+  const bed = new THREE.Mesh(new THREE.PlaneGeometry(D.bed[0], D.bed[1]), bedMat); bed.position.z = -0.05; print.add(bed);
+  const gl = [];
+  for (let x = -D.bed[0] / 2; x <= D.bed[0] / 2 + 1e-6; x += 10) gl.push(x, -D.bed[1] / 2, 0, x, D.bed[1] / 2, 0);
+  for (let y = -D.bed[1] / 2; y <= D.bed[1] / 2 + 1e-6; y += 10) gl.push(-D.bed[0] / 2, y, 0, D.bed[0] / 2, y, 0);
+  const gridGeo = new THREE.BufferGeometry(); gridGeo.setAttribute('position', new THREE.Float32BufferAttribute(gl, 3));
+  const gridMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.6 });
+  print.add(new THREE.LineSegments(gridGeo, gridMat));
+  const pm = { '3d': new THREE.Mesh(G['3d'], matSup), '2d': new THREE.Mesh(G['2d'], matSup) };
+  for (const k in pm) { pm[k].position.set(-D.center[0], -D.center[1], 0); print.add(pm[k]); }
+
+  // 装配：两片支撑（右侧为镜像）+ 三根横梁
+  const asm = new THREE.Group(); scene.add(asm);
+  const am = { '3d': [], '2d': [] };
+  for (const k of ['3d', '2d']) for (const mat of D.supportMats) {
+    const m = new THREE.Mesh(G[k], matSup); m.matrixAutoUpdate = false; m.matrix.copy(M4(mat)); asm.add(m); am[k].push(m);
+  }
+  for (const mat of D.beamMats) { const m = new THREE.Mesh(Gb, matBeam); m.matrixAutoUpdate = false; m.matrix.copy(M4(mat)); asm.add(m); }
+
+  const S = { view: 'print', model: '3d', color: 'height', layer: D.nz };
+  function render() { renderer.render(scene, camera); }
+  function frame(obj) {
+    const box = new THREE.Box3().setFromObject(obj), c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
+    const dir = S.view === 'print' ? new THREE.Vector3(-0.35, -1.0, 0.95) : new THREE.Vector3(-1.1, -0.9, 0.75);
+    const dist = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * (S.view === 'print' ? 0.85 : 0.95);
+    controls.target.copy(c); camera.position.copy(c).add(dir.normalize().multiplyScalar(dist)); controls.update();
+  }
+  function apply(refit) {
+    print.visible = S.view === 'print'; asm.visible = S.view === 'asm';
+    for (const k in pm) pm[k].visible = k === S.model;
+    for (const k in am) am[k].forEach(m => m.visible = k === S.model);
+    matSup.vertexColors = S.color === 'height';
+    matSup.color.set(S.color === 'height' ? 0xffffff : css('--flat'));
+    matSup.clippingPlanes = S.view === 'print' ? [clip] : [];
+    matSup.needsUpdate = true;
+    $('legend').hidden = S.color !== 'height';
+    $('layerbox').classList.toggle('off', S.view !== 'print');
+    const zc = S.layer * D.dz; clip.constant = zc + 1e-3;
+    $('layerout').textContent = '第 ' + S.layer + ' 层 · z ' + fmt(zc, 1) + ' mm';
+    const cur = $('cursor'); if (cur) { cur.setAttribute('x1', X(S.layer)); cur.setAttribute('x2', X(S.layer)); }
+    if (refit) frame(S.view === 'print' ? pm[S.model] : asm);
+    render();
+  }
+  function seg(id, key) {
+    $(id).addEventListener('click', (e) => {
+      const b = e.target.closest('button'); if (!b) return;
+      S[key] = b.dataset.v || b.dataset.m || b.dataset.c;
+      $(id).querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+      apply(key === 'view');
+    });
+  }
+  seg('seg-view', 'view'); seg('seg-model', 'model'); seg('seg-color', 'color');
+  const slider = $('layer'); slider.max = D.nz; slider.value = D.nz;
+  slider.addEventListener('input', () => { S.layer = +slider.value; apply(false); });
+  let timer = null;
+  $('play').addEventListener('click', () => {
+    if (timer) { clearInterval(timer); timer = null; $('play').textContent = '逐层播放'; return; }
+    S.layer = 1; slider.value = 1; $('play').textContent = '停止';
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    timer = setInterval(() => {
+      S.layer = Math.min(D.nz, S.layer + (reduce ? 8 : 1)); slider.value = S.layer; apply(false);
+      if (S.layer >= D.nz) { clearInterval(timer); timer = null; $('play').textContent = '逐层播放'; }
+    }, reduce ? 200 : 45);
+  });
+  controls.addEventListener('change', render);      // 只在交互时重绘，不常驻占用显卡
+  function theme() { renderer.setClearColor(css('--view')); bedMat.color.set(css('--bed')); gridMat.color.set(css('--grid')); if (S.color !== 'height') matSup.color.set(css('--flat')); render(); }
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', theme);
+  new MutationObserver(theme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  new ResizeObserver(() => { const w = viewer.clientWidth, h = viewer.clientHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); render(); }).observe(viewer);
+  theme(); apply(true);
+})();
+</script>

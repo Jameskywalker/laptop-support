@@ -1,6 +1,6 @@
 {
  "support_left": {
-  "volume_cm3": 130.41,
+  "volume_cm3": 135.87,
   "bbox_mm": [
    255.0,
    186.3,
@@ -9,7 +9,7 @@
   "valid": true
  },
  "support_right": {
-  "volume_cm3": 130.41,
+  "volume_cm3": 135.87,
   "bbox_mm": [
    255.0,
    186.3,

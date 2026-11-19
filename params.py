@@ -14,7 +14,7 @@ import re
 import numpy as np
 import shapely
 import shapely.affinity
-from shapely.geometry import Polygon, box, Point
+from shapely.geometry import Polygon, box, Point, LineString
 
 VARIANT = os.environ.get("STAND_VARIANT", "desk40")
 _m = re.fullmatch(r"(desk|raised)(\d+(?:\.\d+)?)", VARIANT)
@@ -94,25 +94,43 @@ SNAP_PLAY = 0.15          # 卡钩与支撑外侧面之间的轴向间隙
 _HB = BEAM_W / 2 + JOINT_MARGIN          # 接口实体区半宽（短边方向）= 13
 _HA = BEAM_H / 2 + JOINT_MARGIN          # 接口实体区半长（长边方向）= 25
 if MODE == "raised":
-    JOINTS = [dict(name="rear", cn="后", x=212.0, y=75.0, phi=90.0)]
+    JOINTS = [dict(name="rear", cn="后", x=212.0, y=75.0, phi=90.0, part="beam")]
 else:
-    # 后横梁：放在"顶面后端 → 后脚"连线上、离地约 45% 处（后腿的天然传力路径上），截面竖放
-    _Fr = np.array([X_MAX - FOOT_LEN / 2, 0.0])
-    _J = _E + 0.55 * (_Fr - _E)
-    # 前横梁：截面与斜面平行，紧贴顶面实体带下方；尽量靠前，直到接口区最低角碰到桌面
+    # 三个接口放在支撑三角形的三个顶点附近（2026-11-20 起）。
+    # 前、顶两个接口的截面都与斜面平行、在同一平面上（离笔记本底面 10 mm），由一块拓扑优化的面板连起来（part="panel"，见 panel.py）；
+    # 后接口仍是单独一根横梁（part="beam"）。
+    # 前（前下顶点）：紧贴顶面实体带下方；尽量靠前，直到接口区最低角碰到桌面
     _nc = -TB - _HB
     _sc = _HA + ((_HB - _nc) * np.cos(TH) - P0[1]) / np.sin(TH) + 2.0
     _Jf = P0 + _sc * U + _nc * N
-    # 底横梁：截面平放在底边上（离桌面 BASE_H），位于前后两根横梁中间
+    # 顶（上顶点）：顶面实体带后端正下方
+    _Jt = P0 + (S_END - _HA - 2.0) * U + _nc * N
+    # 后（后下顶点）：后脚正上方，截面平放，离桌面 BASE_H
     JOINTS = [
-        dict(name="rear", cn="后", x=round(float(_J[0]), 1), y=round(float(_J[1]), 1), phi=90.0),
-        dict(name="front", cn="前", x=round(float(_Jf[0]), 1), y=round(float(_Jf[1]), 1), phi=THETA_DEG),
-        dict(name="bottom", cn="底", x=round(float((_J[0] + _Jf[0]) / 2), 1), y=_HB, phi=0.0),
+        dict(name="front", cn="前", x=round(float(_Jf[0]), 1), y=round(float(_Jf[1]), 1), phi=THETA_DEG, part="panel"),
+        dict(name="top", cn="顶", x=round(float(_Jt[0]), 1), y=round(float(_Jt[1]), 1), phi=THETA_DEG, part="panel"),
+        dict(name="rear", cn="后", x=round(X_MAX - _HA - 2.0, 1), y=_HB, phi=0.0, part="beam"),
     ]
 
 # ---------------- 材料（等效 PLA/PETG 打印件） ----------------
 E_MAT = 2500.0            # MPa，考虑填充/层间后的等效模量
 NU = 0.35
+
+# ---------------- 三维优化（topopt3d.py） ----------------
+# 打印时支撑侧面贴床，z = 打印方向。三维优化用"高度场"：每根 1×1 mm 柱子只有一个高度，
+# 材料只能从顶面往下去掉 → 每层都完整落在下一层之上，无悬空；底面平整贴床。
+LAYER_H = 0.2             # 层高 = z 向单元高度
+KZ = 0.5                  # z 向（层间）模量、层间剪切模量的折减系数，模拟层间结合弱于层内
+T3_MAX = 19.2             # 初始模型厚度（96 层）；多重网格要求层数能被 8 整除
+T3_DILATE = 3.0           # 二维结果向外膨胀量，作为三维初始模型的轮廓
+T3_MIN = 3.0              # 最小厚度：比它薄的柱子刚度按 (t/T3_MIN)^3 惩罚，避免出现薄皮
+F_SIDE = 10.0             # 侧推：笔记本被横向推动，经顶面摩擦传给单侧支撑（z 向）
+F_JOINT_Z = 10.0          # 横梁传来的轴向力（z 向）
+# 打印结构（三维优化 --model print 与复核用）：墙、上下表皮为实心，其余为稀疏填充
+LINE_W = 0.42             # 挤出线宽
+NWALL = 3                 # 墙圈数 → 墙厚 1.26 mm
+NSKIN = 4                 # 顶/底实心层数（各 0.8 mm）
+INFILL = 0.15             # gyroid 填充率；刚度按 INFILL² 折算，用料按 INFILL 计
 
 # ---------------- 载荷（单个支撑） ----------------
 G = 9.81
@@ -157,6 +175,67 @@ def joint_slot(j=None):
     return _place(shapely.unary_union([box(-a / 2, -b / 2, a / 2, b / 2)] + corners), j)
 
 
+SLOT_A, SLOT_B = TENON_H + 2 * CLEAR, TENON_W + 2 * CLEAR    # 方槽长边（卡扣臂所在方向）× 短边
+
+
+def slot_uv(j, x, y):
+    """全局坐标 → 横梁 j 的方槽局部坐标（u 沿长边，v 沿短边，原点在槽中心）"""
+    ph = np.deg2rad(j["phi"]); c, s = np.cos(ph), np.sin(ph)
+    dx, dy = np.asarray(x, float) - j["x"], np.asarray(y, float) - j["y"]
+    return dx * c + dy * s, -dx * s + dy * c
+
+
+def slot_bearing(j, x, y, f, tol):
+    """横梁面内力 f 的承压权重：卡扣臂顶在法向朝向 f 的槽壁上，权重 = max(0, 槽壁外法向·f 方向)。
+    只取离槽壁 tol 以内的点；其余为 0。"""
+    u, v = slot_uv(j, x, y)
+    a2, b2 = SLOT_A / 2, SLOT_B / 2
+    near = (np.abs(u) <= a2 + tol) & (np.abs(v) <= b2 + tol) & ((np.abs(u) >= a2 - tol) | (np.abs(v) >= b2 - tol))
+    on_u = np.abs(u) / a2 >= np.abs(v) / b2                     # 落在短边壁（u = ±a/2）上
+    nu = np.where(on_u, np.sign(u), 0.0); nv = np.where(on_u, 0.0, np.sign(v))
+    ph = np.deg2rad(j["phi"]); c, s = np.cos(ph), np.sin(ph)
+    fx, fy = np.asarray(f, float) / np.hypot(*f)
+    w = np.maximum(0.0, (nu * c - nv * s) * fx + (nu * s + nv * c) * fy)
+    return np.where(near, w, 0.0)
+
+
+def hook_strip(j, x, y, tol):
+    """卡钩扣住支撑外侧面的搭接带：方槽两端（长边方向）各一条，宽 HOOK_H − CLEAR"""
+    u, v = slot_uv(j, x, y)
+    return (np.abs(u) >= SLOT_A / 2 - tol) & (np.abs(u) <= TENON_H / 2 + HOOK_H + tol) & (np.abs(v) <= TENON_W / 2 + tol)
+
+
+# ---------------- 面板（前、顶两个接口合成一块，见 panel.py） ----------------
+PANEL_T = BEAM_W          # 面板厚 = 横梁截面短边，四角卡扣与横梁端头完全相同；平放打印
+PANEL_VF = 0.20           # 面板拓扑优化的体积分数（四角实体区不计入）
+PANEL_BODY = 25.0         # 四角实体区沿横向的长度（卡扣臂根部和让位槽都在里面）
+F_RACK = 10.0             # 面板工况的力（两片支撑上部相对下部横向错动、互相撑开、前后错动）
+
+
+def panel_joints():
+    """属于面板的接口，按沿斜面位置从前到后排"""
+    js = [j for j in JOINTS if j.get("part") == "panel"]
+    return sorted(js, key=lambda j: float(xy2sn(j["x"], j["y"])[0]))
+
+
+def snap_end(sx, half, yc=0.0):
+    """横梁/面板一端的卡扣，打印平面坐标：X 沿横向，支撑内侧面在 X = sx·half；Y 沿截面长边，卡扣中心在 Y = yc。
+    返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、两臂之间让位。"""
+    yA = TENON_H / 2; yI = yA - ARM_T
+    uc = T + SNAP_PLAY; uL = uc + HOOK_FLAT + HOOK_RAMP
+
+    def T_(u, y):
+        return (sx * (half + u), yc + y)
+    parts, cuts = [], []
+    for sy in (1, -1):
+        parts.append(Polygon([T_(-1, sy * yI), T_(uL, sy * yI), T_(uL, sy * yA), T_(-1, sy * yA)]))
+        parts.append(Polygon([T_(uc, sy * (yA - 0.01)), T_(uc, sy * (yA + HOOK_H)), T_(uc + HOOK_FLAT, sy * (yA + HOOK_H)), T_(uL, sy * (yA - 0.01))]))
+        w = RELIEF_W
+        cuts.append(LineString([T_(-ARM_ROOT + w / 2, sy * (yA + w / 2)), T_(2, sy * (yA + w / 2))]).buffer(w / 2))
+    cuts.append(Polygon([T_(-ARM_ROOT, -yI), T_(3, -yI), T_(3, yI), T_(-ARM_ROOT, yI)]).buffer(-2).buffer(2))
+    return parts, cuts
+
+
 def snap_strain():
     """卡扣臂扣入时的最大弯曲应变（悬臂梁近似 ε = 1.5·t·δ/L²）"""
     delta = HOOK_H - CLEAR
@@ -195,6 +274,10 @@ def geometry(use_joint=USE_JOINT):
         **extra,
     }
     if use_joint:
+        # 接口区实体，方槽是贯通孔：从设计域和所有实体区里挖掉，优化时就按有孔计算
         for j in JOINTS:
             solids["joint_" + j["name"]] = joint_rect(2 * _HB, 2 * _HA, j)
+        slots = joint_slot()
+        domain = domain.difference(slots)
+        solids = {k: g.difference(slots) for k, g in solids.items()}
     return domain, solids

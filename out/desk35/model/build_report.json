@@ -1,6 +1,6 @@
 {
  "support_left": {
-  "volume_cm3": 115.85,
+  "volume_cm3": 116.02,
   "bbox_mm": [
    278.1,
    125.9,
@@ -9,7 +9,7 @@
   "valid": true
  },
  "support_right": {
-  "volume_cm3": 115.85,
+  "volume_cm3": 116.02,
   "bbox_mm": [
    278.1,
    125.9,
@@ -26,6 +26,15 @@
   ],
   "valid": true
  },
+ "panel": {
+  "volume_cm3": 136.1,
+  "bbox_mm": [
+   243.3,
+   161.8,
+   16.0
+  ],
+  "valid": true
+ },
  "assembly": {
   "bbox_mm": [
    243.3,
@@ -35,22 +44,25 @@
  },
  "beams": [
   {
-   "name": "rear",
-   "x": 228.5,
-   "y": 56.8,
-   "phi": 90.0
-  },
-  {
    "name": "front",
    "x": 71.5,
    "y": 26.1,
-   "phi": 35.0
+   "phi": 35.0,
+   "part": "panel"
   },
   {
-   "name": "bottom",
-   "x": 150.0,
+   "name": "top",
+   "x": 171.3,
+   "y": 96.0,
+   "phi": 35.0,
+   "part": "panel"
+  },
+  {
+   "name": "rear",
+   "x": 251.1,
    "y": 13.0,
-   "phi": 0.0
+   "phi": 0.0,
+   "part": "beam"
   }
  ],
  "interference_beam_left_mm3": 0,

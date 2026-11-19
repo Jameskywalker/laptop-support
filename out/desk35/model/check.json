@@ -1,8 +1,8 @@
 {
  "support_left": {
   "watertight": true,
-  "faces": 5628,
-  "volume_cm3": 115.85,
+  "faces": 6800,
+  "volume_cm3": 116.02,
   "extents": [
    278.1,
    125.9,
@@ -11,8 +11,8 @@
  },
  "support_right": {
   "watertight": true,
-  "faces": 5628,
-  "volume_cm3": 115.85,
+  "faces": 6800,
+  "volume_cm3": 116.02,
   "extents": [
    278.1,
    125.9,
@@ -29,19 +29,22 @@
    16.0
   ]
  },
- "beams": 3,
+ "panel": true,
+ "beams": 1,
+ "tenons_per_side": 3,
  "tenon_in_left_slab_cm3": 3.6,
  "beam_support_clash_mm3": 0.0,
  "print_mass_g_est": {
-  "support_each": 68,
+  "support_each": 67,
   "beam": 55,
-  "beams": 3,
-  "total": 301
+  "beams": 1,
+  "panel": 79,
+  "total": 269
  },
  "tipping": {
   "cg_x_mm": 124.4,
   "push_height_mm": 345,
-  "F_tip_backward_N": 8.2,
-  "F_tip_forward_N": 6.8
+  "F_tip_backward_N": 8.1,
+  "F_tip_forward_N": 6.7
  }
 }
