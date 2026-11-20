@@ -1,0 +1,93 @@
+"""
+无填充三维优化预览网页：把三维优化支撑、尖拱空腔对照、二维方案、面板、后横梁的网格和复核数据嵌入
+web/template_noinfill.html → web/noinfill_preview.html
+用法: STAND_VARIANT=desk40 python make_web_noinfill.py [--dir out/desk40/model_noinfill]   （需先运行 topopt3d_noinfill.py 和 export3d_noinfill.py）
+"""
+import argparse, base64, json
+import numpy as np
+import trimesh
+import manifold3d as m3d
+import params as P
+
+
+def b64(a):
+    return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
+
+
+def pack(m):
+    v = np.asarray(m.vertices, float); f = np.asarray(m.faces)
+    mn = v.min(0); sz = v.max(0) - mn; sz[sz == 0] = 1
+    q = np.round((v - mn) / sz * 65535).astype("<u2")
+    u32 = len(v) >= 65536
+    return dict(min=mn.round(5).tolist(), size=sz.round(5).tolist(), pos=b64(q), idx=b64(f.astype("<u4" if u32 else "<u2")), u32=u32)
+
+
+def display_mesh(fn, tol):
+    """显示用网格：manifold 简化（tol mm 以内），面数降到原来的几分之一"""
+    m = trimesh.load(fn)
+    man = m3d.Manifold(m3d.Mesh(vert_properties=np.asarray(m.vertices, np.float32), tri_verts=np.asarray(m.faces, np.uint32)))
+    mm = man.simplify(tol).to_mesh()
+    return trimesh.Trimesh(np.asarray(mm.vert_properties)[:, :3], np.asarray(mm.tri_verts), process=False)
+
+
+def T_beam(j):
+    """横梁 / 面板打印坐标 → 世界坐标（与 render.py 相同）"""
+    ph = np.deg2rad(j["phi"]); c, s = np.cos(ph), np.sin(ph)
+    M = np.eye(4); M[:3, :3] = [[1, 0, 0], [0, c, -s], [0, s, c]]
+    M[:3, 3] = [0, j["x"] + P.BEAM_W / 2 * s, j["y"] - P.BEAM_W / 2 * c]
+    return M
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default=f"{P.OUT_DIR}/model_noinfill")
+    ap.add_argument("--tol", type=float, default=0.12)
+    a = ap.parse_args()
+    ver = json.load(open(f"{a.dir}/verify.json"))
+    res = {r["key"]: dict(r, label=nm) for nm, r in ver["results"].items()}
+    names = ver["names"]
+    cases = [c for c in names if c not in ("侧推后段", "z向体力", "前部误用150N", "后部误用150N")]
+    iF, iR = names.index("前部误用150N"), names.index("后部误用150N")
+    designs = []
+    for k in ("free", "gable", "flat"):
+        r = res[k]
+        st = r["stress"]
+        designs.append(dict(key=k, label=r["label"], mass=r["petg_g"], weighted=r["weighted_orig"],
+                            rel={c: r["rel"][names.index(c)] for c in cases},
+                            buck_f=r["buckling"]["前部误用150N"], buck_r=r["buckling"]["后部误用150N"],
+                            vm_f=st[iF]["VM_99_9pct_MPa"], vm_r=st[iR]["VM_99_9pct_MPa"],
+                            z_f=st[iF]["z向位移_mm"] * 1000, z_r=st[iR]["z向位移_mm"] * 1000))
+    meshes = {k: display_mesh(f"{a.dir}/{fn}", a.tol) for k, fn in
+              (("free", "support_noinfill_left.stl"), ("gable", "support_gable_left.stl"))}
+    meshes["flat"] = trimesh.load(f"{P.MODEL_DIR}/support_left.stl")
+    labels = dict(free="无填充三维", gable="尖拱空腔", flat="二维方案")
+    Ls = np.eye(4); Ls[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]; Ls[:3, 3] = [-P.SPACING / 2 - P.T / 2, 0, 0]
+    Rs = np.diag([-1, 1, 1, 1]) @ Ls
+    rear = [j for j in P.JOINTS if j.get("part", "beam") == "beam"][0]
+    m0 = meshes["free"]
+    ha = ver["args"]
+    gw = ver.get("gable_wall_mm")
+    notes = [
+        "打印：侧面贴床，不加支撑。切片时内部按实心打印（墙圈数加够，或稀疏填充设 100%）；三个横梁接口区加修改器，仍用 4 圈墙 + 15–25% 填充。",
+        "封闭空腔留在零件里面，FDM 不用清理。空腔顶部最后一层是跨度不到 2 mm 的短桥。",
+        "左右两片是镜像件，都是 z = 0 的那面贴床；装配时这一面朝外，卡钩扣在这一面。",
+        "尖拱空腔对照：同一个二维轮廓，内部挖成 45° 尖顶空腔，墙厚 " + (f"{gw:.2f}" if gw else "—") + " mm 时与二维方案同样用料。",
+        "侧向位移：面内载荷引起的厚度方向位移。单片模型里接口在 z 向是自由的；装配后面板和横梁会拉住接口，实际会小一些。",
+    ]
+    B = np.load(f"{a.dir}/binary.npz")["B"]
+    t = B.sum(2); thin = float((t[t > 0] <= 1).mean())          # 只有一层体素厚的柱子占比
+    data = dict(T=P.T, thin=thin, nz=int(ha["nz"]), h=P.T / int(ha["nz"]), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
+                center=[float(m0.bounds[:, 0].mean()), float(m0.bounds[:, 1].mean())], xmax=float(m0.bounds[1, 0]),
+                cavities=ver["mesh"]["cavities_mm3"], overhang=dict(area=ver["overhang"]["悬空总面积_mm2"], bridge=ver["overhang"]["短桥面积_mm2"]),
+                cases=cases, designs=designs, notes=notes,
+                models=[dict(key=k, label=labels[k], mesh=pack(meshes[k])) for k in ("free", "gable", "flat")],
+                supportMats=[Ls.ravel().round(6).tolist(), Rs.ravel().round(6).tolist()],
+                beamMat=T_beam(rear).ravel().round(6).tolist(), panelMat=T_beam(P.panel_joints()[0]).ravel().round(6).tolist(),
+                beam=pack(trimesh.load(f"{P.MODEL_DIR}/beam.stl")), panel=pack(trimesh.load(f"{P.MODEL_DIR}/panel.stl")))
+    html = open("web/template_noinfill.html", encoding="utf-8").read().replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    open("web/noinfill_preview.html", "w", encoding="utf-8").write(html)
+    print("网格面数", {k: len(m.faces) for k, m in meshes.items()}, f"；页面 {len(html)/1e6:.2f} MB")
+
+
+if __name__ == "__main__":
+    main()
