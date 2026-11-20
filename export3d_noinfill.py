@@ -15,7 +15,7 @@ import argparse, json, os, time
 import numpy as np
 import shapely
 from shapely.geometry import Polygon, MultiPolygon
-from scipy.ndimage import label, distance_transform_edt
+from scipy.ndimage import label, distance_transform_edt, binary_opening
 from skimage import measure, morphology
 import manifold3d as m3d
 import trimesh
@@ -34,6 +34,19 @@ def binarize(M, xi):
     B2 = lab == int(sizes.argmax())
     info = dict(悬空去掉体素=int((B & ~B1).sum()), 碎块数=int(n - 1), 碎块体素=int((B1 & ~B2).sum()))
     return B2 & d3, info                                    # 只返回设计区部分
+
+
+def thin_stats(M, B, tmin):
+    """B：设计区二值。用直径 tmin 的球做形态学开运算（网格外按空），被去掉的设计区体素就是比 tmin 薄的板 / 杆"""
+    S = np.where(M.design3, B, M.E_fix > 0)
+    r = tmin / 2 / M.h; R = int(np.ceil(r)); o = np.arange(-R, R + 1)
+    di, dj, dk = np.meshgrid(o, o, o, indexing="ij")
+    ball = di ** 2 + dj ** 2 + dk ** 2 <= r * r + 1e-9
+    thin = S & ~binary_opening(S, structure=ball) & M.design3
+    sol = S & M.design3
+    t = sol.sum(2)
+    return dict(tmin_mm=tmin, 薄于tmin体积比例=round(float(thin.sum() / max(1, sol.sum())), 4),
+                含薄处柱子比例=round(float(thin.any(2)[t > 0].mean()), 4), 单层柱子比例=round(float((t[t > 0] <= 1).mean()), 4))
 
 
 # ---------------- 尖拱空腔对照 ----------------
@@ -139,6 +152,8 @@ def main():
     ap.add_argument("--dir", default=N.OUT)
     ap.add_argument("--no-gable", action="store_true")
     ap.add_argument("--no-buckling", action="store_true")
+    ap.add_argument("--ref", default=None, help="另一次三维结果（同 nz 的 result.npz 所在目录）一起复核，例如无约束的那次")
+    ap.add_argument("--tmin", type=float, default=None, help="薄壁统计用的厚度 mm（默认取优化时的 --tmin，没有则 1.9）")
     a = ap.parse_args()
     t0 = time.time()
     r = np.load(f"{a.dir}/result.npz")
@@ -160,7 +175,21 @@ def main():
         gable_wall, (Eg, mg, sg) = gable_matched(M, float(m2.sum()) * M.h ** 3)
         print(f"尖拱空腔对照：墙厚 {gable_wall:.2f} mm 时用料相同", flush=True)
         nm = f"二维方案 + 尖拱空腔（无填充，墙 {gable_wall:.2f} mm）"; designs[nm] = (Eg, mg, sg); keys[nm] = "gable"
-    nm = "无填充三维优化"; designs[nm] = M.design_fields(B.astype(float)); keys[nm] = "free"
+    tmin = a.tmin or ha.get("tmin") or 1.9
+    thin = {}
+    if a.ref:
+        rr = np.load(f"{a.ref}/result.npz")
+        if rr["xi"].shape == xi.shape:
+            Bo, info_o = binarize(M, rr["xi"].astype(float))
+            nm = "无填充三维（无约束）"; designs[nm] = M.design_fields(Bo.astype(float)); keys[nm] = "free_old"
+            thin[nm] = thin_stats(M, Bo, tmin)
+        else:
+            print(f"--ref 网格 {rr['xi'].shape} 与本次 {xi.shape} 不同，跳过", flush=True)
+    cons = [f"屈曲 ≥ {ha['buck']:g}" if ha.get("buck") else "", f"最薄 {ha['tmin']:g} mm" if ha.get("tmin") else ""]
+    nm = "无填充三维优化" + (f"（{'，'.join(c for c in cons if c)}）" if any(cons) else "")
+    designs[nm] = M.design_fields(B.astype(float)); keys[nm] = "free"
+    thin[nm] = thin_stats(M, B, tmin)
+    print("薄壁统计：", thin, flush=True)
     res = {}
     buck_cases = [k for k, nm in enumerate(M.names) if nm in ("前部误用150N", "后部误用150N")]
     for nm, (E, m, s) in designs.items():
@@ -169,7 +198,7 @@ def main():
         comps, its = M.solve(E)
         st = M.stresses(s)
         mass = float(m.sum()) * M.h ** 3
-        res[nm] = dict(key=keys[nm], comp=comps.tolist(), stress=st, mass_cm3=mass / 1000, petg_g=mass / 1000 * 1.27, cg=its,
+        res[nm] = dict(key=keys[nm], comp=comps.tolist(), stress=st, mass_cm3=mass / 1000, petg_g=mass / 1000 * 1.27, cg=its, thin=thin.get(nm),
                        warp_um={k: [round(v[0] * 1000, 2), round(v[1] * 1000, 2)] for k, v in M.warp_measures().items()})   # 顶面平均 z 位移：全长、后半段
         print(f"{nm}: 用料 {mass/1000:.2f} cm³（PETG {mass/1000*1.27:.0f} g），CG {sum(its)}", flush=True)
         if not a.no_buckling:
@@ -229,7 +258,8 @@ def main():
     summary = dict(names=names, binarize=info, mesh=dict(faces=len(left.faces), watertight=bool(left.is_watertight), volume_cm3=left.volume / 1000,
                    printed_cm3=mass_mesh, petg_g=mass_mesh * 1.27, bodies=int(sum(p.volume() > 0 for p in parts)), cavities_mm3=cav), overhang=oh,
                    target_cm3=target / 1000, results=res, table=table, args=ha, gable_wall_mm=gable_wall,
-                   overhang_gable=oh_g if gable_wall is not None else None)
+                   overhang_gable=oh_g if gable_wall is not None else None,
+                   ref_model_dir=(a.ref.replace("noinfill", "model_noinfill") if a.ref and "noinfill" in a.ref else None))
     json.dump(summary, open(f"{md}/verify.json", "w"), ensure_ascii=False, indent=1)
     np.savez_compressed(f"{md}/binary.npz", B=B, h=M.h)
     N.fig_sections(M, np.where(M.design3, B, M.E_fix > 0).astype(float), f"{md}/sections_binary.png", "二值化后的剖面（x = 常数，纵轴为打印方向）")

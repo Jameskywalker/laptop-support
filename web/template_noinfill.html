@@ -132,29 +132,31 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   const fmt = (v, d) => Number(v).toFixed(d);
   const des = D.designs, byKey = Object.fromEntries(des.map(d => [d.key, d]));
-  const free = byKey.free, gable = byKey.gable, flat = byKey.flat;
+  const ck = D.cmpKey || 'gable', sh = D.short || { free: '三维', gable: '尖拱', flat: '二维' };
+  const free = byKey.free, gable = byKey[ck], flat = byKey.flat;
 
   // ---------- 面板 ----------
   const pct = (r) => (r < 1 ? '低 ' + Math.round((1 - r) * 100) + '%' : '高 ' + Math.round((r - 1) * 100) + '%');
+  if (D.leadExtra) $('lead').textContent += D.leadExtra;
   $('lead').textContent += '同样用料下，加权柔度比二维方案' + pct(free.weighted) + '（越低越硬）。';
   const facts = [
     ['单片用料（PETG）', fmt(free.mass, 0) + ' g（二维 ' + fmt(flat.mass, 0) + '）'],
-    ['加权柔度（二维 = 1）', fmt(free.weighted, 2) + '（尖拱对照 ' + fmt(gable.weighted, 2) + '）'],
-    ['封闭空腔', D.cavities.length + ' 个，共 ' + fmt(D.cavities.reduce((a, b) => a + b, 0) / 1000, 1) + ' cm³'],
+    ['加权柔度（二维 = 1）', fmt(free.weighted, 2) + '（' + sh[ck] + ' ' + fmt(gable.weighted, 2) + '）'],
+    ['封闭空腔', D.cavities.length + ' 个，共 ' + fmt(D.cavities.reduce((a, b) => a + b, 0), 0) + ' mm³'],
     ['悬空（> 45°，宽 > 2 mm）', fmt(D.overhang.area, 1) + ' mm²'],
     ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²'],
-    ['贴床薄板', '最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%'],
+    ['薄壁', D.thinFact || ('最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%')],
     ['体素', fmt(D.h, 3) + ' mm 立方，厚度方向 ' + D.nz + ' 层'],
   ];
   $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const xmax = Math.max(1.25, ...D.cases.map(c => Math.max(free.rel[c], gable.rel[c])));
-  $('comp').innerHTML = '<tr><th>工况</th><th class="num"><span class="sw free"></span>三维</th><th class="num"><span class="sw gable"></span>尖拱</th><th></th></tr>' + D.cases.map(c =>
+  $('comp').innerHTML = '<tr><th>工况</th><th class="num"><span class="sw free"></span>' + sh.free + '</th><th class="num"><span class="sw gable"></span>' + sh[ck] + '</th><th></th></tr>' + D.cases.map(c =>
     '<tr><td>' + c + '</td><td class="num"><b>' + fmt(free.rel[c], 2) + '</b></td><td class="num">' + fmt(gable.rel[c], 2) + '</td><td class="barc"><div class="bar two"><i style="width:' +
     (free.rel[c] / xmax * 100).toFixed(1) + '%"></i><i class="gable" style="width:' + (gable.rel[c] / xmax * 100).toFixed(1) + '%"></i><b style="left:' + (100 / xmax).toFixed(1) + '%"></b></div></td></tr>').join('') +
     '<tr><td><b>加权</b></td><td class="num"><b>' + fmt(free.weighted, 2) + '</b></td><td class="num">' + fmt(gable.weighted, 2) + '</td><td></td></tr>';
   const rows = [['屈曲系数 · 前部', 'buck_f', 1], ['屈曲系数 · 后部', 'buck_r', 1], ['应力 99.9% · 前部 MPa', 'vm_f', 1], ['应力 99.9% · 后部 MPa', 'vm_r', 1],
                 ['侧向位移 · 后部 µm', 'z_r', 0]];
-  $('mis').innerHTML = '<tr><th></th><th class="num"><span class="sw flat"></span>二维</th><th class="num"><span class="sw gable"></span>尖拱</th><th class="num"><span class="sw free"></span>三维</th></tr>' +
+  $('mis').innerHTML = '<tr><th></th><th class="num"><span class="sw flat"></span>' + sh.flat + '</th><th class="num"><span class="sw gable"></span>' + sh[ck] + '</th><th class="num"><span class="sw free"></span>' + sh.free + '</th></tr>' +
     rows.map(([k, f, d]) => '<tr><td>' + k + '</td>' + [flat, gable, free].map(x => '<td class="num">' + fmt(x[f], d) + '</td>').join('') + '</tr>').join('');
   $('notes').innerHTML = D.notes.map(t => '<li>' + t + '</li>').join('');
 
