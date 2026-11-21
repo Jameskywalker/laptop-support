@@ -73,7 +73,9 @@ class Mesh:
         return v.reshape(self.nelx, self.nely).T   # [row=j(y), col=i(x)]
 
 
-def build_filter(m, rmin):
+def build_filter(m, rmin, pad_void=False):
+    """密度过滤矩阵。pad_void：网格外当作空（归一化用完整核的权重和），否则在网格边界截断后重新归一化——
+    截断时贴着网格边界的细条只被单侧腐蚀，鲁棒公式下比内部的杆便宜，优化会沿边界长出很细的拉条"""
     R = int(np.ceil(rmin / m.h)) - 1
     rows, cols, vals = [], [], []
     for di in range(-R, R + 1):
@@ -86,6 +88,8 @@ def build_filter(m, rmin):
             rows.append(e); cols.append(i2[ok] * m.nely + j2[ok]); vals.append(np.full(e.size, w))
     H = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(m.nel, m.nel))
     Hs = np.asarray(H.sum(1)).ravel()
+    if pad_void:
+        Hs = np.full(m.nel, float(sum(max(rmin - m.h * np.hypot(di, dj), 0) for di in range(-R, R + 1) for dj in range(-R, R + 1))))
     return H, Hs
 
 
@@ -285,12 +289,14 @@ def main():
     optimize(m, F, names, imp, free, fixed, a, thick=P.T, vf_mode=P.VF_MODE, t0=t0)
 
 
-def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_groups=None, t0=None):
+def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_groups=None, t0=None, escale=None, cnorm=None):
     """SIMP + 密度过滤 + Heaviside 投影（可选鲁棒三场）+ β 续进 + OC。结果写到 a.out。
-    fe_groups 不给时所有工况共用约束 free；给了就按组用不同约束（MultiFE）。"""
+    fe_groups 不给时所有工况共用约束 free；给了就按组用不同约束（MultiFE）。
+    escale：每个单元的刚度系数（默认全 1），比如非设计实体按打印结构（墙 + 填充）折算时用
+    cnorm：各工况柔度的归一化基准（默认第一轮灰度设计的柔度）；给参考设计的柔度时，目标就是"相对参考设计的柔度比"加权和"""
     t0 = t0 or time.time()
     os.makedirs(a.out, exist_ok=True)
-    H, Hs = build_filter(m, a.rmin)
+    H, Hs = build_filter(m, a.rmin, getattr(a, "pad_void", False))
     KE = element_stiffness(P.NU)
     E0 = P.E_MAT * thick; Emin = E0 * 1e-9
     nlc = F.shape[1]
@@ -313,6 +319,7 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
     vmask = m.active if vf_mode == "active" else m.in_dom      # 体积约束统计的区域
     nd = int(vmask.sum())
     Hs = dev(Hs); KEd = dev(KE); imp = dev(imp); edof = dev(m.edof); vmf = dev(vmask.astype(float))
+    es = dev(np.asarray(escale, float)) if escale is not None else 1.0
     idx = lambda mask: dev(np.nonzero(mask)[0])               # 下标数组：cupy 上用布尔掩码赋值每次都要同步
     solid, void, fixed_el = idx(m.solid), idx(m.void), idx(m.solid | m.void)
     act, inact = idx(m.active), idx(~m.active)
@@ -336,7 +343,7 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
     print(f"体积约束: {vf_mode}，目标 {a.vf}（统计 {nd} 个单元；非设计实体 {int(m.solid.sum())} 个）")
     xe, dxe = physics(x, beta, eta_e)
     for it in range(1, a.maxit + 1):
-        Ek = Emin + xe ** a.penal * (E0 - Emin)
+        Ek = (Emin + xe ** a.penal * (E0 - Emin)) * es
         U = fe.solve(Ek)
         ce = nx.zeros((m.nel, nlc))
         for k in range(nlc):
@@ -344,9 +351,9 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
             ce[:, k] = nx.einsum("ij,jk,ik->i", ue, KEd, ue)
         comp = (Ek[:, None] * ce).sum(0)
         if wts is None:
-            wts = imp / comp
+            wts = imp / (dev(np.asarray(cnorm, float)) if cnorm is not None else comp)
         c = float((wts * comp).sum())
-        dc_p = -a.penal * xe ** (a.penal - 1) * (E0 - Emin) * (ce @ wts)
+        dc_p = -a.penal * xe ** (a.penal - 1) * (E0 - Emin) * es * (ce @ wts)
         dc = H.T @ (dc_p * dxe / Hs)
         xdd, dxd = physics(x, beta, eta_d)
         dv = H.T @ (vmf * dxd / Hs) / nd

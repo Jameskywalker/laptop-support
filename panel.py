@@ -85,14 +85,14 @@ def cases(m):
     return F, [d[0] for d in defs], np.array([d[1] for d in defs]), groups
 
 
-def extract(xphys, m):
-    """密度场 → 面板轮廓（面板坐标，不含卡扣）"""
+def extract(xphys, m, level=0.5):
+    """密度场 → 面板轮廓（面板坐标，不含卡扣）。level：等值线阈值（调低可补回开运算削掉的边）"""
     G = xphys.reshape(m.nelx, m.nely).T
     d = 0.2
     xs = np.arange(-2, m.nelx * m.h + 2, d); ys = np.arange(-2, m.nely * m.h + 2, d)
     XX, YY = np.meshgrid(xs, ys)
     Fd = map_coordinates(gaussian_filter(G, 0.6), [YY.ravel() / m.h - 0.5, XX.ravel() / m.h - 0.5], order=1, mode="constant", cval=0).reshape(XX.shape)
-    rings = [Polygon(np.c_[xs[0] + c[:, 1] * d, ys[0] + c[:, 0] * d]).buffer(0) for c in measure.find_contours(Fd, 0.5) if len(c) >= 8]
+    rings = [Polygon(np.c_[xs[0] + c[:, 1] * d, ys[0] + c[:, 0] * d]).buffer(0) for c in measure.find_contours(Fd, level) if len(c) >= 8]
     region = rings[0]
     for pg in rings[1:]:
         region = region.symmetric_difference(pg)
