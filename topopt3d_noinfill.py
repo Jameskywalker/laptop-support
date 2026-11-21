@@ -234,17 +234,18 @@ def _kfun(name):
     return _kern[name]
 
 
-def geo_mats(h):
-    """立方体单元的 ∫ ∂N_a/∂x_k ∂N_b/∂x_l dV（2×2×2 高斯点），按应力分量 xx, yy, zz, xy, yz, zx 组合（剪切项含 kl+lk）"""
+def geo_mats(h, hy=None, hz=None):
+    """长方体单元（h × hy × hz，默认立方）的 ∫ ∂N_a/∂x_k ∂N_b/∂x_l dV（2×2×2 高斯点），按应力分量 xx, yy, zz, xy, yz, zx 组合（剪切项含 kl+lk）"""
+    hy = hy or h; hz = hz or h
     g = 1 / np.sqrt(3); sx, sy, sz = T3._SGN.T
     Mk = np.zeros((3, 3, 8, 8))
     for xi in (-g, g):
         for et in (-g, g):
             for ze in (-g, g):
                 dN = np.array([sx * (1 + sy * et) * (1 + sz * ze) / 8 * 2 / h,
-                               sy * (1 + sx * xi) * (1 + sz * ze) / 8 * 2 / h,
-                               sz * (1 + sx * xi) * (1 + sy * et) / 8 * 2 / h])
-                Mk += np.einsum("ka,lb->klab", dN, dN) * (h ** 3 / 8)
+                               sy * (1 + sx * xi) * (1 + sz * ze) / 8 * 2 / hy,
+                               sz * (1 + sx * xi) * (1 + sy * et) / 8 * 2 / hz])
+                Mk += np.einsum("ka,lb->klab", dN, dN) * (h * hy * hz / 8)
     out = [Mk[0, 0], Mk[1, 1], Mk[2, 2], Mk[0, 1] + Mk[1, 0], Mk[1, 2] + Mk[2, 1], Mk[2, 0] + Mk[0, 2]]
     return cp.asarray(np.stack(out).ravel())
 
@@ -293,11 +294,12 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None):
-        R = int(np.ceil(rmin / h)) - 1
-        o = np.arange(-R, R + 1)
-        di, dj, dk = np.meshgrid(o, o, o, indexing="ij")
-        K = np.maximum(0.0, rmin - h * np.sqrt(di ** 2 + dj ** 2 + dk ** 2))
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None):
+        dz = dz or h
+        R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
+        o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
+        di, dj, dk = np.meshgrid(o, o, oz, indexing="ij")
+        K = np.maximum(0.0, rmin - np.sqrt((h * di) ** 2 + (h * dj) ** 2 + (dz * dk) ** 2))     # 按物理距离的锥形核（体素扁时是椭球）
         self.K = cp.asarray(K)
         if pad_void:
             self.Ks = float(K.sum())
@@ -307,6 +309,9 @@ class Pipeline:
         self.fixed = cp.asarray(fixed); self.fval = cp.asarray(fval, cp.float64)
         self.free = ~self.fixed
         self.P = p_am; self.Q = p_am + np.log(5) / np.log(xi0); self.eps = eps
+        # 45° 悬空：每层最多外扩 dz（mm）。体素宽 h = m·dz 时，每层相对下面 1..m 层都最多外扩一格（十字邻域）：
+        # 平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法
+        self.m_am = max(1, int(round(h / dz)))
 
     def filt(self, x):
         return cnd.correlate(x, self.K, mode="constant", cval=0.0) / self.Ks
@@ -330,32 +335,51 @@ class Pipeline:
         return xi, c
 
     def am_forward(self, xb):
-        Pp, Q, eps = self.P, self.Q, self.eps
+        """ξ_k = smin(x̄_k, Σ_k)，Σ_k = smin_j S_j，S_j = (十字邻域 Σ ξ_{k−j}^P)^{1/Q}（j = 1..m；k−j < 0 时是床面，S_j = 1）"""
+        Pp, Q, eps, m = self.P, self.Q, self.eps, self.m_am
+        se = np.sqrt(eps)
         NZ = xb.shape[2]
-        xi = cp.empty_like(xb); S = cp.zeros_like(xb); dsx = cp.zeros_like(xb); dsS = cp.zeros_like(xb)
-        xi[:, :, 0] = xb[:, :, 0]; dsx[:, :, 0] = 1.0
-        fr = self.free[:, :, 0]
+        xi = cp.empty_like(xb); dsx = cp.zeros_like(xb); dsS = cp.zeros_like(xb)
+        S = [cp.ones_like(xb) for _ in range(m)]; W = [cp.zeros_like(xb) for _ in range(m)]    # S_j 的 P 次和、∂Σ/∂S_j
+        xi[:, :, 0] = xb[:, :, 0]
         for k in range(1, NZ):
-            Sk = cp.maximum(plus_sum(xi[:, :, k - 1] ** Pp), 1e-280)
-            Sg = Sk ** (1.0 / Q)
-            x = xb[:, :, k]; d = x - Sg; r = cp.sqrt(d * d + eps)
-            v = 0.5 * (x + Sg - r + np.sqrt(eps))
-            xi[:, :, k] = cp.where(fr, v, xb[:, :, k])
-            S[:, :, k] = Sk
+            fr = self.free[:, :, k]
+            Sig = None; wj = []
+            for j in range(1, m + 1):
+                if k - j < 0:
+                    continue
+                Sk = cp.maximum(plus_sum(xi[:, :, k - j] ** Pp), 1e-280); S[j - 1][:, :, k] = Sk
+                Sg = Sk ** (1.0 / Q)
+                if Sig is None:
+                    Sig = Sg; wj = [(j, cp.ones_like(Sg))]
+                else:                                           # Σ ← smin(Σ, S_j)，之前各项的 ∂Σ/∂S 跟着乘
+                    d = Sig - Sg; r = cp.sqrt(d * d + eps)
+                    a1, a2 = 0.5 * (1 - d / r), 0.5 * (1 + d / r)
+                    Sig = 0.5 * (Sig + Sg - r + se)
+                    wj = [(jj, w * a1) for jj, w in wj] + [(j, a2)]
+            x = xb[:, :, k]; d = x - Sig; r = cp.sqrt(d * d + eps)
+            v = 0.5 * (x + Sig - r + se)
+            xi[:, :, k] = cp.where(fr, v, x)
             dsx[:, :, k] = cp.where(fr, 0.5 * (1 - d / r), 0.0)
             dsS[:, :, k] = cp.where(fr, 0.5 * (1 + d / r), 0.0)
-        dsx[:, :, 0] = cp.where(fr, 1.0, 0.0)
-        return xi, dict(xi=xi, S=S, dsx=dsx, dsS=dsS)
+            for jj, w in wj:
+                W[jj - 1][:, :, k] = w
+        dsx[:, :, 0] = cp.where(self.free[:, :, 0], 1.0, 0.0)
+        return xi, dict(xi=xi, S=S, W=W, dsx=dsx, dsS=dsS)
 
     def am_backward(self, gxi, c):
-        """dF/dξ → dF/dx̄（从顶层往下传）"""
-        Pp, Q = self.P, self.Q
+        """dF/dξ → dF/dx̄（从顶层往下传；第 k 层的梯度只来自上面各层，处理到它时已经齐了）"""
+        Pp, Q, m = self.P, self.Q, self.m_am
         g = gxi.copy(); gxb = cp.zeros_like(gxi)
         for k in range(gxi.shape[2] - 1, 0, -1):
             gk = g[:, :, k]
             gxb[:, :, k] = gk * c["dsx"][:, :, k]
-            A = gk * c["dsS"][:, :, k] * (1.0 / Q) * c["S"][:, :, k] ** (1.0 / Q - 1.0)
-            g[:, :, k - 1] += Pp * c["xi"][:, :, k - 1] ** (Pp - 1) * plus_sum(A)
+            gS = gk * c["dsS"][:, :, k]
+            for j in range(1, m + 1):
+                if k - j < 0:
+                    continue
+                A = gS * c["W"][j - 1][:, :, k] * (1.0 / Q) * c["S"][j - 1][:, :, k] ** (1.0 / Q - 1.0)
+                g[:, :, k - j] += Pp * c["xi"][:, :, k - j] ** (Pp - 1) * plus_sum(A)
         gxb[:, :, 0] = g[:, :, 0] * c["dsx"][:, :, 0]
         return gxb
 
@@ -372,33 +396,45 @@ class Pipeline:
         return cnd.correlate(gt / self.Ks, self.K, mode="constant", cval=0.0) * self.free
 
 
-def rmin_for_thickness(tmin, h, eta_e=0.75):
+def rmin_for_thickness(tmin, h, eta_e=0.75, dz=None):
     """最小厚度 → 过滤半径（mm）。无限大的板（厚 n 个体素，网格外按空）过滤后，腐蚀设计（x̃ ≥ η_e）还剩下东西所需的最小 n
-    随半径成台阶变化；取 n = round(tmin/h) 那一段半径的中点（离两头的阈值都远，有限 β 下也稳）"""
-    n_t = max(1, int(round(tmin / h)))
-    ok = []
-    for r in np.arange(1.0, 8.0, 0.02) * h:
-        R = int(np.ceil(r / h)) - 1
-        o = np.arange(-R, R + 1)
-        di, dj, dk = np.meshgrid(o, o, o, indexing="ij")
-        kz = np.maximum(0.0, r - h * np.sqrt(di ** 2 + dj ** 2 + dk ** 2)).sum((0, 1))
-        kz = kz / kz.sum()
-        for n in range(1, 60):
-            x = np.zeros(n + 2 * R + 4); x[R + 2:R + 2 + n] = 1
-            if np.convolve(x, kz, mode="same").max() >= eta_e:
-                break
-        if n == n_t:
-            ok.append(r)
-    if not ok:
+    随半径成台阶变化；取 n = round(tmin/h) 那一段半径的中点（离两头的阈值都远，有限 β 下也稳）。
+    体素扁（dz ≠ h）时竖立的板（法向在面内，步长 h）和平躺的板（法向沿 z，步长 dz）分开算，取两者都满足的半径；
+    没有交集时优先满足面内，返回实际的平躺板最小厚度。返回 (半径, 面内最小厚度, 层向最小厚度)"""
+    dz = dz or h
+
+    def n_min(r, axis_h, axis):
+        R, Rz = int(np.ceil(r / h)) - 1, int(np.ceil(r / dz)) - 1
+        o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
+        di, dj, dk = np.meshgrid(o, o, oz, indexing="ij")
+        K = np.maximum(0.0, r - np.sqrt((h * di) ** 2 + (h * dj) ** 2 + (dz * dk) ** 2))
+        prof = K.sum(tuple(a for a in range(3) if a != axis)); prof = prof / prof.sum()
+        Rp = (len(prof) - 1) // 2
+        for n in range(1, 200):
+            x = np.zeros(n + 2 * Rp + 4); x[Rp + 2:Rp + 2 + n] = 1
+            if np.convolve(x, prof, mode="same").max() >= eta_e:
+                return n
+        return None
+    nt_x, nt_z = max(1, int(round(tmin / h))), max(1, int(round(tmin / dz)))
+    rs = np.arange(1.0, 8.0, 0.02) * max(h, dz)
+    okx = [r for r in rs if n_min(r, h, 0) == nt_x]
+    if not okx:
         raise ValueError(f"最小厚度 {tmin} mm 在 h={h} 下找不到合适的过滤半径")
-    return 0.5 * (min(ok) + max(ok)), n_t * h
+    if dz == h:
+        r = 0.5 * (min(okx) + max(okx)); return r, nt_x * h, nt_x * h
+    both = [r for r in okx if n_min(r, dz, 2) == nt_z]
+    pick = both or okx
+    r = 0.5 * (min(pick) + max(pick))
+    return r, nt_x * h, n_min(r, dz, 2) * dz
 
 
-def am_binary(B):
-    """二值模型的悬空检查/修整：从床面往上，没有支撑的体素去掉"""
+def am_binary(B, m=1):
+    """二值模型的悬空检查/修整：从床面往上，没有支撑的体素去掉（每层相对下面 1..m 层都最多外扩一格，见 Pipeline.m_am）"""
     B = B.copy()
     for k in range(1, B.shape[2]):
-        B[:, :, k] &= plus_sum(B[:, :, k - 1].astype(np.uint8)) > 0
+        for j in range(1, m + 1):
+            if k - j >= 0:
+                B[:, :, k] &= plus_sum(B[:, :, k - j].astype(np.uint8)) > 0
     return B
 
 
@@ -508,14 +544,26 @@ class MMA:
 
 # ======================= 模型 =======================
 class Free3D:
-    def __init__(self, nz, kz=P.KZ, skin=1.5, nwall=P.NWALL, nskin=P.NSKIN, infill=P.INFILL, misuse=False, lateral=True, warp=True, asm_z=True):
+    def __init__(self, nz, kz=P.KZ, skin=1.5, nwall=P.NWALL, nskin=P.NSKIN, infill=P.INFILL, misuse=False, lateral=True, warp=True, asm_z=True,
+                 hxy=None, dz=None):
+        """nz：立方体素时厚度方向的格数（h = T/nz）。给了 dz 时按扁体素：层向 dz（= 打印层高），面内 hxy；
+        厚度方向 NT = T/dz 层，网格补到 NZ（能被 16 整除，多重网格要逐级对半分），T 以上的层是固定的空"""
         self.lateral, self.warp, self.asm_z = lateral, warp, asm_z
-        self.NZ = NZ = nz; self.h = h = P.T / nz; self.dz = h
+        if dz is None:
+            NT = NZ = nz; h = dz = P.T / nz
+            mult, q = 1, nz                                     # 多重网格：z 能对半分几次，x、y 也要能分几次
+            while q % 2 == 0 and q > 2:
+                q //= 2; mult *= 2
+            mult = max(mult, 2)
+        else:
+            NT = int(round(P.T / dz)); assert abs(NT * dz - P.T) < 1e-6, f"层高 {dz} 不能整分厚度 {P.T}"
+            h = hxy or dz
+            NZ = -(-NT // 16) * 16
+            mult = 32                                           # 层向先单独对半到接近立方，之后三向一起 / 只面内再分几次
+        self.NZ, self.NT, self.h, self.dz = NZ, NT, h, dz
+        self.vox = h * h * dz                                   # 体素体积 mm³
+        zr = np.arange(NZ) < NT; self.zr = zr                   # 厚度 T 以内的层
         domain, solids = P.geometry(True)                       # 设计域、实体区都已经挖掉方槽
-        mult, q = 1, nz                                         # 多重网格：z 能对半分几次，x、y 也要能分几次
-        while q % 2 == 0 and q > 2:
-            q //= 2; mult *= 2
-        mult = max(mult, 2)
         self.NX = NX = int(-(-int(np.ceil(domain.bounds[2] / h)) // mult) * mult)
         self.NY = NY = int(-(-int(np.ceil(domain.bounds[3] / h)) // mult) * mult)
         I, J = np.meshgrid(np.arange(NX), np.arange(NY), indexing="ij")
@@ -533,25 +581,25 @@ class Free3D:
         self.fixed_regions = dict(regs, joint=jg)
         # 固定体素的刚度/用料系数：实心条 = 1；接口区 = 墙 + 表皮 + 填充（墙沿接口区外边和方槽）
         self.print_set = dict(nwall=nwall, nskin=nskin, infill=infill)
-        self.fs = skin_fraction(NZ, h, nskin * P.LAYER_H)
+        self.fs = np.concatenate([skin_fraction(NT, dz, nskin * P.LAYER_H), np.zeros(NZ - NT)])
         cov, fw = print_columns(jg, NX, NY, h, nwall * P.LINE_W)
         fwn = np.where(jnt, np.clip(fw / np.maximum(cov, 1e-9), 0, 1), 0.0)
         Ej, mj = print_voxels(jnt.astype(float), fwn, self.fs, infill ** 2, infill)
         f3 = np.broadcast_to(fixs[:, :, None], (NX, NY, NZ))
-        self.E_fix = np.where(f3, 1.0, Ej); self.m_fix = np.where(f3, 1.0, mj)
-        self.design3 = np.broadcast_to(self.cols["design"][:, :, None], (NX, NY, NZ))
+        self.E_fix = np.where(f3, 1.0, Ej) * zr; self.m_fix = np.where(f3, 1.0, mj) * zr
+        self.design3 = self.cols["design"][:, :, None] & zr[None, None, :]
         use_centered_kernels()
         self.D = T3.material_D(P.E_MAT, P.NU, kz); self.kz = kz
         self.gmin = 1e-6
         self._loads_bc(misuse)
-        self.mg = T3.MGCG(NX, NY, NZ, h, h, self.D, cp.asarray(self.fm, F32))
+        self.mg = T3.MGCG(NX, NY, NZ, h, dz, self.D, cp.asarray(self.fm, F32))
         self.KE0 = self.mg.levels[0].KE
         self.fm_d = cp.asarray(self.fm, F32)
         # 面内工况按装配状态：面板 / 横梁拉住接口，接口 z 向不动（另一套约束、另一个求解器）
         self.mgs = [self.mg]; self.fms = [self.fm_d]
         if asm_z:
             self.fms.append(cp.asarray(self.fm_asm, F32))
-            self.mgs.append(T3.MGCG(NX, NY, NZ, h, h, self.D, self.fms[1]))
+            self.mgs.append(T3.MGCG(NX, NY, NZ, h, dz, self.D, self.fms[1]))
         self.case_bc = [1 if (asm_z and nm in ASM_CASES) else 0 for nm in self.names]
         for l in range(len(self.F)):
             self.F[l] = self.F[l] * self.fms[self.case_bc[l]]
@@ -565,8 +613,8 @@ class Free3D:
             return
         m = cp.asarray(m, F32)
         if self.q_lat is None:
-            self.q_lat = F_LAT / (float(m.sum()) * self.h ** 3)
-        e = m * F32(self.q_lat * self.h ** 3 / 8)
+            self.q_lat = F_LAT / (float(m.sum()) * self.vox)
+        e = m * F32(self.q_lat * self.vox / 8)
         nf = cp.zeros((self.NX + 1, self.NY + 1, self.NZ + 1), F32)
         for a in range(8):
             di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
@@ -581,7 +629,7 @@ class Free3D:
         for a in range(8):
             di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
             s += uz[di:di + self.NX, dj:dj + self.NY, dk:dk + self.NZ]
-        return s * F32(self.q_lat * self.h ** 3 / 8)
+        return s * F32(self.q_lat * self.vox / 8)
 
     # ---------- 翘曲 ----------
     def warp_measures(self):
@@ -606,7 +654,7 @@ class Free3D:
     # ---------- 线性屈曲 ----------
     def kgeo(self, sig, double=False, fm=None):
         """返回 v ↦ K_G v（sig：每个单元 6 个应力分量，为 0 的单元跳过）。double=True 时输入输出都是 float64"""
-        Mg = geo_mats(self.h); L0 = self.mg.levels[0]; fm = self.fm_d if fm is None else fm
+        Mg = geo_mats(self.h, self.h, self.dz); L0 = self.mg.levels[0]; fm = self.fm_d if fm is None else fm
         if double:
             sig = sig.astype(cp.float64)
         else:
@@ -633,7 +681,7 @@ class Free3D:
     def element_stress(self, E, l, emin=0.01):
         """工况 l 的单元中心应力 E·D·B·u；刚度系数小于 emin 的单元（空）置 0，避免空区里的假屈曲模态"""
         L0 = self.mg.levels[0]
-        DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.h, 0, 0, 0)).ravel(), F32)
+        DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.dz, 0, 0, 0)).ravel(), F32)
         Eg = cp.asarray(E, F32).ravel()
         sig = cp.empty(6 * L0.nel, F32)
         T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], sig, Eg, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
@@ -681,7 +729,7 @@ class Free3D:
     # ---------- 屈曲约束（优化用） ----------
     def _DB(self):
         if not hasattr(self, "_db"):
-            self._db = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.h, 0, 0, 0)).ravel(), F32)
+            self._db = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.dz, 0, 0, 0)).ravel(), F32)
         return self._db
 
     def _dims(self):
@@ -751,7 +799,7 @@ class Free3D:
         dG/dξ_e = −E_G'·Bq + E_K'·(Cw − A)，其中 E_K = gmin + (1−gmin)E、E_G = E（空的单元不受力）"""
         L0 = self.mg.levels[0]; nel = L0.nel; b = self.case_bc[l]; dims = self._dims()
         A = cp.zeros(nel, F32); gs = cp.zeros(6 * nel, F32)
-        Mg = geo_mats(self.h).astype(F32)
+        Mg = geo_mats(self.h, self.h, self.dz).astype(F32)
         for o, mu, ph in zip(om, mus, Phis):
             T3._K()["kener"](T3._blocks(nel), (T3._TB,), (ph, A, self.KE0, np.float32(o * mu), *dims))
             _kfun("kgq")(T3._blocks(nel), (T3._TB,), (ph, gs, Mg, np.float32(o), *dims))
@@ -785,7 +833,8 @@ class Free3D:
         s, n = P.xy2sn(xn, yn)
         top, lipback, jn = adj(C["top"]), adj(C["lip"]), adj(C["jnt"])
         nn = (NX + 1) * (NY + 1) * (NZ + 1)
-        m3 = lambda m2: np.broadcast_to(m2[:, :, None], (NX + 1, NY + 1, NZ + 1)).ravel()
+        zn = np.arange(NZ + 1) <= self.NT                       # 加载 / 约束只在厚度 T 以内的节点上（扁体素时网格补高了）
+        m3 = lambda m2: (m2[:, :, None] & zn[None, None, :]).ravel() if m2.dtype == bool else (m2[:, :, None] * zn[None, None, :]).ravel()
         F, names = [], []
         new = lambda: np.zeros(3 * nn)
 
@@ -844,7 +893,7 @@ class Free3D:
         for j in P.JOINTS:
             hk = jn & P.hook_strip(j, xn, yn, 0.75 * h)
             sh = jn & shapely.contains_xy(P.joint_rect(P.BEAM_W, P.BEAM_H, j), xn, yn) & ~shapely.contains_xy(P.joint_slot(j), xn, yn)
-            fa[hk, 0, 2] = True; fa[sh, NZ, 2] = True
+            fa[hk, 0, 2] = True; fa[sh, self.NT, 2] = True
         self.fm_asm = (~fa.ravel()).astype(np.float32)
 
     # ---------- 有限元 ----------
@@ -883,7 +932,7 @@ class Free3D:
     def stresses(self, mask):
         """各工况实心材料里的应力（D·B·u，体素中心），只统计 mask 内的体素；另给位移"""
         L0 = self.mg.levels[0]
-        DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.h, 0, 0, 0)).ravel(), F32)
+        DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.dz, 0, 0, 0)).ravel(), F32)
         sig = cp.empty(6 * L0.nel, F32); ones = cp.ones(L0.nel, F32)
         mk = cp.asarray(mask.ravel())
         out = []
@@ -903,7 +952,7 @@ class Free3D:
     # ---------- 用料 ----------
     def mass(self, xi):
         """实心等效体积 mm³：设计体素按 ξ，固定区按各自系数"""
-        return (float(cp.asarray(xi)[cp.asarray(self.design3)].sum()) + float(self.m_fix.sum())) * self.h ** 3
+        return (float(cp.asarray(xi)[cp.asarray(self.design3)].sum()) + float(self.m_fix.sum())) * self.vox
 
     # ---------- 对比用的体素场 ----------
     def baseline_fields(self, geom=None):
@@ -913,7 +962,7 @@ class Free3D:
         cov, fw = print_columns(geom, self.NX, self.NY, self.h, ps["nwall"] * P.LINE_W)
         E, m = print_voxels(cov, fw, self.fs, ps["infill"] ** 2, ps["infill"])
         solid = (fw[:, :, None] + (cov - fw)[:, :, None] * self.fs[None, None, :]) > 0.5
-        return E, m, solid
+        return E * self.zr, m * self.zr, solid & self.zr
 
     def design_fields(self, xi, p=3.0):
         """优化结果（ξ 或二值）+ 固定区 → (E, m, 实心掩码)"""
@@ -926,11 +975,11 @@ class Free3D:
 
 # ======================= 图 =======================
 def fig_layers(M, xi, fn, title):
-    ks = np.unique(np.linspace(0, M.NZ - 1, 8).round().astype(int))
+    ks = np.unique(np.linspace(0, M.NT - 1, 8).round().astype(int))
     fig, axs = plt.subplots(2, 4, figsize=(22, 7.5))
     for ax, k in zip(axs.ravel(), ks):
         ax.imshow(1 - xi[:, :, k].T, cmap="gray", origin="lower", extent=[0, M.NX * M.h, 0, M.NY * M.h], vmin=0, vmax=1)
-        ax.set_title(f"第 {k+1} 层体素  z = {k*M.h:.1f}–{(k+1)*M.h:.1f} mm"); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"第 {k+1} 层体素  z = {k*M.dz:.1f}–{(k+1)*M.dz:.1f} mm"); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(title, fontsize=14)
     fig.savefig(fn, dpi=90, bbox_inches="tight"); plt.close(fig)
 
@@ -940,7 +989,7 @@ def fig_sections(M, xi, fn, title, xs=(30, 60, 95, 130, 165, 200, 235)):
     fig, axs = plt.subplots(len(xs), 1, figsize=(16, 1.35 * len(xs) + 1))
     for ax, x in zip(axs, xs):
         i = min(M.NX - 1, int(x / M.h))
-        ax.imshow(1 - xi[i].T, cmap="gray", origin="lower", extent=[0, M.NY * M.h, 0, M.NZ * M.h], vmin=0, vmax=1, interpolation="nearest")
+        ax.imshow(1 - xi[i, :, :M.NT].T, cmap="gray", origin="lower", extent=[0, M.NY * M.h, 0, M.NT * M.dz], vmin=0, vmax=1, interpolation="nearest")
         ax.set_ylabel(f"x={x}", rotation=0, labelpad=22); ax.set_yticks([0, P.T]); ax.set_aspect("equal")
     axs[-1].set_xlabel("y (mm)    剖面纵轴为打印方向 z（下面贴床）")
     fig.suptitle(title, fontsize=13)
@@ -950,7 +999,9 @@ def fig_sections(M, xi, fn, title, xs=(30, 60, 95, 130, 165, 200, 235)):
 # ======================= 优化 =======================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nz", type=int, default=32, help="厚度方向体素数（立方体素，h = T/nz）")
+    ap.add_argument("--nz", type=int, default=32, help="厚度方向体素数（立方体素，h = T/nz）；给了 --dz 时不用")
+    ap.add_argument("--dz", type=float, default=None, help="扁体素：层向尺寸 mm（= 打印层高，如 0.2）")
+    ap.add_argument("--hxy", type=float, default=None, help="扁体素：面内尺寸 mm（如 0.4；45° 悬空按每 hxy/dz 层外扩一格）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
     ap.add_argument("--skin", type=float, default=1.5, help="顶面、前挡后表面、脚垫固定实心条的宽度 mm")
     ap.add_argument("--kz", type=float, default=P.KZ)
@@ -978,17 +1029,19 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
-    M = Free3D(a.nz, kz=a.kz, skin=a.skin, lateral=a.lateral, warp=a.warp > 0, asm_z=a.asm_z, misuse=a.buck > 0)
+    M = Free3D(a.nz, kz=a.kz, skin=a.skin, lateral=a.lateral, warp=a.warp > 0, asm_z=a.asm_z, misuse=a.buck > 0, hxy=a.hxy, dz=a.dz)
     NX, NY, NZ, h = M.NX, M.NY, M.NZ, M.h
+    vox = M.vox
     nd = int(M.design3.sum())
-    print(f"网格 {NX}×{NY}×{NZ}（h={h:.4f} mm），体素 {NX*NY*NZ/1e6:.2f} M，自由度 {3*M.mg.levels[0].nn/1e6:.2f} M；设计体素 {nd/1e6:.2f} M", flush=True)
+    print(f"网格 {NX}×{NY}×{NZ}（面内 {h:.4f} mm，层向 {M.dz:.4f} mm，厚度内 {M.NT} 层），体素 {NX*NY*NZ/1e6:.2f} M，"
+          f"自由度 {3*M.mg.levels[0].nn/1e6:.2f} M；设计体素 {nd/1e6:.2f} M", flush=True)
     print("多重网格:", M.mg.describe())
     E2, m2, _ = M.baseline_fields()
-    target = float(m2.sum()) * h ** 3 * a.mass_scale
-    fixm = float(M.m_fix.sum()) * h ** 3
-    vf = (target - fixm) / (nd * h ** 3)
+    target = float(m2.sum()) * vox * a.mass_scale
+    fixm = float(M.m_fix.sum()) * vox
+    vf = (target - fixm) / (nd * vox)
     print(f"用料目标 {target/1000:.2f} cm³ 实心等效（二维方案 × {a.mass_scale:g}；PETG 约 {target/1000*1.27:.0f} g）；"
-          f"固定区 {fixm/1000:.2f} cm³（接口区 {float(M.m_fix[M.cols['jnt']].sum())*h**3/1000:.2f}）；设计区平均密度 {vf:.4f}", flush=True)
+          f"固定区 {fixm/1000:.2f} cm³（接口区 {float(M.m_fix[M.cols['jnt']].sum())*vox/1000:.2f}）；设计区平均密度 {vf:.4f}", flush=True)
     tb = time.time()
     M.set_mass(m2)
     comps_b, its_b = M.solve(E2, a.tol)
@@ -1004,10 +1057,12 @@ def main():
     fval = np.where(M.E_fix > 0, 1.0, 0.0)                      # 固定实心（含接口区）算作有材料，可以支撑上层
     rmin = a.rmin
     if a.tmin > 0:
-        rmin, tq = rmin_for_thickness(a.tmin, h, a.eta_e)
-        print(f"最小厚度 {a.tmin} mm（网格上 {tq:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
+        rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
+        print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz)
+    if pipe.m_am > 1:
+        print(f"悬空：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 平均 45°，单层最多伸出 {h:g} mm", flush=True)
     d3 = cp.asarray(M.design3)
     use_mma = a.opt == "mma" or (a.opt is None and (a.tmin > 0 or a.buck > 0))
     bcases = [M.names.index(n) for n in ("前部误用150N", "后部误用150N")] if a.buck > 0 else []
@@ -1049,10 +1104,13 @@ def main():
     if a.init:
         from scipy.ndimage import map_coordinates
         r0 = np.load(a.init); xc, hc = r0["x"].astype(float), float(r0["h"])
-        I, J, K = np.meshgrid(*[(np.arange(n) + 0.5) * h / hc - 0.5 for n in (NX, NY, NZ)], indexing="ij")
+        dzc = float(r0["dz"]) if "dz" in r0.files else hc
+        I, J = np.meshgrid(*[(np.arange(n) + 0.5) * h / hc - 0.5 for n in (NX, NY)], indexing="ij")
+        I, J, K = (np.broadcast_to(v[:, :, None], (NX, NY, NZ)) for v in (I, J, np.zeros((NX, NY))))
+        K = np.broadcast_to(((np.arange(NZ) + 0.5) * M.dz / dzc - 0.5)[None, None, :], (NX, NY, NZ))
         x0 = map_coordinates(xc, [I, J, K], order=1, mode="nearest")
         x = cp.where(d3, cp.asarray(np.clip(x0, 0, 1)), 0.0)
-        print(f"初始设计取自 {a.init}（网格 {xc.shape}，h={hc:.4f}）", flush=True)
+        print(f"初始设计取自 {a.init}（网格 {xc.shape}，面内 {hc:.4f}、层向 {dzc:.4f} mm）", flush=True)
     beta, lb = a.beta0, 0
     hist = []
     for it in range(1, a.maxit + 1):
@@ -1085,7 +1143,7 @@ def main():
             gE = gE - mut.astype(cp.float64) * (1 - M.gmin) * a.penal * xa_ ** (a.penal - 1) * d3
         robust = "xie" in cache
         dc = pipe.backward(None, cache, gE) if robust else pipe.backward(gE, cache)
-        dm = pipe.backward(d3 * h ** 3, cache)                    # 用料按打印设计 ξ
+        dm = pipe.backward(d3 * vox, cache)                       # 用料按打印设计 ξ
         dm = cp.maximum(dm, 1e-3 * float(dm[d3].mean()))          # 支撑不住的体素 dm≈0：给个下限，让它们往下走
         xa = x[d3]; binfo = {}; fG = 0.0
         if use_mma:
@@ -1129,7 +1187,7 @@ def main():
             break
     xi, _ = pipe.forward(x, beta)
     xi = cp.asnumpy(xi)
-    np.savez_compressed(f"{a.out}/result.npz", x=cp.asnumpy(x).astype(np.float32), xi=xi.astype(np.float32), NX=NX, NY=NY, NZ=NZ, h=h,
+    np.savez_compressed(f"{a.out}/result.npz", x=cp.asnumpy(x).astype(np.float32), xi=xi.astype(np.float32), NX=NX, NY=NY, NZ=NZ, h=h, dz=M.dz, NT=M.NT,
                         comps_b=comps_b, names=np.array(M.names), target=target, **{"col_" + k: v for k, v in M.cols.items()})
     json.dump(dict(args=vars(a), names=M.names, hist=hist, base=dict(comp=comps_b.tolist()), target_mm3=target),
               open(f"{a.out}/history.json", "w"), ensure_ascii=False, indent=1)

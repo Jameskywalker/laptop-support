@@ -32,7 +32,7 @@ import topopt3d_noinfill as N
 def binarize(M, xi):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
-    B1 = N.am_binary(B)
+    B1 = N.am_binary(B, max(1, int(round(M.h / M.dz))))
     lab, n = label(B1)                                      # 6 连通
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
     B2 = lab == int(sizes.argmax())
@@ -44,8 +44,9 @@ def thin_stats(M, B, tmin):
     """B：设计区二值。用直径 tmin 的球做形态学开运算（网格外按空），被去掉的设计区体素就是比 tmin 薄的板 / 杆"""
     S = np.where(M.design3, B, M.E_fix > 0)
     r = tmin / 2 / M.h; R = int(np.ceil(r)); o = np.arange(-R, R + 1)
-    di, dj, dk = np.meshgrid(o, o, o, indexing="ij")
-    ball = di ** 2 + dj ** 2 + dk ** 2 <= r * r + 1e-9
+    rz = tmin / 2 / M.dz; Rz = int(np.ceil(rz)); oz = np.arange(-Rz, Rz + 1)
+    di, dj, dk = np.meshgrid(o, o, oz, indexing="ij")
+    ball = (di / r) ** 2 + (dj / r) ** 2 + (dk / rz) ** 2 <= 1 + 1e-9         # 扁体素时是椭球（物理上仍是直径 tmin 的球）
     thin = S & ~binary_opening(S, structure=ball) & M.design3
     sol = S & M.design3
     t = sol.sum(2)
@@ -220,12 +221,13 @@ def build_mesh(M, F, step=1, fine=None):
     """F：体素场（0..1，固定区为 1）→ manifold；给了 fine（smooth_fine 的结果）就用细网格场的等值面。
     z 两面镜像延拓，切平到 [0, T]；并上精确固定区，挖掉精确方槽"""
     h, F, lev = (M.h, F, 0.5) if fine is None else (fine["lh"], fine["G"], fine["t"])
+    hz = M.dz if fine is None else h                        # 扁体素：层向尺寸不同
     pz = 3
     G = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
     G = np.pad(G, 2)
-    v, f, _, _ = measure.marching_cubes(G.astype(np.float32, copy=False), lev, spacing=(h, h, h), step_size=step, allow_degenerate=False)
+    v, f, _, _ = measure.marching_cubes(G.astype(np.float32, copy=False), lev, spacing=(h, h, hz), step_size=step, allow_degenerate=False)
     del G
-    v = v + np.array([-1.5 * h, -1.5 * h, -(pz + 1.5) * h])
+    v = v + np.array([-1.5 * h, -1.5 * h, -(pz + 1.5) * hz])
     mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f[:, ::-1].astype(np.uint32)))
     if mesh.volume() < 0:
         mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f.astype(np.uint32)))
@@ -289,7 +291,11 @@ def main():
     ha = hist["args"]
     md = a.dir.replace("noinfill", "model_noinfill") if "noinfill" in a.dir else a.dir + "/model"
     os.makedirs(md, exist_ok=True)
-    M = N.Free3D(ha["nz"], kz=ha["kz"], skin=ha["skin"], misuse=True, lateral=True, warp=True, asm_z=ha.get("asm_z", True))    # 复核总带 z 向体力工况
+    M = N.Free3D(ha["nz"], kz=ha["kz"], skin=ha["skin"], misuse=True, lateral=True, warp=True, asm_z=ha.get("asm_z", True),
+                 hxy=ha.get("hxy"), dz=ha.get("dz"))    # 复核总带 z 向体力工况
+    if M.dz != M.h and smooth_on:
+        print("扁体素：层向已经是打印层高，不做平滑（--smooth 只用于立方体素）", flush=True)
+        smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
     B, info = binarize(M, xi)
@@ -308,7 +314,7 @@ def main():
     nm = "二维方案（墙+表皮+15%填充）"; designs[nm] = (E2, m2, s2); keys[nm] = "flat"
     gable_wall = None
     if not a.no_gable:
-        gable_wall, (Eg, mg, sg) = gable_matched(M, float(m2.sum()) * M.h ** 3)
+        gable_wall, (Eg, mg, sg) = gable_matched(M, float(m2.sum()) * M.vox)
         print(f"尖拱空腔对照：墙厚 {gable_wall:.2f} mm 时用料相同", flush=True)
         nm = f"二维方案 + 尖拱空腔（无填充，墙 {gable_wall:.2f} mm）"; designs[nm] = (Eg, mg, sg); keys[nm] = "gable"
     tmin = a.tmin or ha.get("tmin") or 1.9
@@ -338,7 +344,7 @@ def main():
         M.set_mass(m)                      # 第一次调用（二维方案）定下 z 向体力的单位体积力
         comps, its = M.solve(E)
         st = M.stresses(s)
-        mass = float(m.sum()) * M.h ** 3
+        mass = float(m.sum()) * M.vox
         res[nm] = dict(key=keys[nm], comp=comps.tolist(), stress=st, mass_cm3=mass / 1000, petg_g=mass / 1000 * 1.27, cg=its, thin=thin.get(nm),
                        warp_um={k: [round(v[0] * 1000, 2), round(v[1] * 1000, 2)] for k, v in M.warp_measures().items()})   # 顶面平均 z 位移：全长、后半段
         print(f"{nm}: 用料 {mass/1000:.2f} cm³（PETG {mass/1000*1.27:.0f} g），CG {sum(its)}", flush=True)
@@ -396,7 +402,7 @@ def main():
         print("尖拱对照悬空检查：", oh_g, flush=True)
     # 实际打印用料：网格体积里接口区按墙+表皮+填充折算
     jv = extrude(M.joint_geom, 0, P.T).volume()
-    jm = float(M.m_fix[M.cols["jnt"]].sum()) * M.h ** 3
+    jm = float(M.m_fix[M.cols["jnt"]].sum()) * M.vox
     mass_mesh = (left.volume - jv + jm) / 1000
     summary = dict(names=names, binarize=info, mesh=dict(faces=len(left.faces), watertight=bool(left.is_watertight), volume_cm3=left.volume / 1000,
                    printed_cm3=mass_mesh, petg_g=mass_mesh * 1.27, bodies=int(sum(p.volume() > 0 for p in parts)), cavities_mm3=cav), overhang=oh,
@@ -404,7 +410,7 @@ def main():
                    overhang_gable=oh_g if gable_wall is not None else None, smooth=fine["info"] if fine is not None else None,
                    ref_model_dir=(a.ref.replace("noinfill", "model_noinfill") if a.ref and "noinfill" in a.ref else None))
     json.dump(summary, open(f"{md}/verify.json", "w"), ensure_ascii=False, indent=1)
-    np.savez_compressed(f"{md}/binary.npz", B=B, h=M.h)
+    np.savez_compressed(f"{md}/binary.npz", B=B, h=M.h, dz=M.dz, NT=M.NT)
     N.fig_sections(M, np.where(M.design3, B, M.E_fix > 0).astype(float), f"{md}/sections_binary.png", "二值化后的剖面（x = 常数，纵轴为打印方向）")
     print(f"导出用料（按网格）{mass_mesh:.2f} cm³ ≈ {mass_mesh*1.27:.0f} g PETG；用时 {time.time()-t0:.0f}s")
 

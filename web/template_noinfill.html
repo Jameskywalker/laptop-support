@@ -147,7 +147,8 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     ['悬空（> 45°，宽 > 2 mm）', fmt(D.overhang.area, 1) + ' mm²'],
     ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²'],
     ['薄壁', D.thinFact || ('最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%')],
-    ['网格', '优化用 ' + fmt(D.h, 3) + ' mm 立方体素（厚度方向 ' + D.nz + ' 格）' + (D.layer ? '；STL 平滑后按 ' + fmt(D.layer, 1) + ' mm 打印层重建' : '')],
+    ['网格', D.hxy ? ('优化用 ' + fmt(D.hxy, 2) + ' × ' + fmt(D.hxy, 2) + ' × ' + fmt(D.h, 2) + ' mm 扁体素（层向 = 打印层高，厚度方向 ' + D.nz + ' 层）')
+              : ('优化用 ' + fmt(D.h, 3) + ' mm 立方体素（厚度方向 ' + D.nz + ' 格）' + (D.layer ? '；STL 平滑后按 ' + fmt(D.layer, 1) + ' mm 打印层重建' : ''))],
     ...(D.padsInfo ? [['TPU 垫', D.padsInfo]] : []),
   ];
   $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');

@@ -114,7 +114,8 @@ def main():
         pads_info = (f"U 形卡套，每片支撑 4 件（顶面垫、前挡垫、前后脚套），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
     data = dict(T=P.T, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
-                leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=int(ha["nz"]), h=P.T / int(ha["nz"]), layer=(sm["layer_mm"] if sm else None), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
+                leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=(int(round(P.T / ha["dz"])) if ha.get("dz") else int(ha["nz"])), h=(ha["dz"] if ha.get("dz") else P.T / int(ha["nz"])),
+                hxy=(ha.get("hxy") or None), layer=(sm["layer_mm"] if sm else ha.get("dz")), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
                 center=[float(m0.bounds[:, 0].mean()), float(m0.bounds[:, 1].mean())], xmax=float(m0.bounds[1, 0]),
                 cavities=ver["mesh"]["cavities_mm3"], overhang=dict(area=ver["overhang"]["悬空总面积_mm2"], bridge=ver["overhang"]["短桥面积_mm2"]),
                 cases=cases, designs=designs, notes=notes,
