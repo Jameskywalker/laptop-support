@@ -294,7 +294,7 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -312,6 +312,7 @@ class Pipeline:
         # 45° 悬空：每层最多外扩 dz（mm）。体素宽 h = m·dz 时，每层相对下面 1..m 层都最多外扩一格（十字邻域）：
         # 平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法
         self.m_am = max(1, int(round(h / dz)))
+        self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
 
     def filt(self, x):
         return cnd.correlate(x, self.K, mode="constant", cval=0.0) / self.Ks
@@ -336,6 +337,8 @@ class Pipeline:
 
     def am_forward(self, xb):
         """ξ_k = smin(x̄_k, Σ_k)，Σ_k = smin_j S_j，S_j = (十字邻域 Σ ξ_{k−j}^P)^{1/Q}（j = 1..m；k−j < 0 时是床面，S_j = 1）"""
+        if self.no_am:
+            return xb, dict(xi=xb)
         Pp, Q, eps, m = self.P, self.Q, self.eps, self.m_am
         se = np.sqrt(eps)
         NZ = xb.shape[2]
@@ -369,6 +372,8 @@ class Pipeline:
 
     def am_backward(self, gxi, c):
         """dF/dξ → dF/dx̄（从顶层往下传；第 k 层的梯度只来自上面各层，处理到它时已经齐了）"""
+        if self.no_am:
+            return gxi
         Pp, Q, m = self.P, self.Q, self.m_am
         g = gxi.copy(); gxb = cp.zeros_like(gxi)
         for k in range(gxi.shape[2] - 1, 0, -1):
@@ -1014,6 +1019,7 @@ def main():
     ap.add_argument("--nz", type=int, default=32, help="厚度方向体素数（立方体素，h = T/nz）；给了 --dz 时不用")
     ap.add_argument("--dz", type=float, default=None, help="扁体素：层向尺寸 mm（= 打印层高，如 0.2）")
     ap.add_argument("--hxy", type=float, default=None, help="扁体素：面内尺寸 mm（如 0.4；45° 悬空按每 hxy/dz 层外扩一格）")
+    ap.add_argument("--no_am", action="store_true", help="不加悬空限制（对照：悬空的地方打印时加支撑）")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
@@ -1074,7 +1080,7 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am)
     if pipe.m_am > 1:
         print(f"悬空：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 平均 45°，单层最多伸出 {h:g} mm", flush=True)
     d3 = cp.asarray(M.design3)

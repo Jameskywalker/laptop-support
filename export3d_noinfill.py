@@ -29,10 +29,10 @@ import topopt3d_noinfill as N
 
 
 # ---------------- 二值化与清理 ----------------
-def binarize(M, xi):
+def binarize(M, xi, no_am=False):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
-    B1 = N.am_binary(B, max(1, int(round(M.h / M.dz))))
+    B1 = B if no_am else N.am_binary(B, max(1, int(round(M.h / M.dz))))
     lab, n = label(B1)                                      # 6 连通
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
     B2 = lab == int(sizes.argmax())
@@ -300,7 +300,7 @@ def main():
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
-    B, info = binarize(M, xi)
+    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")))
     print("二值化：", info, flush=True)
     fine = None
     if smooth_on:
