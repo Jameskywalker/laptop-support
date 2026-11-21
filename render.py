@@ -171,9 +171,23 @@ if 2 * sy + gap <= BD - 10 and (pg.bounds[2] - pg.bounds[0]) <= BW - 10:
               links_plate(BD / 2)]
     titles = ["第 1 盘：支撑 ×2", f"第 2 盘：面板 + 横梁 ×{NB}" if HAS_PANEL else f"第 2 盘：横梁 ×{NB}"]
 else:
-    plates = [[(place(pg, BW / 2, BD / 2), C_SUP)], [(place(right_fl, BW / 2, BD / 2), C_SUP)],
+    # 一盘放不下两片：每片单独一盘，绕竖直轴转一个角度斜着放（支撑大致是三角形，沿热床对角线放得下更长的）
+    def best_rot(g, margin=5.0):
+        best = None
+        for th in np.arange(0.0, 180.0, 0.5):
+            r = affinity.rotate(g, th, origin="centroid"); x0, y0, x1, y1 = r.bounds
+            s = min(BW - 2 * margin - (x1 - x0), BD - 2 * margin - (y1 - y0))
+            if best is None or s > best[1]:
+                best = (float(th), float(s))
+        return best
+    rot, slack = best_rot(pg)
+    assert slack >= 0, f"支撑转任何角度都放不进 {BW}×{BD} 热床（差 {-slack:.0f} mm）"
+    chk["print_rotation_deg"] = rot; chk["print_rotation_slack_mm"] = round(slack, 1)
+    plates = [[(place(affinity.rotate(pg, rot, origin="centroid"), BW / 2, BD / 2), C_SUP)],
+              [(place(affinity.rotate(right_fl, -rot, origin="centroid"), BW / 2, BD / 2), C_SUP)],
               links_plate(BD / 2)]
-    titles = ["支撑", "支撑", f"面板 + 横梁 ×{NB}" if HAS_PANEL else f"横梁 ×{NB}"]
+    titles = [f"第 1 盘：左支撑（绕竖直轴转 {rot:g}°）", f"第 2 盘：右支撑（转 {-rot:g}°）", f"第 3 盘：面板 + 横梁 ×{NB}" if HAS_PANEL else f"第 3 盘：横梁 ×{NB}"]
+    json.dump(chk, open(f"{OUT}/check.json", "w"), ensure_ascii=False, indent=1)
 fig, axs = plt.subplots(1, len(plates), figsize=(6 * len(plates), 5.6))
 for ax, items, tt in zip(np.atleast_1d(axs), plates, titles):
     ax.add_patch(plt.Rectangle((0, 0), BW, BD, fill=False, ls="--", color="gray"))

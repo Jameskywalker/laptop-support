@@ -50,9 +50,14 @@ if MODE == "raised":
     FRONT_FIX, REAR_FIX = "xy", "y"        # 前脚铰支，后脚滑动
 else:
     LIP_H = 15.0                           # 倾角大，前挡加高
-    # 让前挡最前点落在 x=0、顶面实体带最低点落在桌面 y=0 —— 前挡直接接触桌面
-    P0 = np.array([LIP_T * np.cos(TH) + LIP_H * np.sin(TH), LIP_T * np.sin(TH) + TB * np.cos(TH)])
-    REAR_EXT = 95.0                        # 后脚伸出顶面后端的距离（防后翻；H3C 热床允许，2026-11-18 由 45 加长到 95）
+    # 让前挡最前点落在 x=FRONT_EXT、顶面实体带最低点落在桌面 y=0 —— 前挡直接接触桌面
+    # 前挡前面再伸出一段贴桌的楔形脚尖（防前翻，2026-11-21）：从前挡顶前角斜下到 x=0 处高 TOE_H 的脚尖
+    FRONT_EXT = 40.0
+    TOE_H = 5.0
+    P0 = np.array([FRONT_EXT + LIP_T * np.cos(TH) + LIP_H * np.sin(TH), LIP_T * np.sin(TH) + TB * np.cos(TH)])
+    # 后脚伸出顶面后端的距离（防后翻）：2026-11-18 由 45 加长到 95；2026-11-21 再加 60 到 155，
+    # 总长约 368 mm，单片转约 34° 斜放才放得进 H3C 热床（两片分两盘打）
+    REAR_EXT = 155.0
     _E = P0 + S_END * U
     X_MAX = round(float(_E[0] + REAR_EXT), 1)
     Y_CAP_REAR = float(_E[1] - 25.0)       # 顶面后端之后的区域限高（给转轴/屏幕下沿留空间）
@@ -260,7 +265,7 @@ def geometry(use_joint=USE_JOINT):
     else:
         E = sn2xy(S_END, 0); F = sn2xy(0, 0); Gp = sn2xy(0, LIP_H); H = sn2xy(-LIP_T, LIP_H)
         D = sn2xy(S_END, (Y_CAP_REAR - float(E[1])) / np.cos(TH))
-        pts = [(0, 0), (X_MAX, 0), (X_MAX, Y_CAP_REAR), D, E, F, Gp, H, (0.0, float(H[1]))]
+        pts = [(0, 0), (X_MAX, 0), (X_MAX, Y_CAP_REAR), D, E, F, Gp, H] + ([(0.0, TOE_H)] if FRONT_EXT > 0 else [(0.0, float(H[1]))])
         domain = Polygon([(float(x), float(y)) for x, y in pts]).buffer(0)
         r = FILLET_R
         # 方块向 s<0、n<0 方向多伸 0.05 mm 与主体重叠，避免浮点误差导致圆角区与主体分离
