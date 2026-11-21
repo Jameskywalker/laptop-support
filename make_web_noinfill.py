@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--dir", default=f"{P.OUT_DIR}/model_noinfill")
     ap.add_argument("--tol", type=float, default=0.06)
     ap.add_argument("--cmp-dir", default=None, help="另一次导出的目录，取它的三维设计作对照（比值各按它自己的二维方案算），例如孔位改动前的那次")
+    ap.add_argument("--names", default="新孔位三维,新孔位,旧孔位三维,旧孔位", help="--cmp-dir 时的标签：本次全称,本次简称,对照全称,对照简称")
+    ap.add_argument("--lead", default="横梁孔上移 5 mm、接口区贴齐斜面后重新优化；", help="--cmp-dir 时导语前面加的话")
+    ap.add_argument("--cmp-note", default="旧孔位三维：孔中心离斜面 18 mm 时的上一版（屈曲 ≥ 20、最薄 1.9 mm），比值按它自己那时的二维方案算。")
     a = ap.parse_args()
     ver = json.load(open(f"{a.dir}/verify.json"))
     res = {r["key"]: dict(r, label=nm) for nm, r in ver["results"].items()}
@@ -70,8 +73,9 @@ def main():
                          f"{a.dir}/support_ref_left.stl" if os.path.exists(f"{a.dir}/support_ref_left.stl") else f"{ver.get('ref_model_dir')}/support_noinfill_left.stl"))
     meshes = {k: display_mesh(src[k], a.tol) for k in ("free", cmp)}
     meshes["flat"] = trimesh.load(f"{P.MODEL_DIR}/support_left.stl")
-    labels = dict(free="新孔位三维" if a.cmp_dir else "新三维" if cons else "无填充三维", free_old="旧孔位三维" if a.cmp_dir else "旧三维（无约束）", gable="尖拱空腔", flat="二维方案")
-    short = dict(free="新孔位" if a.cmp_dir else "新三维" if cons else "三维", free_old="旧孔位" if a.cmp_dir else "旧三维", gable="尖拱", flat="二维")
+    nm4 = a.names.split(",")
+    labels = dict(free=nm4[0] if a.cmp_dir else "新三维" if cons else "无填充三维", free_old=nm4[2] if a.cmp_dir else "旧三维（无约束）", gable="尖拱空腔", flat="二维方案")
+    short = dict(free=nm4[1] if a.cmp_dir else "新三维" if cons else "三维", free_old=nm4[3] if a.cmp_dir else "旧三维", gable="尖拱", flat="二维")
     Ls = np.eye(4); Ls[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]; Ls[:3, 3] = [-P.SPACING / 2 - P.T / 2, 0, 0]
     Rs = np.diag([-1, 1, 1, 1]) @ Ls
     rear = [j for j in P.JOINTS if j.get("part", "beam") == "beam"][0]
@@ -83,7 +87,7 @@ def main():
          "封闭空腔留在零件里面，FDM 不用清理。" + ("空腔顶部按 45° 逐层收成尖顶，不用搭桥。" if ver["overhang"]["短桥面积_mm2"] < 1 else "空腔顶部最后一层是跨度不到 2 mm 的短桥。")),
         "左右两片是镜像件，都是 z = 0 的那面贴床；装配时这一面朝外，卡钩扣在这一面。",
         ("尖拱空腔对照：同一个二维轮廓，内部挖成 45° 尖顶空腔，墙厚 " + (f"{gw:.2f}" if gw else "—") + " mm 时与二维方案同样用料。") if cmp == "gable" else
-        ("旧孔位三维：孔中心离斜面 18 mm 时的上一版（屈曲 ≥ 20、最薄 1.9 mm），比值按它自己那时的二维方案算。" if a.cmp_dir else
+        (a.cmp_note if a.cmp_dir else
          "旧三维：上一版无填充三维优化（只有用料约束），同一个三维模型、同样的复核方法重新算的。"),
         "侧向位移：面内载荷引起的厚度方向（z）位移。误用工况按装配状态算：面板和横梁拉住三个接口的 z 向。",
     ]
@@ -110,7 +114,7 @@ def main():
         pads_info = (f"U 形卡套，每片支撑 4 件（顶面垫、前挡垫、前后脚套），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
     data = dict(T=P.T, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
-                leadExtra=(("横梁孔上移 5 mm、接口区贴齐斜面后重新优化；" if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=int(ha["nz"]), h=P.T / int(ha["nz"]), layer=(sm["layer_mm"] if sm else None), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
+                leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=int(ha["nz"]), h=P.T / int(ha["nz"]), layer=(sm["layer_mm"] if sm else None), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
                 center=[float(m0.bounds[:, 0].mean()), float(m0.bounds[:, 1].mean())], xmax=float(m0.bounds[1, 0]),
                 cavities=ver["mesh"]["cavities_mm3"], overhang=dict(area=ver["overhang"]["悬空总面积_mm2"], bridge=ver["overhang"]["短桥面积_mm2"]),
                 cases=cases, designs=designs, notes=notes,
