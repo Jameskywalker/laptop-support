@@ -307,8 +307,14 @@ class SupportEst:
     的估算（体素上）对上 Bambu 实切的 11.2 cm³（阈值 30°、树状支撑）。短桥下的支撑体素上看不到（斜面版实切 1.6 cm³，估算 ≈ 0）。
     xi0 取得低（0.1）：灰度阶段均匀的低密度算"托得住"，不会凭空算出一大片支撑"""
 
-    def __init__(self, h, dz, NT, angle=30.0, P=40.0, xi0=0.1, eps=1e-8, c=2.0, e=0.47):
+    def __init__(self, h, dz, NT, angle=30.0, P=40.0, xi0=0.1, eps=1e-8, c=2.0, e=0.47, r_mm=0.0, pd=16.0):
+        """r_mm > 0：悬空先在面内膨胀 r_mm（p-范数近似的最大值，pd 次）再计面积 —— 树状支撑每个悬空点都要一根枝，
+        按面积计费时优化器会把悬空打碎成很多一格的小点（面积小、实切支撑反而多），膨胀后小点不再便宜"""
         m, ker = am_stencil(h, dz, angle)
+        self.r, self.pd = r_mm, pd
+        if r_mm > 0:
+            R = int(np.floor(r_mm / h + 1e-9)); o = np.arange(-R, R + 1); di, dj = np.meshgrid(o, o, indexing="ij")
+            self.disk = cp.asarray((((di * di + dj * dj) * h * h) <= r_mm * r_mm + 1e-9).astype(np.float64)[:, :, None])
         self.ker = None if ker is None else cp.asarray(ker[:, :, None].astype(np.float64))
         nst = 5 if ker is None else int(ker.sum())
         self.P, self.Q, self.eps, self.NT = P, P + np.log(nst) / np.log(xi0), eps, NT
@@ -325,11 +331,17 @@ class SupportEst:
         Ssum = cp.maximum(self._ss(lo ** Pp), 1e-280); S = Ssum ** (1.0 / Q)
         d = up - S; r = cp.sqrt(d * d + self.eps)
         u = 0.5 * (d + r - np.sqrt(self.eps))
-        V = float((self.w * u).sum())
         du = 0.5 * (1 + d / r)
+        if self.r > 0:
+            up_ = cp.maximum(u, 0.0); pd = self.pd
+            Tsum = cp.maximum(cnd.correlate(up_ ** pd, self.disk, mode="constant", cval=0.0), 1e-300)
+            V = float((self.w * Tsum ** (1.0 / pd)).sum())
+            gu = up_ ** (pd - 1) * cnd.correlate(self.w * Tsum ** (1.0 / pd - 1.0), self.disk, mode="constant", cval=0.0)
+        else:
+            V = float((self.w * u).sum()); gu = self.w
         g = cp.zeros_like(x)
-        g[:, :, 1:NT] += self.w * du
-        g[:, :, :NT - 1] += Pp * lo ** (Pp - 1) * self._ss(-self.w * du * (1.0 / Q) * Ssum ** (1.0 / Q - 1.0))
+        g[:, :, 1:NT] += gu * du
+        g[:, :, :NT - 1] += Pp * lo ** (Pp - 1) * self._ss(-gu * du * (1.0 / Q) * Ssum ** (1.0 / Q - 1.0))
         return V, g
 
 
@@ -1102,7 +1114,9 @@ def main():
     ap.add_argument("--sup_mu", type=float, default=0.0, help="支撑惩罚：目标 += μ·(估算支撑体积 / sup_ref)；一般配 --no_am")
     ap.add_argument("--sup_ref", type=float, default=10000.0, help="支撑惩罚的参考体积 mm³（10 cm³）")
     ap.add_argument("--sup_angle", type=float, default=30.0, help="估算支撑时的阈值角（与床面夹角）。立方体素上建议 45：30° 的 3×3 邻域把斜对角的台阶也算托住，切片时仍要支撑")
-    ap.add_argument("--sup_c", type=float, default=2.0, help="每 mm² 悬空的支撑体积系数（× z^0.47 mm³），按 Bambu 实切标定")
+    ap.add_argument("--sup_c", type=float, default=2.0, help="每 mm² 悬空的支撑体积系数（× z^e mm³），按 Bambu 实切标定")
+    ap.add_argument("--sup_e", type=float, default=0.47, help="支撑体积随离床高度的指数")
+    ap.add_argument("--sup_r", type=float, default=0.0, help="悬空面内膨胀半径 mm（> 0 时按膨胀后的面积计，见 SupportEst）")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
@@ -1169,7 +1183,7 @@ def main():
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
     elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm", flush=True)
-    supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle, c=a.sup_c) if a.sup_mu > 0 else None
+    supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle, c=a.sup_c, e=a.sup_e, r_mm=a.sup_r) if a.sup_mu > 0 else None
     if supest is not None:
         print(f"支撑惩罚 μ={a.sup_mu:g}：每 {a.sup_ref/1000:g} cm³ 估算支撑 = 目标里 {a.sup_mu:g}（阈值 {a.sup_angle:g}°）", flush=True)
     d3 = cp.asarray(M.design3)

@@ -302,7 +302,8 @@ def main():
     target = float(r["target"])
     B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0))
     _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
-    sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0))(cp.asarray(_S))[0]
+    sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
+                           e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
     print(f"估算树状支撑（阈值 {ha.get('sup_angle', 30.0):g}°）：{sup_est/1000:.2f} cm³", flush=True)
     print("二值化：", info, flush=True)
     fine = None
