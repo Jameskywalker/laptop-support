@@ -935,13 +935,20 @@ class Free3D:
         DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.dz, 0, 0, 0)).ravel(), F32)
         sig = cp.empty(6 * L0.nel, F32); ones = cp.ones(L0.nel, F32)
         mk = cp.asarray(mask.ravel())
+        # 位移只统计实心体素的节点（空单元里的节点只靠极软的空材料连着，位移没有意义；扁体素时 T 以上补的层也是空）
+        m3 = cp.asarray(mask, cp.bool_)
+        nm_ = cp.zeros((self.NX + 1, self.NY + 1, self.NZ + 1), cp.bool_)
+        for a in range(8):
+            di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
+            nm_[di:di + self.NX, dj:dj + self.NY, dk:dk + self.NZ] |= m3
+        nm_ = nm_.ravel()
         out = []
         for l, nm in enumerate(self.names):
             T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], sig, ones, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
             S = sig.reshape(-1, 6)[mk]
             vm = cp.sqrt(0.5 * ((S[:, 0] - S[:, 1]) ** 2 + (S[:, 1] - S[:, 2]) ** 2 + (S[:, 2] - S[:, 0]) ** 2) + 3 * (S[:, 3] ** 2 + S[:, 4] ** 2 + S[:, 5] ** 2))
             tz = cp.sqrt(S[:, 4] ** 2 + S[:, 5] ** 2)
-            u = self.U[l].reshape(-1, 3)
+            u = self.U[l].reshape(-1, 3)[nm_]
             pct = lambda v: float(cp.percentile(v, 99.9))
             out.append(dict(工况=nm, 最大位移_mm=float(cp.sqrt((u ** 2).sum(1)).max()),
                             面内位移_mm=float(cp.sqrt(u[:, 0] ** 2 + u[:, 1] ** 2).max()), z向位移_mm=float(cp.abs(u[:, 2]).max()),
@@ -962,6 +969,11 @@ class Free3D:
         cov, fw = print_columns(geom, self.NX, self.NY, self.h, ps["nwall"] * P.LINE_W)
         E, m = print_voxels(cov, fw, self.fs, ps["infill"] ** 2, ps["infill"])
         solid = (fw[:, :, None] + (cov - fw)[:, :, None] * self.fs[None, None, :]) > 0.5
+        # 顶面、前挡后表面、脚垫那几条固定实心条按实心（与三维设计相同）：载荷就加在这几条的节点上，二维轮廓在前挡顶、
+        # 顶面后端是圆角，网格细的时候最外一排加载节点会落在轮廓外的空单元里，力加在空节点上，柔度被放大好几倍。
+        # 二维方案在这里本来就是墙（实心），差别只在圆角那一点点
+        fx = self.cols["fixs"][:, :, None] & self.zr[None, None, :]
+        E = np.where(fx, 1.0, E); m = np.where(fx, 1.0, m); solid = solid | fx
         return E * self.zr, m * self.zr, solid & self.zr
 
     def design_fields(self, xi, p=3.0):
