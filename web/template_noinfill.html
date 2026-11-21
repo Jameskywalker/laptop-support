@@ -146,7 +146,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     ['悬空（> 45°，宽 > 2 mm）', fmt(D.overhang.area, 1) + ' mm²'],
     ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²'],
     ['薄壁', D.thinFact || ('最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%')],
-    ['体素', fmt(D.h, 3) + ' mm 立方，厚度方向 ' + D.nz + ' 层'],
+    ['网格', '优化用 ' + fmt(D.h, 3) + ' mm 立方体素（厚度方向 ' + D.nz + ' 格）' + (D.layer ? '；STL 平滑后按 ' + fmt(D.layer, 1) + ' mm 打印层重建' : '')],
   ];
   $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const xmax = Math.max(1.25, ...D.cases.map(c => Math.max(free.rel[c], gable.rel[c])));
@@ -198,6 +198,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const fill = new THREE.DirectionalLight(0xffffff, 0.25); fill.position.set(0.8, 0.6, -0.4); scene.add(fill);
 
   const clip = new THREE.Plane(new THREE.Vector3(0, 0, -1), D.T);
+  const NL = D.layer ? Math.round(D.T / D.layer) : D.nz;     // 逐层剖切：按打印层（STL 按打印层重建时），否则按体素层
   const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.65, metalness: 0 });
   const matLink = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.7, metalness: 0, color: 0xb9c2cc });
   const M4 = (a) => new THREE.Matrix4().set(...a);
@@ -239,9 +240,9 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     $('layerbox').classList.toggle('off', S.view !== 'print');
     $('seg-cut').parentElement.classList.toggle('off', S.view !== 'print');
     if (S.cut === 'z') {
-      const k = Math.max(1, Math.round(S.pos * D.nz)), zc = k * D.h;
+      const k = Math.max(1, Math.round(S.pos * NL)), zc = k * D.T / NL;
       clip.normal.set(0, 0, -1); clip.constant = zc + 1e-3;
-      $('layerout').textContent = '第 ' + k + ' 层 · z ' + fmt(zc, 1) + ' mm';
+      $('layerout').textContent = '第 ' + k + ' / ' + NL + ' 层 · z ' + fmt(zc, 1) + ' mm';
     } else {
       const xc = 2 + S.pos * (D.xmax - 2);
       clip.normal.set(-1, 0, 0); clip.constant = xc - D.center[0];
@@ -268,7 +269,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     S.pos = 0; slider.value = 0; $('play').textContent = '停止';
     const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
     timer = setInterval(() => {
-      S.pos = Math.min(1, S.pos + (reduce ? 0.125 : 1 / (S.cut === 'z' ? D.nz : 120))); slider.value = Math.round(S.pos * 1000); apply(false);
+      S.pos = Math.min(1, S.pos + (reduce ? 0.125 : 1 / (S.cut === 'z' ? NL : 120))); slider.value = Math.round(S.pos * 1000); apply(false);
       if (S.pos >= 1) { clearInterval(timer); timer = null; $('play').textContent = '播放'; }
     }, reduce ? 250 : 70);
   });

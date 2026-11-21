@@ -7,7 +7,10 @@
      墙厚调到与二维方案同样用料 —— 手工"尖拱封顶"的对照；
    - 无填充三维优化。
    三者的横梁接口区都按墙 + 表皮 + 15% 填充。
-3. 网格：ξ 场做 marching cubes（z 两面镜像延拓后在 z=0、z=T 处切平），并上精确的固定区几何、挖掉精确的方槽 → STL。
+3. 网格：二值体素先平滑（--smooth σ 个体素），再插值到打印层高（0.2 mm）的立方网格，逐层做 45° 悬空限制（灰度 AM），
+   取等值面（z 两面镜像延拓后在 z=0、z=T 处切平），并上精确的固定区几何、挖掉精确的方槽 → STL。
+   直接用 0.625 mm 体素做 marching cubes 的话，缓坡上是 0.625 mm 高的台阶（--smooth 0 仍可这样导出）。
+   复核、薄壁统计用平滑后的形状（细网格按体素取多数）。
    悬空检查：按 0.2 mm 层高切片，每层超出下一层外扩 0.2 mm（45°）范围的面积。
 用法: STAND_VARIANT=desk40 python export3d_noinfill.py [--dir out/desk40/noinfill]
 """
@@ -15,7 +18,7 @@ import argparse, json, os, time
 import numpy as np
 import shapely
 from shapely.geometry import Polygon, MultiPolygon
-from scipy.ndimage import label, distance_transform_edt, binary_opening
+from scipy.ndimage import label, distance_transform_edt, binary_opening, gaussian_filter, spline_filter, map_coordinates, grey_dilation
 from skimage import measure, morphology
 import manifold3d as m3d
 import trimesh
@@ -97,23 +100,82 @@ def extrude(geom, z0, z1):
     return m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
 
 
-def build_mesh(M, F, step=1):
-    """F：体素场（0..1，固定区为 1）→ manifold。z 两面镜像延拓，切平到 [0, T]；并上精确固定区，挖掉精确方槽"""
-    h = M.h
+# ---------------- 按打印层高平滑重建 ----------------
+def smooth_fine(M, F, sigma, lh=P.LAYER_H, pad=4):
+    """体素场 F（0..1，固定区为 1）→ 打印层高 lh 的立方细网格场：
+    1. 高斯平滑（σ 个体素；网格外按空，z 两面镜像），三次样条插值到细网格（采样点在每层正中，就是切片平面）；
+    2. 阈值 t 取成与体素模型同体积；
+    3. 灰度 AM：从床面往上，每层不超过下一层的十字膨胀（每层最多外扩一格 = lh → 45°）；
+    4. 只留最大的连通块。
+    σ = 1 时比一个体素还薄的板会消失（腐蚀设计里它们本来就不出力）。返回 dict(G, t, lh, info)，G 的 t 等值面就是零件表面"""
+    NX, NY, NZ = F.shape; h = M.h
+    G = np.pad(np.asarray(F, np.float32), ((pad, pad), (pad, pad), (0, 0)))
+    G = np.concatenate([G[:, :, pad - 1::-1], G, G[:, :, :-pad - 1:-1]], 2)
+    if sigma > 0:
+        G = gaussian_filter(G, sigma, mode="nearest")
+    C = spline_filter(G, order=3, mode="nearest")
+    nxf, nyf, nzf = (int(round(n * h / lh)) for n in (NX, NY, NZ))
+    X, Y = np.meshgrid(((np.arange(nxf) + 0.5) * lh) / h - 0.5 + pad, ((np.arange(nyf) + 0.5) * lh) / h - 0.5 + pad, indexing="ij")
+    Gf = np.empty((nxf, nyf, nzf), np.float32)
+    for k in range(nzf):
+        Gf[:, :, k] = map_coordinates(C, [X, Y, np.full_like(X, ((k + 0.5) * lh) / h - 0.5 + pad)], order=3, prefilter=False, mode="nearest")
+    del C, G, X, Y
+    vc = float(np.sum(F)) * h ** 3
+    lo, hi = 0.3, 0.7
+    for _ in range(30):
+        t = 0.5 * (lo + hi)
+        if (Gf > t).sum() * lh ** 3 > vc: lo = t
+        else: hi = t
+    n0 = int((Gf > t).sum())
+    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+    for k in range(1, nzf):
+        Gf[:, :, k] = np.minimum(Gf[:, :, k], grey_dilation(Gf[:, :, k - 1], footprint=cross))
+    L = Gf > t
+    n1 = int(L.sum())
+    lab, n = label(L); sz = np.bincount(lab.ravel()); sz[0] = 0
+    drop = L & (lab != int(sz.argmax())); del lab
+    Gf[drop] = np.minimum(Gf[drop], t - 0.05)
+    n2 = n1 - int(drop.sum())
+    info = dict(sigma_vox=sigma, layer_mm=lh, threshold=round(float(t), 4), 平滑前体积_cm3=round(vc / 1000, 3), 平滑后体积_cm3=round(n2 * lh ** 3 / 1000, 3),
+                AM去掉_mm3=round((n0 - n1) * lh ** 3, 1), 碎块去掉_mm3=round((n1 - n2) * lh ** 3, 1), 碎块数=int(n - 1))
+    return dict(G=Gf, t=float(t), lh=lh, info=info)
+
+
+def coarse_from_fine(M, fine):
+    """细网格实体 → 体素二值（体素里的细网格采样点过半算有材料），给复核和薄壁统计用"""
+    L = fine["G"] > fine["t"]
+    r = M.h / fine["lh"]
+    idx = [((np.arange(n) + 0.5) / r).astype(int) for n in L.shape]
+    st = [np.r_[0, np.nonzero(np.diff(c))[0] + 1] for c in idx]
+    assert tuple(len(s) for s in st) == (M.NX, M.NY, M.NZ)
+    S = L
+    for ax in range(3):
+        S = np.add.reduceat(S, st[ax], axis=ax, dtype=np.uint16)
+    cnt = [np.bincount(c) for c in idx]
+    return S > 0.5 * (cnt[0][:, None, None] * cnt[1][None, :, None] * cnt[2][None, None, :])
+
+
+def build_mesh(M, F, step=1, fine=None):
+    """F：体素场（0..1，固定区为 1）→ manifold；给了 fine（smooth_fine 的结果）就用细网格场的等值面。
+    z 两面镜像延拓，切平到 [0, T]；并上精确固定区，挖掉精确方槽"""
+    h, F, lev = (M.h, F, 0.5) if fine is None else (fine["lh"], fine["G"], fine["t"])
     pz = 3
     G = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
     G = np.pad(G, 2)
-    v, f, _, _ = measure.marching_cubes(G.astype(np.float32), 0.5, spacing=(h, h, h), step_size=step, allow_degenerate=False)
+    v, f, _, _ = measure.marching_cubes(G.astype(np.float32, copy=False), lev, spacing=(h, h, h), step_size=step, allow_degenerate=False)
+    del G
     v = v + np.array([-1.5 * h, -1.5 * h, -(pz + 1.5) * h])
     mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f[:, ::-1].astype(np.uint32)))
     if mesh.volume() < 0:
         mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f.astype(np.uint32)))
-    box = m3d.Manifold.cube((M.NX * h + 20, M.NY * h + 20, P.T)).translate((-10, -10, 0))
+    box = m3d.Manifold.cube((M.NX * M.h + 20, M.NY * M.h + 20, P.T)).translate((-10, -10, 0))
     mesh = mesh ^ box
     dom, _ = P.geometry(True)
     fixed = shapely.unary_union([g.intersection(dom) for g in M.fixed_regions.values()])
     mesh = mesh + extrude(fixed, 0, P.T)
     mesh = mesh - extrude(P.joint_slot(), -1, P.T + 1)
+    if fine is not None:
+        mesh = mesh.simplify(0.02)          # 0.02 mm 以内合并近似共面的三角形，面数降到约 1/4
     return mesh
 
 
@@ -154,6 +216,7 @@ def main():
     ap.add_argument("--no-buckling", action="store_true")
     ap.add_argument("--ref", default=None, help="另一次三维结果（同 nz 的 result.npz 所在目录）一起复核，例如无约束的那次")
     ap.add_argument("--tmin", type=float, default=None, help="薄壁统计用的厚度 mm（默认取优化时的 --tmin，没有则 1.9）")
+    ap.add_argument("--smooth", type=float, default=1.0, help="STL 按打印层高平滑重建的高斯半径（体素）；0 = 直接用体素做 marching cubes")
     a = ap.parse_args()
     t0 = time.time()
     r = np.load(f"{a.dir}/result.npz")
@@ -166,6 +229,14 @@ def main():
     target = float(r["target"])
     B, info = binarize(M, xi)
     print("二值化：", info, flush=True)
+    fine = None
+    if a.smooth > 0:
+        tf = time.time()
+        fine = smooth_fine(M, np.where(M.design3, B, M.E_fix > 0), a.smooth)
+        Bs = coarse_from_fine(M, fine) & M.design3
+        fine["info"]["体素变化"] = dict(增加=int((Bs & ~B).sum()), 去掉=int((B & ~Bs).sum()), 原有=int(B.sum()))
+        print(f"按 {P.LAYER_H} mm 层平滑重建（复核也用平滑后的形状）：", fine["info"], f"{time.time()-tf:.0f}s", flush=True)
+        B = Bs
 
     designs = {}; keys = {}
     E2, m2, s2 = M.baseline_fields()
@@ -181,6 +252,11 @@ def main():
         rr = np.load(f"{a.ref}/result.npz")
         if rr["xi"].shape == xi.shape:
             Bo, info_o = binarize(M, rr["xi"].astype(float))
+            if a.smooth > 0:            # 对照也按同样方法平滑，网格另存一份给预览
+                fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth)
+                Bo = coarse_from_fine(M, fo) & M.design3
+                to_trimesh(build_mesh(M, None, fine=fo)).export(f"{md}/support_ref_left.stl")
+                del fo
             nm = "无填充三维（无约束）"; designs[nm] = M.design_fields(Bo.astype(float)); keys[nm] = "free_old"
             thin[nm] = thin_stats(M, Bo, tmin)
         else:
@@ -233,7 +309,9 @@ def main():
     # 网格
     tm = time.time()
     F = np.where(M.design3, B.astype(float), (M.E_fix > 0).astype(float))   # 用检查过悬空的二值体素（立方体素 + 十字支撑 → 斜面不超过 45°）
-    man = build_mesh(M, F)
+    man = build_mesh(M, F, fine=fine)
+    if fine is not None:
+        del fine["G"]
     left = to_trimesh(man)
     parts = man.decompose()
     cav = sorted([-p.volume() for p in parts if p.volume() < 0])
@@ -258,7 +336,7 @@ def main():
     summary = dict(names=names, binarize=info, mesh=dict(faces=len(left.faces), watertight=bool(left.is_watertight), volume_cm3=left.volume / 1000,
                    printed_cm3=mass_mesh, petg_g=mass_mesh * 1.27, bodies=int(sum(p.volume() > 0 for p in parts)), cavities_mm3=cav), overhang=oh,
                    target_cm3=target / 1000, results=res, table=table, args=ha, gable_wall_mm=gable_wall,
-                   overhang_gable=oh_g if gable_wall is not None else None,
+                   overhang_gable=oh_g if gable_wall is not None else None, smooth=fine["info"] if fine is not None else None,
                    ref_model_dir=(a.ref.replace("noinfill", "model_noinfill") if a.ref and "noinfill" in a.ref else None))
     json.dump(summary, open(f"{md}/verify.json", "w"), ensure_ascii=False, indent=1)
     np.savez_compressed(f"{md}/binary.npz", B=B, h=M.h)

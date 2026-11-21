@@ -3,7 +3,7 @@
 web/template_noinfill.html → web/noinfill_preview.html
 用法: STAND_VARIANT=desk40 python make_web_noinfill.py [--dir out/desk40/model_noinfill]   （需先运行 topopt3d_noinfill.py 和 export3d_noinfill.py）
 """
-import argparse, base64, json
+import argparse, base64, json, os
 import numpy as np
 import trimesh
 import manifold3d as m3d
@@ -41,7 +41,7 @@ def T_beam(j):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=f"{P.OUT_DIR}/model_noinfill")
-    ap.add_argument("--tol", type=float, default=0.12)
+    ap.add_argument("--tol", type=float, default=0.06)
     a = ap.parse_args()
     ver = json.load(open(f"{a.dir}/verify.json"))
     res = {r["key"]: dict(r, label=nm) for nm, r in ver["results"].items()}
@@ -62,7 +62,7 @@ def main():
                             vm_f=st[iF]["VM_99_9pct_MPa"], vm_r=st[iR]["VM_99_9pct_MPa"],
                             z_f=st[iF]["z向位移_mm"] * 1000, z_r=st[iR]["z向位移_mm"] * 1000))
     src = dict(free=f"{a.dir}/support_noinfill_left.stl", gable=f"{a.dir}/support_gable_left.stl",
-               free_old=f"{ver.get('ref_model_dir')}/support_noinfill_left.stl")
+               free_old=f"{a.dir}/support_ref_left.stl" if os.path.exists(f"{a.dir}/support_ref_left.stl") else f"{ver.get('ref_model_dir')}/support_noinfill_left.stl")
     meshes = {k: display_mesh(src[k], a.tol) for k in ("free", cmp)}
     meshes["flat"] = trimesh.load(f"{P.MODEL_DIR}/support_left.stl")
     labels = dict(free="新三维" if cons else "无填充三维", free_old="旧三维（无约束）", gable="尖拱空腔", flat="二维方案")
@@ -74,12 +74,16 @@ def main():
     gw = ver.get("gable_wall_mm")
     notes = [
         "打印：侧面贴床，不加支撑。切片时内部按实心打印（墙圈数加够，或稀疏填充设 100%）；三个横梁接口区加修改器，仍用 4 圈墙 + 15–25% 填充。",
-        "封闭空腔留在零件里面，FDM 不用清理。空腔顶部最后一层是跨度不到 2 mm 的短桥。",
+        "封闭空腔留在零件里面，FDM 不用清理。" + ("空腔顶部按 45° 逐层收成尖顶，不用搭桥。" if ver["overhang"]["短桥面积_mm2"] < 1 else "空腔顶部最后一层是跨度不到 2 mm 的短桥。"),
         "左右两片是镜像件，都是 z = 0 的那面贴床；装配时这一面朝外，卡钩扣在这一面。",
         ("尖拱空腔对照：同一个二维轮廓，内部挖成 45° 尖顶空腔，墙厚 " + (f"{gw:.2f}" if gw else "—") + " mm 时与二维方案同样用料。") if cmp == "gable" else
         ("旧三维：上一版无填充三维优化（只有用料约束），同一个三维模型、同样的复核方法重新算的。"),
         "侧向位移：面内载荷引起的厚度方向（z）位移。误用工况按装配状态算：面板和横梁拉住三个接口的 z 向。",
     ]
+    sm = ver.get("smooth")
+    if sm:
+        notes.insert(1, f"表面：优化网格是 {P.T / int(ha['nz']):.3f} mm 的立方体素，直接导出的话缓坡上是这么高的台阶。STL 先把体素平滑（σ = {sm['sigma_vox']:g} 个体素），"
+                        f"再按 {sm['layer_mm']:g} mm 打印层重建，逐层限制 45° 悬空；复核数据也是按平滑后的形状算的。")
     B = np.load(f"{a.dir}/binary.npz")["B"]
     t = B.sum(2); thin = float((t[t > 0] <= 1).mean())          # 只有一层体素厚的柱子占比
     th = res["free"].get("thin"); tho = res.get(cmp, {}).get("thin")
@@ -91,7 +95,7 @@ def main():
         notes.insert(0, f"这一版在优化里加了两个约束：两个 150 N 误用工况的线性屈曲系数 ≥ {ha.get('buck', 0):g}（按腐蚀后的设计算，偏保守），"
                         f"最小厚度 {ha.get('tmin', 0):g} mm（比它薄的板和杆在腐蚀设计里消失，只吃料不出力）。")
     data = dict(T=P.T, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
-                leadExtra=(f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else ""), nz=int(ha["nz"]), h=P.T / int(ha["nz"]), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
+                leadExtra=(f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else ""), nz=int(ha["nz"]), h=P.T / int(ha["nz"]), layer=(sm["layer_mm"] if sm else None), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
                 center=[float(m0.bounds[:, 0].mean()), float(m0.bounds[:, 1].mean())], xmax=float(m0.bounds[1, 0]),
                 cavities=ver["mesh"]["cavities_mm3"], overhang=dict(area=ver["overhang"]["悬空总面积_mm2"], bridge=ver["overhang"]["短桥面积_mm2"]),
                 cases=cases, designs=designs, notes=notes,
