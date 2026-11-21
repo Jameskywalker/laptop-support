@@ -300,6 +300,39 @@ def am_stencil(h, dz, angle=45.0):
     return 1, (di ** 2 + dj ** 2 <= gc ** 2 + 1e-9)
 
 
+class SupportEst:
+    """支撑用料估算（可微，单位 mm³）。第 k 层超出下一层支撑邻域的部分算悬空：u = x_k − smin(x_k, S_k)，
+    S_k = (邻域 Σ x_{k−1}^P)^{1/Q}，邻域按切片软件的支撑阈值角 angle（与床面夹角，见 am_stencil）。
+    每 mm² 悬空要的树状支撑约 c·z^e mm³（z = 悬空面离床面的高度）。e = 0.47 来自 Bambu 切片的高度拟合；c = 2.0 让不限悬空那版
+    的估算（体素上）对上 Bambu 实切的 11.2 cm³（阈值 30°、树状支撑）。短桥下的支撑体素上看不到（斜面版实切 1.6 cm³，估算 ≈ 0）。
+    xi0 取得低（0.1）：灰度阶段均匀的低密度算"托得住"，不会凭空算出一大片支撑"""
+
+    def __init__(self, h, dz, NT, angle=30.0, P=40.0, xi0=0.1, eps=1e-8, c=2.0, e=0.47):
+        m, ker = am_stencil(h, dz, angle)
+        self.ker = None if ker is None else cp.asarray(ker[:, :, None].astype(np.float64))
+        nst = 5 if ker is None else int(ker.sum())
+        self.P, self.Q, self.eps, self.NT = P, P + np.log(nst) / np.log(xi0), eps, NT
+        z = np.arange(1, NT) * dz
+        self.w = cp.asarray(c * h * h * z ** e)[None, None, :]
+
+    def _ss(self, A):
+        return plus_sum(A) if self.ker is None else cnd.correlate(A, self.ker, mode="constant", cval=0.0)
+
+    def __call__(self, x):
+        """x：打印设计（体素密度，第三维是层），返回 (支撑体积 mm³, ∂/∂x)"""
+        NT, Pp, Q = self.NT, self.P, self.Q
+        lo, up = x[:, :, :NT - 1], x[:, :, 1:NT]
+        Ssum = cp.maximum(self._ss(lo ** Pp), 1e-280); S = Ssum ** (1.0 / Q)
+        d = up - S; r = cp.sqrt(d * d + self.eps)
+        u = 0.5 * (d + r - np.sqrt(self.eps))
+        V = float((self.w * u).sum())
+        du = 0.5 * (1 + d / r)
+        g = cp.zeros_like(x)
+        g[:, :, 1:NT] += self.w * du
+        g[:, :, :NT - 1] += Pp * lo ** (Pp - 1) * self._ss(-self.w * du * (1.0 / Q) * Ssum ** (1.0 / Q - 1.0))
+        return V, g
+
+
 class Pipeline:
     """x（设计变量）→ x̃（密度过滤）→ x̄（投影）→ ξ（AM 滤波后的打印密度）。全部 float64，放在显卡上。
     fixed：固定体素（实心或空）的掩码，fval 是它们的值；固定实心都是从床面起的整柱，天然有支撑。
@@ -1066,6 +1099,9 @@ def main():
     ap.add_argument("--dz", type=float, default=None, help="扁体素：层向尺寸 mm（= 打印层高，如 0.2）")
     ap.add_argument("--hxy", type=float, default=None, help="扁体素：面内尺寸 mm（如 0.4；45° 悬空按每 hxy/dz 层外扩一格）")
     ap.add_argument("--no_am", action="store_true", help="不加悬空限制（对照：悬空的地方打印时加支撑）")
+    ap.add_argument("--sup_mu", type=float, default=0.0, help="支撑惩罚：目标 += μ·(估算支撑体积 / sup_ref)；一般配 --no_am")
+    ap.add_argument("--sup_ref", type=float, default=10000.0, help="支撑惩罚的参考体积 mm³（10 cm³）")
+    ap.add_argument("--sup_angle", type=float, default=30.0, help="估算支撑时的阈值角（与床面夹角，Bambu 默认 30°）")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
@@ -1132,6 +1168,9 @@ def main():
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
     elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm", flush=True)
+    supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle) if a.sup_mu > 0 else None
+    if supest is not None:
+        print(f"支撑惩罚 μ={a.sup_mu:g}：每 {a.sup_ref/1000:g} cm³ 估算支撑 = 目标里 {a.sup_mu:g}（阈值 {a.sup_angle:g}°）", flush=True)
     d3 = cp.asarray(M.design3)
     use_mma = a.opt == "mma" or (a.opt is None and (a.tmin > 0 or a.buck > 0))
     bcases = [M.names.index(n) for n in ("前部误用150N", "后部误用150N")] if a.buck > 0 else []
@@ -1212,6 +1251,11 @@ def main():
             gE = gE - mut.astype(cp.float64) * (1 - M.gmin) * a.penal * xa_ ** (a.penal - 1) * d3
         robust = "xie" in cache
         dc = pipe.backward(None, cache, gE) if robust else pipe.backward(gE, cache)
+        sup = 0.0; ctot = c
+        if supest is not None:
+            sup, gS = supest(xi)                                      # 按打印设计 ξ 估算
+            dc = dc + (a.sup_mu / a.sup_ref) * pipe.backward(gS, cache)
+            ctot = c + a.sup_mu * sup / a.sup_ref
         dm = pipe.backward(d3 * vox, cache)                       # 用料按打印设计 ξ
         dm = cp.maximum(dm, 1e-3 * float(dm[d3].mean()))          # 支撑不住的体素 dm≈0：给个下限，让它们往下走
         xa = x[d3]; binfo = {}; fG = 0.0
@@ -1238,11 +1282,11 @@ def main():
         x[d3] = xn
         mratio = M.mass(xi) / target
         grey = float((4 * xi * (1 - xi))[d3].mean())
-        hist.append(dict(it=it, c=c, pen=pen / w.dot(comps_b), mass=mratio, change=change, beta=beta, grey=grey, cg=its, comp=comps.tolist(),
+        hist.append(dict(it=it, c=c, sup=sup, ctot=ctot, pen=pen / w.dot(comps_b), mass=mratio, change=change, beta=beta, grey=grey, cg=its, comp=comps.tolist(),
                          buck=binfo, ks=fG))
         bs = (" 屈曲 λ " + " / ".join(f"{v:.1f}" for k, v in binfo.items() if k != "假模态比例") + f" KS−1={fG:+.3f}"
               + (f" 假模态{binfo['假模态比例']}" if "假模态比例" in binfo else "")) if binfo else ""
-        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
+        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs}{f" 支撑≈{sup/1000:.2f}cm³ 总目标={ctot:.4f}" if supest is not None else ""} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
               f"CG={sum(its)} {time.time()-ti:.1f}s t={time.time()-t0:.0f}s", flush=True)
         if it % 20 == 0:
             fig_layers(M, cp.asnumpy(xi), f"{a.out}/layers_it{it}.png", f"it={it} β={beta:g} 加权柔度/二维={c:.3f}")
@@ -1252,7 +1296,7 @@ def main():
             beta *= 2; lb = 0
             if mma is not None:
                 mma.reset()
-        elif beta >= a.beta_max and lb >= 30 and feas and (change < 0.01 or abs(hist[-11]["c"] - c) / c < 1e-3):
+        elif beta >= a.beta_max and lb >= 30 and feas and (change < 0.01 or abs(hist[-11]["ctot"] - ctot) / ctot < 1e-3):
             break
         if a.save_every and it % a.save_every == 0:          # 中途存盘（同一个文件，跑完再覆盖）
             xs = cp.asnumpy(pipe.forward(x, beta)[0]).astype(np.float32)
