@@ -636,6 +636,18 @@ class Free3D:
             self.F[l] = self.F[l] * self.fms[self.case_bc[l]]
         self.lat = self.names.index("z向体力") if lateral else None
         self.q_lat = None
+        # 只差一个倍数的工况（误用 150 N 就是前压 / 后压按比例放大：载荷区、方向、约束都一样）：只解一次，位移按比例给
+        self.alias = {}
+        for l in range(len(self.F)):
+            fl_ = self.F[l].astype(cp.float64); nl = float(cp.linalg.norm(fl_))
+            if l == self.lat or nl == 0.0:
+                continue
+            for m in range(l):
+                if m == self.lat or m in self.alias or self.case_bc[m] != self.case_bc[l]:
+                    continue
+                fm_ = self.F[m].astype(cp.float64); k = float(fl_ @ fm_) / float(fm_ @ fm_)
+                if float(cp.linalg.norm(fl_ - k * fm_)) <= 1e-6 * nl:
+                    self.alias[l] = (m, k); break
 
     # ---------- z 向体力 ----------
     def set_mass(self, m):
@@ -799,9 +811,12 @@ class Free3D:
         同 buckling()：子空间用单精度多重网格生成，Rayleigh–Ritz 用双精度矩阵乘；负 μ 占优时加平移"""
         st = self.bk[l]; b = self.case_bc[l]; fm, mg = self.fms[b], self.mgs[b]
         KG = self.kgeo(sig, fm=fm); KG64 = self.kgeo(sig, double=True, fm=fm); A64 = self.kmul64(fm)
-        X = st["X"]; nb = len(X)
+        X = st["X"]; nb = len(X); mu0 = st.get("mu")
         for _ in range(nit):
-            G = cp.stack([mg.solve(-KG(x), None, tol=tol)[0] + F32(st["shift"]) * x for x in X])
+            # CG 初值 μ_j·x_j：x_j 是上一步的 Ritz 向量（μ_j 同序），收敛后 K⁻¹(−K_G)x_j ≈ μ_j·x_j，只剩一点要修正。
+            # 容差不变（相对 ‖b‖），所以结果和从零开始一样准，只是 CG 少走几步
+            G = cp.stack([mg.solve(-KG(x), None if mu0 is None else F32(mu0[j]) * x, tol=tol)[0] + F32(st["shift"]) * x
+                          for j, x in enumerate(X)])
             del X
             Am = np.zeros((nb, nb)); Bm = np.zeros((nb, nb))
             for j in range(nb):
@@ -816,9 +831,10 @@ class Free3D:
             Phi = cp.asarray(C.T, F32) @ G
             del G
             X = [p / cp.linalg.norm(p) for p in Phi]
+            mu0 = mu
             if mu.min() < 0:
                 st["shift"] = max(st["shift"], 1.05 * float(-mu.min()))
-        st["X"] = X
+        st["X"] = X; st["mu"] = mu0
         o = np.argsort(-mu)
         return mu[o], [Phi[i] for i in o]
 
@@ -936,6 +952,10 @@ class Free3D:
         A64s = [self.kmul64(fm) for fm in self.fms]
         comps = np.zeros(len(self.F)); its = []
         for l, Fv in enumerate(self.F):
+            if l in self.alias:                                 # 某个前面工况的倍数：U = k·U_m，柔度 = k²·c_m
+                m, k = self.alias[l]
+                self.U[l] = self.U[m] * F32(k); comps[l] = k * k * comps[m]; its.append(0)
+                continue
             mg, A64 = self.mgs[self.case_bc[l]], A64s[self.case_bc[l]]
             # 混合精度迭代修正：残差用双精度算，修正量用单精度多重网格 CG 解。整体面外弯曲（侧推、z 向体力）的位移场很光滑，
             # 单精度矩阵乘相消误差大，只用单精度时 CG 自报收敛、实际残差可达百分之几
