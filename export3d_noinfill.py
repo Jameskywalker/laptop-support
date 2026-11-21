@@ -239,6 +239,8 @@ def build_mesh(M, F, step=1, fine=None):
     mesh = mesh - extrude(P.joint_slot(), -1, P.T + 1)
     if fine is not None:
         mesh = mesh.simplify(0.02)          # 0.02 mm 以内合并近似共面的三角形，面数降到约 1/4
+    elif M.dz != M.h:
+        mesh = mesh.simplify(0.01)          # 扁体素：表面全是平台阶，合并共面三角形（不然 STL 有几百 MB）
     return mesh
 
 

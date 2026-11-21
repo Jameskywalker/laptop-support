@@ -1002,6 +1002,8 @@ def main():
     ap.add_argument("--nz", type=int, default=32, help="厚度方向体素数（立方体素，h = T/nz）；给了 --dz 时不用")
     ap.add_argument("--dz", type=float, default=None, help="扁体素：层向尺寸 mm（= 打印层高，如 0.2）")
     ap.add_argument("--hxy", type=float, default=None, help="扁体素：面内尺寸 mm（如 0.4；45° 悬空按每 hxy/dz 层外扩一格）")
+    ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
+    ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
     ap.add_argument("--skin", type=float, default=1.5, help="顶面、前挡后表面、脚垫固定实心条的宽度 mm")
     ap.add_argument("--kz", type=float, default=P.KZ)
@@ -1184,6 +1186,15 @@ def main():
             if mma is not None:
                 mma.reset()
         elif beta >= a.beta_max and lb >= 30 and feas and (change < 0.01 or abs(hist[-11]["c"] - c) / c < 1e-3):
+            break
+        if a.save_every and it % a.save_every == 0:          # 中途存盘（同一个文件，跑完再覆盖）
+            xs = cp.asnumpy(pipe.forward(x, beta)[0]).astype(np.float32)
+            np.savez_compressed(f"{a.out}/result.npz", x=cp.asnumpy(x).astype(np.float32), xi=xs, NX=NX, NY=NY, NZ=NZ, h=h, dz=M.dz, NT=M.NT,
+                                comps_b=comps_b, names=np.array(M.names), target=target, it=it, **{"col_" + k: v for k, v in M.cols.items()})
+            json.dump(dict(args=vars(a), names=M.names, hist=hist, base=dict(comp=comps_b.tolist()), target_mm3=target),
+                      open(f"{a.out}/history.json", "w"), ensure_ascii=False, indent=1)
+        if a.time_budget and time.time() - t0 > a.time_budget:
+            print(f"到时间上限 {a.time_budget:.0f}s，第 {it} 轮停下（β={beta:g}）", flush=True)
             break
     xi, _ = pipe.forward(x, beta)
     xi = cp.asnumpy(xi)
