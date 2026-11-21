@@ -1101,7 +1101,8 @@ def main():
     ap.add_argument("--no_am", action="store_true", help="不加悬空限制（对照：悬空的地方打印时加支撑）")
     ap.add_argument("--sup_mu", type=float, default=0.0, help="支撑惩罚：目标 += μ·(估算支撑体积 / sup_ref)；一般配 --no_am")
     ap.add_argument("--sup_ref", type=float, default=10000.0, help="支撑惩罚的参考体积 mm³（10 cm³）")
-    ap.add_argument("--sup_angle", type=float, default=30.0, help="估算支撑时的阈值角（与床面夹角，Bambu 默认 30°）")
+    ap.add_argument("--sup_angle", type=float, default=30.0, help="估算支撑时的阈值角（与床面夹角）。立方体素上建议 45：30° 的 3×3 邻域把斜对角的台阶也算托住，切片时仍要支撑")
+    ap.add_argument("--sup_c", type=float, default=2.0, help="每 mm² 悬空的支撑体积系数（× z^0.47 mm³），按 Bambu 实切标定")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
@@ -1168,7 +1169,7 @@ def main():
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
     elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm", flush=True)
-    supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle) if a.sup_mu > 0 else None
+    supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle, c=a.sup_c) if a.sup_mu > 0 else None
     if supest is not None:
         print(f"支撑惩罚 μ={a.sup_mu:g}：每 {a.sup_ref/1000:g} cm³ 估算支撑 = 目标里 {a.sup_mu:g}（阈值 {a.sup_angle:g}°）", flush=True)
     d3 = cp.asarray(M.design3)
