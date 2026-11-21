@@ -394,7 +394,8 @@ def main():
     right = left.copy(); right.apply_transform(np.diag([-1, 1, 1, 1])); right.apply_translation((float(left.bounds[1][0]), 0, 0))
     right.invert() if right.volume < 0 else None
     right.export(f"{md}/support_noinfill_right.stl")
-    oh = overhang_check(man)
+    # 扁体素：45° 规则是"每 m 层外扩一格"，单层最多伸出一格（hxy），检查时容差相应放宽到一格
+    oh = overhang_check(man, tol=0.05 + max(0.0, M.h - M.dz * np.tan(np.deg2rad(45.0))))
     print("悬空检查：", oh, flush=True)
     if gable_wall is not None:      # 尖拱对照也导出网格（预览用）
         Fg = np.where(M.design3, designs[[k for k in keys if keys[k] == "gable"][0]][2], M.E_fix > 0).astype(float)
