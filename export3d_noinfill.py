@@ -7,11 +7,12 @@
      墙厚调到与二维方案同样用料 —— 手工"尖拱封顶"的对照；
    - 无填充三维优化。
    三者的横梁接口区都按墙 + 表皮 + 15% 填充。
-3. 网格：二值体素先平滑（--smooth σ 个体素），再插值到打印层高（0.2 mm）的立方网格，逐层做 45° 悬空限制（灰度 AM），
+3. 网格：二值体素先平滑（--smooth σ 个体素），再插值到打印层高（0.2 mm）的立方网格，逐层做 45° 悬空处理
+   （默认先在伸出的地方下面补斜坡、再削掉补不到的细边，见 smooth_fine），用料调回与体素模型相同；
    取等值面（z 两面镜像延拓后在 z=0、z=T 处切平），并上精确的固定区几何、挖掉精确的方槽 → STL。
    直接用 0.625 mm 体素做 marching cubes 的话，缓坡上是 0.625 mm 高的台阶（--smooth 0 仍可这样导出）。
    复核、薄壁统计用平滑后的形状（细网格按体素取多数）。
-   悬空检查：按 0.2 mm 层高切片，每层超出下一层外扩 0.2 mm（45°）范围的面积。
+   悬空检查：按 0.2 mm 层高切片，每层超出下一层外扩 0.2 mm（45°）+ 0.05 mm 容差范围的面积。
 用法: STAND_VARIANT=desk40 python export3d_noinfill.py [--dir out/desk40/noinfill]
 """
 import argparse, json, os, time
@@ -101,44 +102,104 @@ def extrude(geom, z0, z1):
 
 
 # ---------------- 按打印层高平滑重建 ----------------
-def smooth_fine(M, F, sigma, lh=P.LAYER_H, pad=4):
+def _sdf_layer(f, c, lh, band=3):
+    """一层的平面有向距离（mm，里面为正）：f 在 c 处的等值线用 marching squares 取（与最终网格在这一层的切片一致），
+    离等值线 band 格以内的点算到等值线段的精确距离，更远的用像素距离变换"""
+    b = f > c
+    phi = np.where(b, distance_transform_edt(b) - 0.5, 0.5 - distance_transform_edt(~b))
+    segs = [np.stack([cc[:-1], cc[1:]], 1) for cc in measure.find_contours(f, c) if len(cc) >= 2]
+    if segs:
+        segs = np.concatenate(segs)
+        tree = shapely.STRtree(shapely.linestrings(segs))
+        near = np.nonzero(np.abs(phi) <= band)
+        _, d = tree.query_nearest(shapely.points(near[0], near[1]), return_distance=True, all_matches=False)
+        phi[near] = np.where(b[near], d, -d)
+    return (phi * lh).astype(np.float32)
+
+
+def smooth_fine(M, F, sigma, lh=P.LAYER_H, pad=4, am="fill+trim", angle=45.0, match_volume=True):
     """体素场 F（0..1，固定区为 1）→ 打印层高 lh 的立方细网格场：
-    1. 高斯平滑（σ 个体素；网格外按空，z 两面镜像），三次样条插值到细网格（采样点在每层正中，就是切片平面）；
-    2. 阈值 t 取成与体素模型同体积；
-    3. 灰度 AM：从床面往上，每层不超过下一层的十字膨胀（每层最多外扩一格 = lh → 45°）；
+    1. 高斯平滑（σ 个体素；网格外按空，z 两面镜像），三次样条插值到细网格（采样点在每层正中，就是切片平面）。
+       σ 可以是一个数，或 (σ_xy, σ_z) 平面内和厚度方向分开取；
+    2. 阈值取成与体素模型同体积；
+    3. 逐层悬空限制，在每层的平面距离场上做（_sdf_layer，轮廓附近是到等值线的精确距离；每层改完重新算距离再传下去，
+       误差不会一层层累积）。δ = lh·tan(angle)，各方向一样（圆形外扩）：
+       am="fill+trim"（默认）：先从顶层往下补——每层要包住上一层往里缩 δ 的部分，伸出超过 angle 的地方在下面补斜坡，
+         只加料不删料；再从床面往上削——每层只能落在下一层外扩 δ 的范围内，保证每层都有支撑。补过之后削掉的只剩
+         比 2δ 还窄、补不到的细边，不会连锁削断杆件；
+       am="levelset"：只削；平滑后贴着 45° 的斜面局部稍陡就会被削，往上连锁，细杆可能断；
+       am="cross"：只削，而且每层只能沿 x 或 y 外扩一格（斜着走的杆实际只放行到约 35°），连锁削断最严重，只留作对照；
     4. 只留最大的连通块。
-    σ = 1 时比一个体素还薄的板会消失（腐蚀设计里它们本来就不出力）。返回 dict(G, t, lh, info)，G 的 t 等值面就是零件表面"""
+    match_volume：补的料会让体积变大；先算一次补了多少，再把阈值调到少这么多重算一次，最后体积与体素模型相同。
+    返回 dict(G, t, lh, info)，G 的 t 等值面就是零件表面"""
     NX, NY, NZ = F.shape; h = M.h
+    sxy, sz = (sigma, sigma) if np.isscalar(sigma) else sigma
     G = np.pad(np.asarray(F, np.float32), ((pad, pad), (pad, pad), (0, 0)))
     G = np.concatenate([G[:, :, pad - 1::-1], G, G[:, :, :-pad - 1:-1]], 2)
-    if sigma > 0:
-        G = gaussian_filter(G, sigma, mode="nearest")
+    if sxy > 0 or sz > 0:
+        G = gaussian_filter(G, (sxy, sxy, sz), mode="nearest")
     C = spline_filter(G, order=3, mode="nearest")
     nxf, nyf, nzf = (int(round(n * h / lh)) for n in (NX, NY, NZ))
     X, Y = np.meshgrid(((np.arange(nxf) + 0.5) * lh) / h - 0.5 + pad, ((np.arange(nyf) + 0.5) * lh) / h - 0.5 + pad, indexing="ij")
-    Gf = np.empty((nxf, nyf, nzf), np.float32)
+    G0 = np.empty((nxf, nyf, nzf), np.float32)
     for k in range(nzf):
-        Gf[:, :, k] = map_coordinates(C, [X, Y, np.full_like(X, ((k + 0.5) * lh) / h - 0.5 + pad)], order=3, prefilter=False, mode="nearest")
+        G0[:, :, k] = map_coordinates(C, [X, Y, np.full_like(X, ((k + 0.5) * lh) / h - 0.5 + pad)], order=3, prefilter=False, mode="nearest")
     del C, G, X, Y
     vc = float(np.sum(F)) * h ** 3
-    lo, hi = 0.3, 0.7
-    for _ in range(30):
-        t = 0.5 * (lo + hi)
-        if (Gf > t).sum() * lh ** 3 > vc: lo = t
-        else: hi = t
-    n0 = int((Gf > t).sum())
-    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
-    for k in range(1, nzf):
-        Gf[:, :, k] = np.minimum(Gf[:, :, k], grey_dilation(Gf[:, :, k - 1], footprint=cross))
-    L = Gf > t
-    n1 = int(L.sum())
-    lab, n = label(L); sz = np.bincount(lab.ravel()); sz[0] = 0
-    drop = L & (lab != int(sz.argmax())); del lab
-    Gf[drop] = np.minimum(Gf[drop], t - 0.05)
-    n2 = n1 - int(drop.sum())
-    info = dict(sigma_vox=sigma, layer_mm=lh, threshold=round(float(t), 4), 平滑前体积_cm3=round(vc / 1000, 3), 平滑后体积_cm3=round(n2 * lh ** 3 / 1000, 3),
-                AM去掉_mm3=round((n0 - n1) * lh ** 3, 1), 碎块去掉_mm3=round((n1 - n2) * lh ** 3, 1), 碎块数=int(n - 1))
-    return dict(G=Gf, t=float(t), lh=lh, info=info)
+    dl = lh * np.tan(np.deg2rad(angle))
+
+    def threshold(target):
+        lo, hi = 0.2, 0.8
+        for _ in range(30):
+            t = 0.5 * (lo + hi)
+            if (G0 > t).sum() * lh ** 3 > target: lo = t
+            else: hi = t
+        return t
+
+    def run(target):
+        t = threshold(target)
+        Gf = G0.copy()
+        n0 = int((Gf > t).sum())
+        if am in ("fill", "levelset", "fill+trim"):
+            if am != "levelset":   # 先去掉平滑后分离出来的小碎块（不然下面会给它们补出一根柱子）
+                lab, n = label(Gf > t); cnt = np.bincount(lab.ravel()); cnt[0] = 0
+                drop = (lab > 0) & (lab != int(cnt.argmax())); del lab
+                Gf[drop] = np.minimum(Gf[drop], t - 0.05)
+            lev = t
+            for ps in {"fill": ["fill"], "levelset": ["trim"], "fill+trim": ["fill", "trim"]}[am]:
+                prev = None
+                for k in (range(nzf - 1, -1, -1) if ps == "fill" else range(nzf)):
+                    phi = _sdf_layer(Gf[:, :, k], lev, lh)
+                    if prev is not None:
+                        phi = np.maximum(phi, prev - dl) if ps == "fill" else np.minimum(phi, prev + dl)
+                        phi = _sdf_layer(phi, 0.0, lh)          # 改过的这一层重新算精确距离，再传给下一层
+                    Gf[:, :, k] = phi; prev = phi
+                lev = 0.0
+            t1 = 0.0
+        elif am == "cross":
+            cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+            for k in range(1, nzf):
+                Gf[:, :, k] = np.minimum(Gf[:, :, k], grey_dilation(Gf[:, :, k - 1], footprint=cross))
+            t1 = t
+        else:
+            t1 = t
+        L = Gf > t1
+        n1 = int(L.sum())
+        lab, n = label(L); cnt = np.bincount(lab.ravel()); cnt[0] = 0
+        drop = L & (lab != int(cnt.argmax())); del lab
+        Gf[drop] = np.minimum(Gf[drop], t1 - 0.05)
+        n2 = n1 - int(drop.sum())
+        return Gf, t1, dict(threshold=round(float(t), 4), 悬空处理增减_mm3=round((n1 - n0) * lh ** 3, 1),
+                            碎块去掉_mm3=round((n1 - n2) * lh ** 3, 1), 碎块数=int(n - 1), 体积_cm3=round(n2 * lh ** 3 / 1000, 3))
+
+    Gf, t1, r1 = run(vc)
+    info = dict(sigma_vox=[sxy, sz], am=am, angle=angle, layer_mm=lh, 体素模型体积_cm3=round(vc / 1000, 3), 第一次=r1)
+    if match_volume and am in ("fill", "fill+trim") and abs(r1["体积_cm3"] * 1000 - vc) > 1.0:
+        del Gf
+        Gf, t1, r2 = run(vc - (r1["体积_cm3"] * 1000 - vc))
+        info["第二次（同体积）"] = r2
+    info["平滑后体积_cm3"] = list(info.values())[-1]["体积_cm3"]
+    return dict(G=Gf, t=float(t1), lh=lh, info=info)
 
 
 def coarse_from_fine(M, fine):
@@ -184,10 +245,10 @@ def to_trimesh(man):
     return trimesh.Trimesh(np.asarray(mm.vert_properties)[:, :3], np.asarray(mm.tri_verts), process=False)
 
 
-def overhang_check(man, lh=P.LAYER_H, ang=45.0, bridge=2.0):
-    """按层高切片：每层超出下一层外扩 lh/tan(ang) 的部分算悬空。窄于 bridge（mm）的条带两边都有支撑，
-    是空腔收顶时的短桥，单独统计；宽的才算真正的悬空。返回面积、最大单块面积、所在高度"""
-    off = lh / np.tan(np.deg2rad(ang))
+def overhang_check(man, lh=P.LAYER_H, ang=45.0, bridge=2.0, tol=0.05):
+    """按层高切片：每层超出下一层外扩 lh·tan(ang) + tol 的部分算悬空（tol 是几何误差的容差，远小于 0.42 mm 线宽）。
+    窄于 bridge（mm）的条带两边都有支撑，是空腔收顶时的短桥，单独统计；宽的才算真正的悬空。返回面积、最大单块面积、所在高度"""
+    off = lh * np.tan(np.deg2rad(ang)) + tol
     zs = np.arange(lh / 2, P.T, lh)
     prev = None; tot = 0.0; tot_b = 0.0; worst = (0.0, 0.0); per = []
     for z in zs:
@@ -198,7 +259,7 @@ def overhang_check(man, lh=P.LAYER_H, ang=45.0, bridge=2.0):
         for r in rings:
             g = g.symmetric_difference(r)
         if prev is not None:
-            un = [p for p in polys(g.difference(prev.buffer(off + 1e-3, join_style="round", quad_segs=4))) if p.area > 0.05]
+            un = [p for p in polys(g.difference(prev.buffer(off, join_style="round", quad_segs=4))) if p.area > 0.05]
             wide = [p for p in un if not p.buffer(-bridge / 2).is_empty]
             a = [p.area for p in wide]
             tot += sum(a); per.append(sum(a)); tot_b += sum(p.area for p in un) - sum(a)
@@ -216,8 +277,12 @@ def main():
     ap.add_argument("--no-buckling", action="store_true")
     ap.add_argument("--ref", default=None, help="另一次三维结果（同 nz 的 result.npz 所在目录）一起复核，例如无约束的那次")
     ap.add_argument("--tmin", type=float, default=None, help="薄壁统计用的厚度 mm（默认取优化时的 --tmin，没有则 1.9）")
-    ap.add_argument("--smooth", type=float, default=1.0, help="STL 按打印层高平滑重建的高斯半径（体素）；0 = 直接用体素做 marching cubes")
+    ap.add_argument("--smooth", default="1.0", help="STL 按打印层高平滑重建的高斯半径（体素）；可写 σ_xy,σ_z 分开取；0 = 直接用体素做 marching cubes")
+    ap.add_argument("--am", default="fill+trim", choices=["fill+trim", "fill", "levelset", "cross"], help="平滑后的逐层悬空处理（见 smooth_fine）")
     a = ap.parse_args()
+    sm = [float(v) for v in str(a.smooth).split(",")]
+    a.smooth = sm[0] if len(sm) == 1 else tuple(sm)
+    smooth_on = max(sm) > 0
     t0 = time.time()
     r = np.load(f"{a.dir}/result.npz")
     hist = json.load(open(f"{a.dir}/history.json"))
@@ -230,9 +295,9 @@ def main():
     B, info = binarize(M, xi)
     print("二值化：", info, flush=True)
     fine = None
-    if a.smooth > 0:
+    if smooth_on:
         tf = time.time()
-        fine = smooth_fine(M, np.where(M.design3, B, M.E_fix > 0), a.smooth)
+        fine = smooth_fine(M, np.where(M.design3, B, M.E_fix > 0), a.smooth, am=a.am)
         Bs = coarse_from_fine(M, fine) & M.design3
         fine["info"]["体素变化"] = dict(增加=int((Bs & ~B).sum()), 去掉=int((B & ~Bs).sum()), 原有=int(B.sum()))
         print(f"按 {P.LAYER_H} mm 层平滑重建（复核也用平滑后的形状）：", fine["info"], f"{time.time()-tf:.0f}s", flush=True)
@@ -252,8 +317,8 @@ def main():
         rr = np.load(f"{a.ref}/result.npz")
         if rr["xi"].shape == xi.shape:
             Bo, info_o = binarize(M, rr["xi"].astype(float))
-            if a.smooth > 0:            # 对照也按同样方法平滑，网格另存一份给预览
-                fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth)
+            if smooth_on:               # 对照也按同样方法平滑，网格另存一份给预览
+                fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth, am=a.am)
                 Bo = coarse_from_fine(M, fo) & M.design3
                 to_trimesh(build_mesh(M, None, fine=fo)).export(f"{md}/support_ref_left.stl")
                 del fo

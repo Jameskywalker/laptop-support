@@ -74,7 +74,8 @@ def main():
     gw = ver.get("gable_wall_mm")
     notes = [
         "打印：侧面贴床，不加支撑。切片时内部按实心打印（墙圈数加够，或稀疏填充设 100%）；三个横梁接口区加修改器，仍用 4 圈墙 + 15–25% 填充。",
-        "封闭空腔留在零件里面，FDM 不用清理。" + ("空腔顶部按 45° 逐层收成尖顶，不用搭桥。" if ver["overhang"]["短桥面积_mm2"] < 1 else "空腔顶部最后一层是跨度不到 2 mm 的短桥。"),
+        ("没有封闭空腔（体素模型里两个十几 mm³ 的小空腔，顶是平的，在补 45° 斜坡时被补实了）。" if not ver["mesh"]["cavities_mm3"] else
+         "封闭空腔留在零件里面，FDM 不用清理。" + ("空腔顶部按 45° 逐层收成尖顶，不用搭桥。" if ver["overhang"]["短桥面积_mm2"] < 1 else "空腔顶部最后一层是跨度不到 2 mm 的短桥。")),
         "左右两片是镜像件，都是 z = 0 的那面贴床；装配时这一面朝外，卡钩扣在这一面。",
         ("尖拱空腔对照：同一个二维轮廓，内部挖成 45° 尖顶空腔，墙厚 " + (f"{gw:.2f}" if gw else "—") + " mm 时与二维方案同样用料。") if cmp == "gable" else
         ("旧三维：上一版无填充三维优化（只有用料约束），同一个三维模型、同样的复核方法重新算的。"),
@@ -82,8 +83,10 @@ def main():
     ]
     sm = ver.get("smooth")
     if sm:
-        notes.insert(1, f"表面：优化网格是 {P.T / int(ha['nz']):.3f} mm 的立方体素，直接导出的话缓坡上是这么高的台阶。STL 先把体素平滑（σ = {sm['sigma_vox']:g} 个体素），"
-                        f"再按 {sm['layer_mm']:g} mm 打印层重建，逐层限制 45° 悬空；复核数据也是按平滑后的形状算的。")
+        sv = sm["sigma_vox"]; sv = sv if isinstance(sv, list) else [sv, sv]
+        sig = f"{sv[0]:g}" if sv[0] == sv[1] else f"平面内 {sv[0]:g}、厚度方向 {sv[1]:g}"
+        notes.insert(1, f"表面：优化网格是 {P.T / int(ha['nz']):.3f} mm 的立方体素，直接导出的话缓坡上是这么高的台阶。STL 先把体素平滑（σ = {sig} 个体素），"
+                        f"再按 {sm['layer_mm']:g} mm 打印层重建：伸出超过 45° 的地方在下面补斜坡，再削掉补不到的细边，用料调回原值；复核数据也是按平滑后的形状算的。")
     B = np.load(f"{a.dir}/binary.npz")["B"]
     t = B.sum(2); thin = float((t[t > 0] <= 1).mean())          # 只有一层体素厚的柱子占比
     th = res["free"].get("thin"); tho = res.get(cmp, {}).get("thin")
