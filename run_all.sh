@@ -18,5 +18,8 @@ for v in ${VARIANTS[@]}; do
   $PY panel.py "${GPU_FLAG[@]}"      # 有面板的方案：面板拓扑优化 + 轮廓 + 复核；没有则跳过
   $PY build3d.py
   $PY render.py
+  if [ "${PADS:-0}" = 1 ]; then      # 可选：TPU 卡套（顶面垫、前挡垫、前后脚套），检查和支撑的贴合
+    $PY pads.py --support "out/$v/model/support_left.stl"
+  fi
 done
 $PY make_web.py
