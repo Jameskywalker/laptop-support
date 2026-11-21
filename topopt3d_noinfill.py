@@ -287,6 +287,19 @@ def plus_sum(A):
     return out
 
 
+def am_stencil(h, dz, angle=45.0):
+    """悬空角 angle（允许的最缓斜面与床面的夹角，度；45 = 常规 45° 规则）→ (m, 面内支撑核)。
+    每层允许外扩 g = dz/tan(angle) mm，即 g/h 格：
+    g/h ≤ 1（陡）：十字核，每层相对下面 1..m 层都最多外扩一格，m = round(h·tan(angle)/dz)，平均每 m 层外扩一格；
+    g/h > 1（缓）：m = 1，核取半径 g/h 格的圆盘（下一层这个圆盘里有材料就算托住）。核为 None 表示十字邻域"""
+    gc = dz / np.tan(np.deg2rad(angle)) / h
+    if gc <= 1.0 + 1e-9:
+        return max(1, int(round(1.0 / gc))), None
+    R = int(np.floor(gc + 1e-9)); o = np.arange(-R, R + 1)
+    di, dj = np.meshgrid(o, o, indexing="ij")
+    return 1, (di ** 2 + dj ** 2 <= gc ** 2 + 1e-9)
+
+
 class Pipeline:
     """x（设计变量）→ x̃（密度过滤）→ x̄（投影）→ ξ（AM 滤波后的打印密度）。全部 float64，放在显卡上。
     fixed：固定体素（实心或空）的掩码，fval 是它们的值；固定实心都是从床面起的整柱，天然有支撑。
@@ -294,7 +307,7 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -308,14 +321,21 @@ class Pipeline:
         self.eta_e = eta_e
         self.fixed = cp.asarray(fixed); self.fval = cp.asarray(fval, cp.float64)
         self.free = ~self.fixed
-        self.P = p_am; self.Q = p_am + np.log(5) / np.log(xi0); self.eps = eps
-        # 45° 悬空：每层最多外扩 dz（mm）。体素宽 h = m·dz 时，每层相对下面 1..m 层都最多外扩一格（十字邻域）：
-        # 平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法
-        self.m_am = max(1, int(round(h / dz)))
+        # 悬空：每层最多外扩 dz/tan(angle)（mm），见 am_stencil。45°、体素宽 h = m·dz 时，每层相对下面 1..m 层都最多外扩一格
+        # （十字邻域）：平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法
+        self.am_angle = am_angle
+        self.m_am, ker = am_stencil(h, dz, am_angle)
+        self.am_ker = None if ker is None else cp.asarray(ker.astype(np.float64))
+        nst = 5 if ker is None else int(ker.sum())
+        self.P = p_am; self.Q = p_am + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
 
     def filt(self, x):
         return cnd.correlate(x, self.K, mode="constant", cval=0.0) / self.Ks
+
+    def _ss(self, A):
+        """支撑邻域求和（十字或圆盘，都对称，所以也是自己的转置）"""
+        return plus_sum(A) if self.am_ker is None else cnd.correlate(A, self.am_ker, mode="constant", cval=0.0)
 
     def forward(self, x, beta):
         xf = cp.where(self.fixed, self.fval, x)
@@ -351,7 +371,7 @@ class Pipeline:
             for j in range(1, m + 1):
                 if k - j < 0:
                     continue
-                Sk = cp.maximum(plus_sum(xi[:, :, k - j] ** Pp), 1e-280); S[j - 1][:, :, k] = Sk
+                Sk = cp.maximum(self._ss(xi[:, :, k - j] ** Pp), 1e-280); S[j - 1][:, :, k] = Sk
                 Sg = Sk ** (1.0 / Q)
                 if Sig is None:
                     Sig = Sg; wj = [(j, cp.ones_like(Sg))]
@@ -384,7 +404,7 @@ class Pipeline:
                 if k - j < 0:
                     continue
                 A = gS * c["W"][j - 1][:, :, k] * (1.0 / Q) * c["S"][j - 1][:, :, k] ** (1.0 / Q - 1.0)
-                g[:, :, k - j] += Pp * c["xi"][:, :, k - j] ** (Pp - 1) * plus_sum(A)
+                g[:, :, k - j] += Pp * c["xi"][:, :, k - j] ** (Pp - 1) * self._ss(A)
         gxb[:, :, 0] = g[:, :, 0] * c["dsx"][:, :, 0]
         return gxb
 
@@ -433,13 +453,19 @@ def rmin_for_thickness(tmin, h, eta_e=0.75, dz=None):
     return r, nt_x * h, n_min(r, dz, 2) * dz
 
 
-def am_binary(B, m=1):
-    """二值模型的悬空检查/修整：从床面往上，没有支撑的体素去掉（每层相对下面 1..m 层都最多外扩一格，见 Pipeline.m_am）"""
+def am_binary(B, m=1, ker=None):
+    """二值模型的悬空检查/修整：从床面往上，没有支撑的体素去掉（每层相对下面 1..m 层的支撑邻域里要有材料，见 am_stencil；
+    ker 为 None 时是十字邻域）"""
     B = B.copy()
+    if ker is not None:
+        from scipy.ndimage import correlate
+        kk = ker.astype(np.int32)
     for k in range(1, B.shape[2]):
         for j in range(1, m + 1):
             if k - j >= 0:
-                B[:, :, k] &= plus_sum(B[:, :, k - j].astype(np.uint8)) > 0
+                lo = B[:, :, k - j]
+                s = plus_sum(lo.astype(np.uint8)) if ker is None else correlate(lo.astype(np.int32), kk, mode="constant", cval=0)
+                B[:, :, k] &= s > 0
     return B
 
 
@@ -1020,6 +1046,7 @@ def main():
     ap.add_argument("--dz", type=float, default=None, help="扁体素：层向尺寸 mm（= 打印层高，如 0.2）")
     ap.add_argument("--hxy", type=float, default=None, help="扁体素：面内尺寸 mm（如 0.4；45° 悬空按每 hxy/dz 层外扩一格）")
     ap.add_argument("--no_am", action="store_true", help="不加悬空限制（对照：悬空的地方打印时加支撑）")
+    ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
@@ -1080,9 +1107,11 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am)
-    if pipe.m_am > 1:
-        print(f"悬空：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 平均 45°，单层最多伸出 {h:g} mm", flush=True)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle)
+    if not a.no_am and pipe.am_ker is not None:
+        print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
+    elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):
+        print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm", flush=True)
     d3 = cp.asarray(M.design3)
     use_mma = a.opt == "mma" or (a.opt is None and (a.tmin > 0 or a.buck > 0))
     bcases = [M.names.index(n) for n in ("前部误用150N", "后部误用150N")] if a.buck > 0 else []
