@@ -192,6 +192,39 @@ STAND_VARIANT=desk40 .venv/bin/python export3d_noinfill.py --dir out/desk40/noin
 STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/model_noinfill_buck                                  # 预览网页（新三维 / 旧三维 / 二维）
 ```
 
+### 第三版：横梁孔贴斜面（分支 `joints-on-slope`）
+
+- **改动**：前、顶两个接口的中心离斜面从 18 mm 改成 13 mm，接口区顶边贴齐斜面。原来接口区和斜面之间隔着 5 mm 顶面实体带，无填充三维里这 5 mm 只固定了 1.5 mm 表皮，要靠优化长材料去连。前接口顺势往前挪了约 6 mm。面板离笔记本底面从 10 mm 变成 5 mm（装上 TPU 顶面垫后是 6.5 mm）。
+- **二维方案按新孔位重算**：单片 72 g、面板 83 g、合计 281 g。加权柔度是旧孔位二维方案的 1.04 倍：自重、后推软了 20–25%，前压、横梁·前硬了约 16%；150 N 前部屈曲系数从 40 降到 27。
+- **算力**：粗、细网格和导出复核都在租的 RTX 5090 上跑（Vast.ai，CPU 7800X3D）：粗网格 11.3 min、细网格 11.8 min、导出复核 2.6 min，本地分别约 65、64、13 min。连装环境一共约 $0.26。环境见 `remote/setup.sh`。
+- **平滑**：这次的设计里有几根倒三角截面、只靠一条一个体素宽的刀刃立在床上的杆。平滑把刀刃抹掉后，"往下补"缩到比 0.4 mm 还窄就补不到床面，"往上削"再把整根杆连锁削掉，自重工况柔度变成 1.83 倍。修法（细处沿中线往下补约 0.6 mm 宽的竖筋）在分支 `smooth-skeleton-wip` 上，还没定，所以这一版按体素直接导出（`--smooth 0`）。
+
+结果（desk40，单片；比值各按自己的二维方案算；新孔位三维按体素复核，旧孔位三维是平滑后的第二版）：
+
+| | 二维方案（新孔位） | 旧孔位三维 | 新孔位三维 |
+|---|---|---|---|
+| 单片用料（PETG） | 74 g | 75 g | 73 g |
+| 加权柔度 | 1 | 0.82 | **0.76** |
+| 自重 / 前压 / 后压 | 1 / 1 / 1 | 0.85 / 0.46 / 0.92 | 0.68 / 0.31 / 0.84 |
+| 后推 / 前推 / 前挡冲击 | 1 / 1 / 1 | 1.01 / 0.72 / 0.69 | 0.99 / 0.68 / 0.65 |
+| 横梁·前 / 顶 / 后 | 1 / 1 / 1 | 0.81 / 1.17 / 1.13 | 0.84 / 1.18 / 1.11 |
+| 150 N 误用屈曲系数：前 / 后 | 27 / 33 | 51 / 20.4 | 92 / 20.4 |
+| 150 N 误用应力 99.9%：前 / 后（MPa） | 6.4 / 4.8 | 3.3 / 5.2 | 2.8 / 4.7 |
+| 后部 150 N 误用时最大侧向位移 | 18 µm | 68 µm | 58 µm |
+| 比 1.9 mm 薄的部分（体积） | — | 2.1% | 3.0% |
+
+按绝对柔度比：新孔位三维比旧孔位三维硬 6%（加权 0.94；前压 0.56，后推 1.23），比旧孔位的二维方案硬 20%。网格是 0.625 mm 体素台阶；封闭空腔 2 个（387、3 mm³），收顶短桥 30.6 mm²，没有超过 45° 的悬空。
+
+```bash
+# 在租的机器上（remote/setup.sh 装好环境后）
+STAND_VARIANT=desk40 python topopt3d_noinfill.py --nz 16 --tmin 1.9 --buck 20 --maxit 240 --out out/desk40/noinfill_slope_nz16
+STAND_VARIANT=desk40 python topopt3d_noinfill.py --nz 24 --tmin 1.9 --buck 20 --maxit 110 --beta0 4 --beta_every 30 \
+    --init out/desk40/noinfill_slope_nz16/result.npz --out out/desk40/noinfill_slope
+STAND_VARIANT=desk40 python export3d_noinfill.py --dir out/desk40/noinfill_slope --no-gable --smooth 0     # → out/desk40/model_noinfill_slope/
+# 本地
+STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/model_noinfill_slope --cmp-dir out/desk40/model_noinfill_buck
+```
+
 ## 输出文件（`out/<方案>/`）
 
 | 文件 | 说明 |

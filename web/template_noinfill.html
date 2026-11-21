@@ -91,6 +91,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
       <div class="controls">
         <div><span class="lbl">视图</span><span class="seg" id="seg-view"><button id="v-print" data-v="print" aria-pressed="true">打印姿态</button><button id="v-asm" data-v="asm" aria-pressed="false">装配</button></span></div>
         <div><span class="lbl">模型</span><span class="seg" id="seg-model"></span></div>
+        <div id="padsbox" hidden><span class="lbl">TPU 垫</span><span class="seg" id="seg-pads"><button data-p="on" aria-pressed="true">显示</button><button data-p="off" aria-pressed="false">隐藏</button></span></div>
         <div><span class="lbl">剖切</span><span class="seg" id="seg-cut"><button id="c-z" data-c="z" aria-pressed="true">逐层</button><button id="c-x" data-c="x" aria-pressed="false">横切</button></span></div>
         <div class="layer" id="layerbox">
           <button class="play" id="play" type="button">播放</button>
@@ -147,6 +148,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²'],
     ['薄壁', D.thinFact || ('最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%')],
     ['网格', '优化用 ' + fmt(D.h, 3) + ' mm 立方体素（厚度方向 ' + D.nz + ' 格）' + (D.layer ? '；STL 平滑后按 ' + fmt(D.layer, 1) + ' mm 打印层重建' : '')],
+    ...(D.padsInfo ? [['TPU 垫', D.padsInfo]] : []),
   ];
   $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const xmax = Math.max(1.25, ...D.cases.map(c => Math.max(free.rel[c], gable.rel[c])));
@@ -201,6 +203,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const NL = D.layer ? Math.round(D.T / D.layer) : D.nz;     // 逐层剖切：按打印层（STL 按打印层重建时），否则按体素层
   const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.65, metalness: 0 });
   const matLink = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.7, metalness: 0, color: 0xb9c2cc });
+  const matPad = new THREE.MeshStandardMaterial({ flatShading: true, side: THREE.DoubleSide, roughness: 0.95, metalness: 0, color: 0x2f3338 });   // TPU 垫：深灰
   const M4 = (a) => new THREE.Matrix4().set(...a);
 
   // 打印姿态：H3C 热床 330 × 320 mm
@@ -215,6 +218,13 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   print.add(new THREE.LineSegments(gridGeo, gridMat));
   const pm = {};
   for (const m of D.models) { pm[m.key] = new THREE.Mesh(G[m.key], matSup); pm[m.key].position.set(-D.center[0], -D.center[1], 0); print.add(pm[m.key]); }
+  // TPU 垫（可选，pads.py）：网格是支撑坐标，打印姿态里卡在支撑上显示，装配里两片支撑都装上
+  const padObjs = [];
+  if (D.pads) {
+    const Gpad = geom(D.pads);
+    const o = new THREE.Mesh(Gpad, matPad); o.position.set(-D.center[0], -D.center[1], 0); print.add(o); padObjs.push(o);
+    for (const mat of D.supportMats) { const a = new THREE.Mesh(Gpad, matPad); a.matrixAutoUpdate = false; a.matrix.copy(M4(mat)); padObjs.push(a); }
+  }
 
   // 装配：两片支撑（右侧为镜像）+ 面板 + 后横梁
   const asm = new THREE.Group(); scene.add(asm);
@@ -222,8 +232,9 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   for (const m of D.models) { am[m.key] = []; for (const mat of D.supportMats) {
     const o = new THREE.Mesh(G[m.key], matSup); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); am[m.key].push(o); } }
   for (const [g, mat] of [[Gb, D.beamMat], [Gp, D.panelMat]]) { const o = new THREE.Mesh(g, matLink); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); }
+  padObjs.slice(1).forEach(o => asm.add(o));
 
-  const S = { view: 'print', model: D.models[0].key, cut: 'z', pos: 1 };
+  const S = { view: 'print', model: D.models[0].key, cut: 'z', pos: 1, pads: 'on' };
   function render() { renderer.render(scene, camera); }
   function frame(obj) {
     const box = new THREE.Box3().setFromObject(obj), c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
@@ -237,6 +248,8 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     for (const k in am) am[k].forEach(o => o.visible = k === S.model);
     matSup.clippingPlanes = S.view === 'print' ? [clip] : [];
     matSup.needsUpdate = true;
+    matPad.clippingPlanes = matSup.clippingPlanes; matPad.needsUpdate = true;
+    padObjs.forEach(o => o.visible = S.pads === 'on');
     $('layerbox').classList.toggle('off', S.view !== 'print');
     $('seg-cut').parentElement.classList.toggle('off', S.view !== 'print');
     if (S.cut === 'z') {
@@ -254,14 +267,15 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   function seg(id, key) {
     $(id).addEventListener('click', (e) => {
       const b = e.target.closest('button'); if (!b) return;
-      S[key] = b.dataset.v || b.dataset.m || b.dataset.c;
+      S[key] = b.dataset.v || b.dataset.m || b.dataset.c || b.dataset.p;
       $(id).querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
       if (key === 'cut') { S.pos = 1; slider.value = 1000; }
       apply(key === 'view');
     });
   }
   const slider = $('layer');
-  seg('seg-view', 'view'); seg('seg-model', 'model'); seg('seg-cut', 'cut');
+  seg('seg-view', 'view'); seg('seg-model', 'model'); seg('seg-cut', 'cut'); seg('seg-pads', 'pads');
+  $('padsbox').hidden = !D.pads;
   slider.addEventListener('input', () => { S.pos = +slider.value / 1000; apply(false); });
   let timer = null;
   $('play').addEventListener('click', () => {
