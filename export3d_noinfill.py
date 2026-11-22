@@ -301,6 +301,9 @@ def main():
     ap.add_argument("--tmin", type=float, default=None, help="薄壁统计用的厚度 mm（默认取优化时的 --tmin，没有则 1.9）")
     ap.add_argument("--smooth", default="1.0", help="STL 按打印层高平滑重建的高斯半径（体素）；可写 σ_xy,σ_z 分开取；0 = 直接用体素做 marching cubes")
     ap.add_argument("--am", default="fill+trim", choices=["fill+trim", "fill", "levelset", "cross"], help="平滑后的逐层悬空处理（见 smooth_fine）")
+    ap.add_argument("--mid", default=None, help="改用另一套顶面载荷复核：斜面中段 s0,s1 / joints 不加载（默认取优化时的 --mid）")
+    ap.add_argument("--legacy_top", action="store_true", help="按旧的顶面加载节点复核（复现 2026-11-22 以前的数）")
+    ap.add_argument("--md", default=None, help="输出目录（默认由 --dir 推出；换载荷复核旧设计时另给一个，免得覆盖）")
     a = ap.parse_args()
     sm = [float(v) for v in str(a.smooth).split(",")]
     a.smooth = sm[0] if len(sm) == 1 else tuple(sm)
@@ -309,10 +312,13 @@ def main():
     r = np.load(f"{a.dir}/result.npz")
     hist = json.load(open(f"{a.dir}/history.json"))
     ha = hist["args"]
-    md = a.dir.replace("noinfill", "model_noinfill") if "noinfill" in a.dir else a.dir + "/model"
+    md = a.md or (a.dir.replace("noinfill", "model_noinfill") if "noinfill" in a.dir else a.dir + "/model")
     os.makedirs(md, exist_ok=True)
     M = N.Free3D(ha["nz"], kz=ha["kz"], skin=ha["skin"], misuse=True, lateral=True, warp=True, asm_z=ha.get("asm_z", True),
-                 hxy=ha.get("hxy"), dz=ha.get("dz"))    # 复核总带 z 向体力工况
+                 hxy=ha.get("hxy"), dz=ha.get("dz"), mid=a.mid or ha.get("mid"), gap=ha.get("gap", 0.0),
+                 legacy_top=a.legacy_top or ha.get("legacy_top", False))    # 复核总带 z 向体力工况
+    if M.mid or M.legacy_top:
+        print(f"顶面载荷：" + (f"中段 s = {M.mid[0]:.1f}–{M.mid[1]:.1f} 不加载（中段空隙 {M.gap:g} mm）" if M.mid else "") + ("旧加载节点" if M.legacy_top else ""), flush=True)
     if M.dz != M.h and smooth_on:
         print("扁体素：层向已经是打印层高，不做平滑（--smooth 只用于立方体素）", flush=True)
         smooth_on = False

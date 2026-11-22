@@ -111,7 +111,7 @@ def main():
     pads_info = None
     if os.path.exists(pads_stl):          # 可选：TPU 卡套（pads.py）
         pj = json.load(open(f"{P.OUT_DIR}/pads/pads.json"))
-        pads_info = (f"U 形卡套，每片支撑 4 件（顶面垫、前挡垫、前后脚套），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
+        pads_info = (f"U 形卡套，每片支撑 {len(pj['parts'])} 件（{'、'.join(pj['parts'])}），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
     data = dict(T=P.T, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
                 leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=(int(round(P.T / ha["dz"])) if ha.get("dz") else int(ha["nz"])), h=(ha["dz"] if ha.get("dz") else P.T / int(ha["nz"])),
