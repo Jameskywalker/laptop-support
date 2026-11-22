@@ -9,3 +9,12 @@ out/**/profile.pkl
 out/**/topo3d/
 out/**/model3d/
 web/support3d_preview.html
+# 无填充三维优化的输出（同上，可由 topopt3d_noinfill.py / export3d_noinfill.py / make_web_noinfill.py 重新生成）
+out/**/noinfill*/
+out/**/model_noinfill*/
+out/**/noinfill*.log
+out/**/model_noinfill*.log
+web/noinfill_preview.html
+# 远程跑完的标记、零散日志
+out/**/run_done*.txt
+out/*_rerun.log

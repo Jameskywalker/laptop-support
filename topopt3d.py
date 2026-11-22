@@ -280,6 +280,9 @@ class CoarseDirect:
         return out
 
 
+MG_INJECT = False          # True：约束按注入法传到粗层（旧做法，只用来对比）
+
+
 class MGCG:
     def __init__(self, nx, ny, nz, dx, dz, D, fm, nu_s=2, omega=1.6, coarse_nodes=12000):
         self.levels = [Level(nx, ny, nz, dx, dx, dz, D, fm)]; self.axes = []
@@ -296,7 +299,15 @@ class MGCG:
             else:
                 break
             f = [2 if a else 1 for a in ax]
-            fmc = L.fm.reshape(L.shape)[tuple(slice(0, None, f[d]) for d in range(3))]   # 约束按注入法传到粗层
+            # 约束传到粗层：粗节点 i 对应细节点 2i，它或相邻的 2i±1 受约束就算受约束（只取 2i 的话，约束落在奇数节点上
+            # ——比如扁体素补层后厚度 T 处的内侧面——到粗层就丢了，粗网格校正不准，CG 次数会翻几倍）。只影响预条件，不影响解
+            a = L.fm.reshape(L.shape)
+            for d in range(3):
+                if ax[d] and not MG_INJECT:
+                    lo = cp.concatenate([cp.ones_like(a[_sl(d, slice(0, 1), 3)]), a[_sl(d, slice(0, -1), 3)]], d)
+                    hi = cp.concatenate([a[_sl(d, slice(1, None), 3)], cp.ones_like(a[_sl(d, slice(0, 1), 3)])], d)
+                    a = cp.minimum(cp.minimum(lo, a), hi)[_sl(d, slice(0, None, 2), 3)]
+            fmc = a if not MG_INJECT else L.fm.reshape(L.shape)[tuple(slice(0, None, f[d]) for d in range(3))]
             self.levels.append(Level(L.nx // f[0], L.ny // f[1], L.nz // f[2], L.dx * f[0], L.dy * f[1], L.dz * f[2], D,
                                      cp.ascontiguousarray(fmc).ravel()))
             self.axes.append(ax)

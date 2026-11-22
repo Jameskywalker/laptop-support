@@ -1,6 +1,6 @@
 """
 生成网页预览：把各方案的网格 / 轮廓 / 密度场 / 复核数据嵌入 web/template.html → web/stand_preview.html
-用法: python make_web.py [方案...]   默认 desk35 desk40 desk45 raised25（需先跑完对应方案的 run_all.sh）
+用法: python make_web.py [方案...]   默认 desk40 raised25（需先跑完对应方案的 run_all.sh）
 """
 import os, sys, json, base64, importlib
 import numpy as np
@@ -8,8 +8,8 @@ import trimesh
 from shapely.geometry import Polygon, box
 import params as P
 
-LABELS = {"desk35": "35°", "desk40": "40° · 选定", "desk45": "45°", "raised25": "25° · 上一版"}
-ORDER = sys.argv[1:] or ["desk35", "desk40", "desk45", "raised25"]
+LABELS = {"desk40": "40° · 选定", "raised25": "25° · 上一版"}
+ORDER = sys.argv[1:] or ["desk40", "raised25"]
 DEFAULT = "desk40" if "desk40" in ORDER else ORDER[0]
 
 
