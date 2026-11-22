@@ -29,14 +29,17 @@ import topopt3d_noinfill as N
 
 
 # ---------------- 二值化与清理 ----------------
-def binarize(M, xi, no_am=False, am_angle=45.0):
+def binarize(M, xi, no_am=False, am_angle=45.0, ground=False):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
+    B0 = B
+    if ground:                                              # 接地：床面那层没料的柱子整柱去掉
+        B = np.where(d3, B & B[:, :, :1], B)
     B1 = B if no_am else N.am_binary(B, *N.am_stencil(M.h, M.dz, am_angle))
     lab, n = label(B1)                                      # 6 连通
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
     B2 = lab == int(sizes.argmax())
-    info = dict(悬空去掉体素=int((B & ~B1).sum()), 碎块数=int(n - 1), 碎块体素=int((B1 & ~B2).sum()))
+    info = dict(接地去掉体素=int((B0 & ~B).sum()), 悬空去掉体素=int((B & ~B1).sum()), 碎块数=int(n - 1), 碎块体素=int((B1 & ~B2).sum()))
     return B2 & d3, info                                    # 只返回设计区部分
 
 
@@ -300,7 +303,7 @@ def main():
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
-    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0))
+    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")))
     _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
     sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
                            e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
