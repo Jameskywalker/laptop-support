@@ -352,7 +352,7 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -374,7 +374,14 @@ class Pipeline:
         nst = 5 if ker is None else int(ker.sum())
         self.P = p_am; self.Q = p_am + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
-        self.ground = ground                                     # True：接地，见 ground_forward
+        self.ground = ground or ground_r > 0                     # True：接地，见 ground_forward
+        self.g_ker = None                                        # ground_r > 0：床面那层先在面内膨胀（圆盘，半径 ground_r mm）
+        if ground_r > 0:
+            Rg = int(np.floor(ground_r / h + 1e-9)); og = np.arange(-Rg, Rg + 1)
+            gi, gj = np.meshgrid(og, og, indexing="ij")
+            kd = ((gi * h) ** 2 + (gj * h) ** 2 <= ground_r ** 2 + 1e-9).astype(np.float64)
+            self.g_ker = cp.asarray(kd)
+            self.gQ = p_am + np.log(int(kd.sum())) / np.log(xi0)          # 同 AM：均匀 ξ0 时 smax = ξ0
 
     def filt(self, x):
         return cnd.correlate(x, self.K, mode="constant", cval=0.0) / self.Ks
@@ -389,9 +396,9 @@ class Pipeline:
         xb, dxb = T2.project(xt, float(beta), 0.5)
         xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
         if self.ground:
-            xg, ga, gb = self.ground_forward(xb)
+            xg, gc = self.ground_forward(xb)
             xi, c = self.am_forward(xg)
-            c.update(ga=ga, gb=gb)
+            c.update(gc)
         else:
             xi, c = self.am_forward(xb)
         c["dxb"] = dxb
@@ -410,23 +417,33 @@ class Pipeline:
         """接地：底面投影非空的地方才能有材料 —— 每一柱里各层的密度不超过床面那层，x̄_g,k = smin(x̄_k, x̄_0)。
         于是离床的东西（连同 45° 龙骨的斜面）正下方的床面上都得有料：单独伸到空床面上方的尖刺不行，
         要么底下铺板（管道、尖拱），要么下面再长一个倒尖刺接上（沙漏形）。先接地再做 AM 滤波：AM 只会去料、床面那层不动，结果仍接地。
-        返回 x̄_g 和它对 x̄_k、x̄_0 的偏导"""
+        g_ker 不为 None（--ground_r）时"底面"是床面那层在面内膨胀后的形状：G = smax_圆盘(x̄_0)（P 次和开 Q 次方，同 AM 滤波），
+        离床面材料 ground_r 以内的地方都能有料 —— 竖墙可以按 45° 往外扩到 ground_r，再宽的龙骨 / 尖刺仍然没有落脚处。
+        返回 x̄_g 和反传要用的量"""
         eps = self.eps; se = np.sqrt(eps)
-        b0 = xb[:, :, :1]
+        b0 = xb[:, :, :1]; gS = None
+        if self.g_ker is not None:
+            gS = cp.maximum(cnd.correlate(b0[:, :, 0] ** self.P, self.g_ker, mode="constant", cval=0.0), 1e-280)
+            b0 = (gS ** (1.0 / self.gQ))[:, :, None]
         d = xb - b0; r = cp.sqrt(d * d + eps)
         xg = 0.5 * (xb + b0 - r + se)
         ga = 0.5 * (1 - d / r); gb = 0.5 * (1 + d / r)
         xg[:, :, 0] = xb[:, :, 0]; ga[:, :, 0] = 1.0; gb[:, :, 0] = 0.0
         xg = cp.where(self.fixed, self.fval, xg)
         ga = cp.where(self.fixed, 0.0, ga); gb = cp.where(self.fixed, 0.0, gb)
-        return xg, ga, gb
+        return xg, dict(ga=ga, gb=gb, gS=gS, gx0=xb[:, :, 0])
 
     def ground_backward(self, g, c):
         """dF/dx̄_g → dF/dx̄（床面那层收各层传下来的那份）"""
         if not self.ground:
             return g
         out = g * c["ga"]
-        out[:, :, 0] += (g * c["gb"]).sum(axis=2)
+        gG = (g * c["gb"]).sum(axis=2)                           # dF/d(底面形状)
+        if self.g_ker is None:
+            out[:, :, 0] += gG
+        else:
+            A = gG * (1.0 / self.gQ) * c["gS"] ** (1.0 / self.gQ - 1.0)
+            out[:, :, 0] += self.P * c["gx0"] ** (self.P - 1) * cnd.correlate(A, self.g_ker, mode="constant", cval=0.0)
         return out
 
     def am_forward(self, xb):
@@ -1147,6 +1164,7 @@ def main():
     ap.add_argument("--sup_e", type=float, default=0.47, help="支撑体积随离床高度的指数")
     ap.add_argument("--sup_r", type=float, default=0.0, help="悬空面内膨胀半径 mm（> 0 时按膨胀后的面积计，见 SupportEst）")
     ap.add_argument("--ground", action="store_true", help="接地：底面投影非空才能有材料（每柱各层不超过床面那层）。配 45°：悬空龙骨不能伸到空床面上方，逼出尖拱管道 / 沙漏形；配 --no_am：悬空只能在有底板的地方")
+    ap.add_argument("--ground_r", type=float, default=0.0, help="接地放宽：床面那层先在面内膨胀 r mm 再当底面（竖墙可按 45° 外扩到 r）；> 0 时自动打开 --ground")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
@@ -1208,9 +1226,9 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground)
-    if a.ground:
-        print("接地：每柱各层的密度不超过床面那层（底面投影非空才能有材料）", flush=True)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r)
+    if a.ground or a.ground_r > 0:
+        print("接地：每柱各层的密度不超过床面那层" + (f"在面内膨胀 {a.ground_r:g} mm 后的形状" if a.ground_r > 0 else "（底面投影非空才能有材料）"), flush=True)
     if not a.no_am and pipe.am_ker is not None:
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
     elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):

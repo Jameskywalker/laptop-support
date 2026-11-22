@@ -19,7 +19,7 @@ import argparse, json, os, time
 import numpy as np
 import shapely
 from shapely.geometry import Polygon, MultiPolygon
-from scipy.ndimage import label, distance_transform_edt, binary_opening, gaussian_filter, spline_filter, map_coordinates, grey_dilation
+from scipy.ndimage import label, distance_transform_edt, binary_opening, binary_dilation, gaussian_filter, spline_filter, map_coordinates, grey_dilation
 from skimage import measure, morphology
 import manifold3d as m3d
 import trimesh
@@ -29,12 +29,17 @@ import topopt3d_noinfill as N
 
 
 # ---------------- 二值化与清理 ----------------
-def binarize(M, xi, no_am=False, am_angle=45.0, ground=False):
+def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
     B0 = B
-    if ground:                                              # 接地：床面那层没料的柱子整柱去掉
-        B = np.where(d3, B & B[:, :, :1], B)
+    if ground or ground_r > 0:                              # 接地：床面那层（膨胀 ground_r 后）没料的柱子整柱去掉
+        g0 = B[:, :, 0]
+        if ground_r > 0:
+            Rg = int(np.floor(ground_r / M.h + 1e-9)); og = np.arange(-Rg, Rg + 1)
+            gi, gj = np.meshgrid(og, og, indexing="ij")
+            g0 = binary_dilation(g0, structure=(gi * M.h) ** 2 + (gj * M.h) ** 2 <= ground_r ** 2 + 1e-9)
+        B = np.where(d3, B & g0[:, :, None], B)
     B1 = B if no_am else N.am_binary(B, *N.am_stencil(M.h, M.dz, am_angle))
     lab, n = label(B1)                                      # 6 连通
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
@@ -303,7 +308,7 @@ def main():
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
-    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")))
+    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0))
     _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
     sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
                            e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
