@@ -761,9 +761,14 @@ class MMA:
 
 
 # ======================= 模型 =======================
+def parse_mid(mid):
+    """--mid：None / "joints"（前、顶两个面板接口区之间）/ "s0,s1" / (s0, s1) → None 或 (s0, s1)（沿斜面 mm），见 params.mid_span"""
+    return P.mid_span(mid)
+
+
 class Free3D:
     def __init__(self, nz, kz=P.KZ, skin=1.5, nwall=P.NWALL, nskin=P.NSKIN, infill=P.INFILL, misuse=False, lateral=True, warp=True, asm_z=True,
-                 hxy=None, dz=None):
+                 hxy=None, dz=None, mid=None, gap=0.0, legacy_top=False):
         """nz：立方体素时厚度方向的格数（h = T/nz）。给了 dz 时按扁体素：层向 dz（= 打印层高），面内 hxy；
         厚度方向 NT = T/dz 层，网格补到 NZ（能被 16 整除，多重网格要逐级对半分），T 以上的层是固定的空"""
         self.lateral, self.warp, self.asm_z = lateral, warp, asm_z
@@ -788,14 +793,27 @@ class Free3D:
         xc, yc = (I + 0.5) * h, (J + 0.5) * h
         dom = shapely.contains_xy(domain, xc, yc)
         w = max(skin, 1.5 * h); self.skin_w = w
-        regs = dict(top=P.sn_rect(-w, P.S_END, -w, 0.0), lip=P.sn_rect(-w, 0.0, 0.0, P.LIP_H),
+        # 中段不贴笔记本（mid = (s0, s1)）：载荷只加在斜面头尾；gap > 0 时中段的表皮条不固定，斜面下 gap 以内固定为空
+        mid = parse_mid(mid); gap = float(gap or 0.0) if mid else 0.0
+        self.mid, self.gap, self.legacy_top = mid, gap, legacy_top
+        top_g = P.sn_rect(-w, P.S_END, -w, 0.0)
+        if gap > 0:
+            top_g = shapely.union(P.sn_rect(-w, mid[0], -w, 0.0), P.sn_rect(mid[1], P.S_END, -w, 0.0))
+        regs = dict(top=top_g, lip=P.sn_rect(-w, 0.0, 0.0, P.LIP_H),
                     feet=shapely.union(box(0, 0, P.FOOT_LEN, w), box(P.X_MAX - P.FOOT_LEN, 0, P.X_MAX, w)))
         jg = shapely.unary_union([solids["joint_" + j["name"]] for j in P.JOINTS])
         self.joint_geom = jg
         jnt = shapely.contains_xy(jg, xc, yc) & dom
         cols = {k: shapely.contains_xy(g, xc, yc) & dom & ~jnt for k, g in regs.items()}
         fixs = cols["top"] | cols["lip"] | cols["feet"]
-        self.cols = dict(dom=dom, jnt=jnt, fixs=fixs, design=dom & ~fixs & ~jnt, **cols)
+        sc, _ = P.xy2sn(xc, yc)
+        in_mid = (sc > mid[0]) & (sc < mid[1]) if mid else np.zeros_like(dom)
+        void = shapely.contains_xy(P.sn_rect(mid[0], mid[1], -gap, 0.0), xc, yc) & dom & ~jnt if gap > 0 else np.zeros_like(dom)
+        # 顶面加载面：斜面下 w 以内的格，含接口区（接口区顶边贴齐斜面，那一段斜面就是接口区的顶墙）。
+        # legacy_top：旧做法只取固定表皮条（不含接口区）→ 接口区那两段斜面上没有加载节点，后压 / 后推 / 后部误用
+        # 几乎全挤在顶面最后 2 mm 上，自重均布那部分 78% 落在两接口之间的中段
+        surf = cols["top"] if legacy_top else shapely.contains_xy(P.sn_rect(-w, P.S_END, -w, 0.0), xc, yc) & dom & ~in_mid
+        self.cols = dict(dom=dom, jnt=jnt, fixs=fixs, design=dom & ~fixs & ~jnt & ~void, void=void, surf=surf, **cols)
         self.fixed_regions = dict(regs, joint=jg)
         # 固定体素的刚度/用料系数：实心条 = 1；接口区 = 墙 + 表皮 + 填充（墙沿接口区外边和方槽）
         self.print_set = dict(nwall=nwall, nskin=nskin, infill=infill)
@@ -1065,7 +1083,7 @@ class Free3D:
             return s[:-1, :-1] | s[1:, :-1] | s[:-1, 1:] | s[1:, 1:]
         C = self.cols
         s, n = P.xy2sn(xn, yn)
-        top, lipback, jn = adj(C["top"]), adj(C["lip"]), adj(C["jnt"])
+        top, lipback, jn = adj(C["surf"]), adj(C["lip"]), adj(C["jnt"])
         nn = (NX + 1) * (NY + 1) * (NZ + 1)
         zn = np.arange(NZ + 1) <= self.NT                       # 加载 / 约束只在厚度 T 以内的节点上（扁体素时网格补高了）
         m3 = lambda m2: (m2[:, :, None] & zn[None, None, :]).ravel() if m2.dtype == bool else (m2[:, :, None] * zn[None, None, :]).ravel()
@@ -1270,6 +1288,9 @@ def main():
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
     ap.add_argument("--skin", type=float, default=1.5, help="顶面、前挡后表面、脚垫固定实心条的宽度 mm")
+    ap.add_argument("--mid", default=None, help="斜面中段不贴笔记本：s0,s1（沿斜面 mm），或 joints = 前、顶两个接口区之间；载荷只加在头尾")
+    ap.add_argument("--gap", type=float, default=0.0, help="配 --mid：中段表皮条不固定，斜面下这么深（mm）以内固定为空，笔记本碰不到中段；0 = 只改载荷（复核旧设计用）")
+    ap.add_argument("--legacy_top", action="store_true", help="旧的顶面加载节点（只在表皮条上，不含贴齐斜面的接口区；复现 2026-11-22 以前的结果用）")
     ap.add_argument("--kz", type=float, default=P.KZ)
     ap.add_argument("--penal", type=float, default=3.0)
     ap.add_argument("--maxit", type=int, default=220)
@@ -1295,8 +1316,13 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
-    M = Free3D(a.nz, kz=a.kz, skin=a.skin, lateral=a.lateral, warp=a.warp > 0, asm_z=a.asm_z, misuse=a.buck > 0, hxy=a.hxy, dz=a.dz)
+    M = Free3D(a.nz, kz=a.kz, skin=a.skin, lateral=a.lateral, warp=a.warp > 0, asm_z=a.asm_z, misuse=a.buck > 0, hxy=a.hxy, dz=a.dz,
+               mid=a.mid, gap=a.gap, legacy_top=a.legacy_top)
     NX, NY, NZ, h = M.NX, M.NY, M.NZ, M.h
+    if M.mid:
+        print(f"斜面中段 s = {M.mid[0]:.1f}–{M.mid[1]:.1f} mm 不贴笔记本：载荷只加在头尾" + (f"；中段斜面下 {M.gap:g} mm 以内固定为空" if M.gap > 0 else "（表皮条照旧固定）"), flush=True)
+    if M.legacy_top:
+        print("旧的顶面加载节点（--legacy_top）", flush=True)
     vox = M.vox
     nd = int(M.design3.sum())
     print(f"网格 {NX}×{NY}×{NZ}（面内 {h:.4f} mm，层向 {M.dz:.4f} mm，厚度内 {M.NT} 层），体素 {NX*NY*NZ/1e6:.2f} M，"

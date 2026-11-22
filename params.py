@@ -220,6 +220,20 @@ def panel_joints():
     return sorted(js, key=lambda j: float(xy2sn(j["x"], j["y"])[0]))
 
 
+def mid_span(mid):
+    """斜面中段不贴笔记本的范围（沿斜面 s，mm）：None / "none" → None（整条贴）；
+    "joints" → 前、顶两个面板接口区之间（接口区顶边贴齐斜面，笔记本只压在前挡到前接口区、顶接口区到顶面后端这两段上）；
+    "s0,s1" 或 (s0, s1) → (s0, s1)"""
+    if mid is None or (isinstance(mid, str) and mid.strip().lower() in ("", "none")):
+        return None
+    if isinstance(mid, str) and mid.strip() == "joints":
+        s = [float(xy2sn(j["x"], j["y"])[0]) for j in panel_joints()]
+        return (s[0] + _HA, s[-1] - _HA)
+    v = [float(t) for t in mid.split(",")] if isinstance(mid, str) else [float(t) for t in mid]
+    assert len(v) == 2 and v[0] < v[1], f"中段范围应为 s0,s1：{mid}"
+    return tuple(v)
+
+
 def snap_end(sx, half, yc=0.0):
     """横梁/面板一端的卡扣，打印平面坐标：X 沿横向，支撑内侧面在 X = sx·half；Y 沿截面长边，卡扣中心在 Y = yc。
     返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、两臂之间让位。"""
