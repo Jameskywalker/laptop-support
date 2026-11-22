@@ -352,7 +352,7 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -375,6 +375,7 @@ class Pipeline:
         self.P = p_am; self.Q = p_am + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
         self.ground = ground or ground_r > 0                     # True：接地，见 ground_forward
+        self.h_xy = h; self.isl_A = island_area; self.isl_b = island_beta      # 底面孤岛最小面积 mm²（0 = 不限），见 island_forward
         self.g_ker = None                                        # ground_r > 0：床面那层先在面内膨胀（圆盘，半径 ground_r mm）
         if ground_r > 0:
             Rg = int(np.floor(ground_r / h + 1e-9)); og = np.arange(-Rg, Rg + 1)
@@ -395,12 +396,16 @@ class Pipeline:
         xt = self.filt(xf)
         xb, dxb = T2.project(xt, float(beta), 0.5)
         xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
+        xa, ic = xb, None
+        if self.isl_A > 0 and beta >= self.isl_b:
+            xa, ic = self.island_forward(xa)
         if self.ground:
-            xg, gc = self.ground_forward(xb)
+            xg, gc = self.ground_forward(xa)
             xi, c = self.am_forward(xg)
             c.update(gc)
         else:
-            xi, c = self.am_forward(xb)
+            xi, c = self.am_forward(xa)
+        c["isl"] = ic
         c["dxb"] = dxb
         if self.eta_e is not None:
             # 腐蚀设计 ξ_e = x̄_e·s，s = ξ/x̄ 是打印设计里"被下层托住"的比例（AM 滤波只对打印设计做一次：
@@ -412,6 +417,21 @@ class Pipeline:
             c.update(xe=xe, dxe=dxe, s=s, br=xb > xi, q=xe / den)
             c["xie"] = xe * s
         return xi, c
+
+    def island_forward(self, xb):
+        """底面孤岛：贴床那层（x̄ > 0.5，8 连通）面积小于 isl_A mm² 的孤岛整块不算打印（ξ_0 = 0），
+        上面只靠它托着的部分随之被 AM 滤波去掉 —— 尖刺的尖落在床面上就是这种小孤岛。
+        连通性不可导：掩码每轮按当前设计重算，反传时当常数（被去掉的格子梯度为 0）"""
+        b0 = xb[:, :, 0]
+        lab, n = cnd.label(b0 > 0.5, structure=cp.ones((3, 3), dtype=bool))
+        n = int(n)
+        if n == 0:
+            return xb, dict(m=None, n=0, ns=0)
+        area = cp.bincount(lab.ravel(), minlength=n + 1) * (self.h_xy ** 2)
+        small = area < self.isl_A; small[0] = False
+        m = small[lab] & self.free[:, :, 0]
+        xa = xb.copy(); xa[:, :, 0] = cp.where(m, 0.0, b0)
+        return xa, dict(m=m, n=n, ns=int(small.sum()))
 
     def ground_forward(self, xb):
         """接地：底面投影非空的地方才能有材料 —— 每一柱里各层的密度不超过床面那层，x̄_g,k = smin(x̄_k, x̄_0)。
@@ -506,7 +526,10 @@ class Pipeline:
             gq = cp.where(c["br"], gxe * c["q"], 0.0)
             gxi = (0.0 if gxi is None else gxi) + gq
             gdir = -gq * c["s"]
-        gt = (self.ground_backward(self.am_backward(gxi, c), c) + gdir) * c["dxb"]
+        g = self.ground_backward(self.am_backward(gxi, c), c)
+        if c.get("isl") is not None and c["isl"]["m"] is not None:
+            g = g.copy(); g[:, :, 0] = cp.where(c["isl"]["m"], 0.0, g[:, :, 0])
+        gt = (g + gdir) * c["dxb"]
         if gxe is not None:
             gt = gt + gxe * c["s"] * c["dxe"]
         return cnd.correlate(gt / self.Ks, self.K, mode="constant", cval=0.0) * self.free
@@ -1164,6 +1187,8 @@ def main():
     ap.add_argument("--sup_e", type=float, default=0.47, help="支撑体积随离床高度的指数")
     ap.add_argument("--sup_r", type=float, default=0.0, help="悬空面内膨胀半径 mm（> 0 时按膨胀后的面积计，见 SupportEst）")
     ap.add_argument("--ground", action="store_true", help="接地：底面投影非空才能有材料（每柱各层不超过床面那层）。配 45°：悬空龙骨不能伸到空床面上方，逼出尖拱管道 / 沙漏形；配 --no_am：悬空只能在有底板的地方")
+    ap.add_argument("--island_area", type=float, default=0.0, help="底面孤岛最小面积 mm²：贴床那层面积更小的连通块不算打印（尖刺落在床面上的尖）；0 = 不限")
+    ap.add_argument("--island_beta", type=float, default=0.0, help="β 达到这个值以后才限制底面孤岛（0 = 从头开始）")
     ap.add_argument("--ground_r", type=float, default=0.0, help="接地放宽：床面那层先在面内膨胀 r mm 再当底面（竖墙可按 45° 外扩到 r）；> 0 时自动打开 --ground")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
@@ -1226,7 +1251,9 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta)
+    if a.island_area > 0:
+        print(f"底面孤岛：贴床那层面积小于 {a.island_area:g} mm² 的连通块不算打印" + (f"（β ≥ {a.island_beta:g} 起）" if a.island_beta > 0 else ""), flush=True)
     if a.ground or a.ground_r > 0:
         print("接地：每柱各层的密度不超过床面那层" + (f"在面内膨胀 {a.ground_r:g} mm 后的形状" if a.ground_r > 0 else "（底面投影非空才能有材料）"), flush=True)
     if not a.no_am and pipe.am_ker is not None:
@@ -1351,7 +1378,7 @@ def main():
                          buck=binfo, ks=fG))
         bs = (" 屈曲 λ " + " / ".join(f"{v:.1f}" for k, v in binfo.items() if k != "假模态比例") + f" KS−1={fG:+.3f}"
               + (f" 假模态{binfo['假模态比例']}" if "假模态比例" in binfo else "")) if binfo else ""
-        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs}{f" 支撑≈{sup/1000:.2f}cm³ 总目标={ctot:.4f}" if supest is not None else ""} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
+        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs}{f" 支撑≈{sup/1000:.2f}cm³ 总目标={ctot:.4f}" if supest is not None else ""}{f" 小孤岛={cache['isl']['ns']}/{cache['isl']['n']}" if cache.get("isl") else ""} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
               f"CG={sum(its)} {time.time()-ti:.1f}s t={time.time()-t0:.0f}s", flush=True)
         if it % 20 == 0:
             fig_layers(M, cp.asnumpy(xi), f"{a.out}/layers_it{it}.png", f"it={it} β={beta:g} 加权柔度/二维={c:.3f}")
