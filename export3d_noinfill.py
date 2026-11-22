@@ -254,7 +254,7 @@ def build_mesh(M, F, step=1, fine=None):
     dom, _ = P.geometry(True)
     fixed = shapely.unary_union([g.intersection(dom) for g in M.fixed_regions.values()])
     mesh = mesh + extrude(fixed, 0, P.T)
-    mesh = mesh - extrude(P.joint_slot(), -1, P.T + 1)
+    mesh = mesh - extrude(M.keepout_geom, -1, P.T + 1)       # 方槽（clampfill 时只是两端卡扣臂的口袋）
     if fine is not None:
         mesh = mesh.simplify(0.02)          # 0.02 mm 以内合并近似共面的三角形，面数降到约 1/4
     elif M.dz != M.h:
@@ -303,6 +303,8 @@ def main():
     ap.add_argument("--am", default="fill+trim", choices=["fill+trim", "fill", "levelset", "cross"], help="平滑后的逐层悬空处理（见 smooth_fine）")
     ap.add_argument("--mid", default=None, help="改用另一套顶面载荷复核：斜面中段 s0,s1 / joints 不加载（默认取优化时的 --mid）")
     ap.add_argument("--legacy_top", action="store_true", help="按旧的顶面加载节点复核（复现 2026-11-22 以前的数）")
+    ap.add_argument("--legacy_slot", action="store_true", help="横梁面内力按旧做法摊在整面受压槽壁上复核（默认只加在卡扣臂贴着的那几段）")
+    ap.add_argument("--beam_rev", action="store_true", help="复核时加反向横梁工况（默认取优化时的 --beam_rev）")
     ap.add_argument("--md", default=None, help="输出目录（默认由 --dir 推出；换载荷复核旧设计时另给一个，免得覆盖）")
     a = ap.parse_args()
     sm = [float(v) for v in str(a.smooth).split(",")]
@@ -316,7 +318,10 @@ def main():
     os.makedirs(md, exist_ok=True)
     M = N.Free3D(ha["nz"], kz=ha["kz"], skin=ha["skin"], misuse=True, lateral=True, warp=True, asm_z=ha.get("asm_z", True),
                  hxy=ha.get("hxy"), dz=ha.get("dz"), mid=a.mid or ha.get("mid"), gap=ha.get("gap", 0.0),
-                 legacy_top=a.legacy_top or ha.get("legacy_top", False))    # 复核总带 z 向体力工况
+                 legacy_top=a.legacy_top or ha.get("legacy_top", False), joint=ha.get("joint", "block"),
+                 legacy_slot=a.legacy_slot, beam_rev=a.beam_rev or ha.get("beam_rev", False))    # 复核总带 z 向体力工况；横梁面内力默认按卡扣臂贴着的槽壁段（旧结果复核也一样，--legacy_slot 复现旧数）
+    if M.joint_mode != "block" or M.legacy_slot:
+        print(f"横梁接口：{M.joint_mode}" + ("；横梁面内力摊在整面槽壁上（旧做法）" if M.legacy_slot else ""), flush=True)
     if M.mid or M.legacy_top:
         print(f"顶面载荷：" + (f"中段 s = {M.mid[0]:.1f}–{M.mid[1]:.1f} 不加载（中段空隙 {M.gap:g} mm）" if M.mid else "") + ("旧加载节点" if M.legacy_top else ""), flush=True)
     if M.dz != M.h and smooth_on:
@@ -351,7 +356,10 @@ def main():
     thin = {}
     if a.ref:
         rr = np.load(f"{a.ref}/result.npz")
-        if rr["xi"].shape == xi.shape:
+        rj = json.load(open(f"{a.ref}/history.json"))["args"].get("joint", "block")
+        if rj != M.joint_mode:
+            print(f"--ref 的横梁接口是 {rj}，本次是 {M.joint_mode}（固定区不同，不能放在同一个模型里比），跳过", flush=True)
+        elif rr["xi"].shape == xi.shape:
             Bo, info_o = binarize(M, rr["xi"].astype(float))
             if smooth_on:               # 对照也按同样方法平滑，网格另存一份给预览
                 fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth, am=a.am)
@@ -395,6 +403,9 @@ def main():
         res[nm]["rel"] = rel.tolist()
         res[nm]["weighted"] = float((M.imp * rel)[opt].sum() / M.imp[opt].sum())
         res[nm]["weighted_orig"] = float((M.imp * rel)[orig].sum() / M.imp[orig].sum())
+        if M.beam_rev:      # 不计反向横梁工况的加权柔度：和没加 --beam_rev 的结果可比
+            fw = [k for k in opt if not names[k].endswith("反")]
+            res[nm]["weighted_fwd"] = float((M.imp * rel)[fw].sum() / M.imp[fw].sum())
     for k, nm in enumerate(names):
         row = dict(工况=nm)
         for d in res:
@@ -403,7 +414,7 @@ def main():
                           面内位移_um=round(st["面内位移_mm"] * 1000, 1), z向位移_um=round(st["z向位移_mm"] * 1000, 1))
         table.append(row)
     for nm in res:
-        print(f"  {nm}: 加权柔度 {res[nm]['weighted']:.3f}（不计 z 向体力 {res[nm]['weighted_orig']:.3f}），用料 {res[nm]['petg_g']:.1f} g")
+        print(f"  {nm}: 加权柔度 {res[nm]['weighted']:.3f}（不计 z 向体力 {res[nm]['weighted_orig']:.3f}" + (f"，不计反向横梁 {res[nm]['weighted_fwd']:.3f}" if "weighted_fwd" in res[nm] else "") + f"），用料 {res[nm]['petg_g']:.1f} g")
     for row in table:
         print("  " + row["工况"] + "：" + "；".join(f"{d[:6]} {v['柔度比']:.3f}/{v['VM_99_9']:.1f}MPa/z{v['z向位移_um']:.0f}µm" for d, v in row.items() if d != "工况"))
 

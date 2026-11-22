@@ -201,6 +201,46 @@ def slot_bearing(j, x, y, f, tol):
     return np.where(near, w, 0.0)
 
 
+def slot_bearing_arms(j, x, y, f, tol):
+    """同 slot_bearing，但只算卡扣臂真正贴着的槽壁：短边壁全长；长边壁只在两端 |u| ≥ TENON_H/2 − ARM_T（臂内侧面）以外。
+    支撑里只有两条卡扣臂（2.5 × 16 mm，方槽长边两端各一条），两臂之间（|u| &lt; 12.5）没有任何东西碰到长边壁"""
+    u, v = slot_uv(j, x, y)
+    on_u = np.abs(u) / (SLOT_A / 2) >= np.abs(v) / (SLOT_B / 2)          # 短边壁（同 slot_bearing 的分法）
+    return np.where(on_u | (np.abs(u) >= TENON_H / 2 - ARM_T - tol), slot_bearing(j, x, y, f, tol), 0.0)
+
+
+# ---------------- 接口「夹头」（无填充三维 --joint clamp / clampfill） ----------------
+# 横梁在支撑里只有两条卡扣臂，限位全在方槽两端：短边壁挡 ±u；长边壁两端（臂贴着的 2.7 mm）挡 ±v；
+# 卡钩搭接带（外侧面 z = 0）挡往里拉；梁身台肩（内侧面 z = T，|u| 到 BEAM_H/2）挡往外推。
+# 夹头 = 方槽每一端 |u| ∈ [CLAMP_U0, BEAM_H/2]、|v| ≤ SLOT_B/2 + CLAMP_WALL 的全厚度实心块（去掉方槽）；
+# 原来 26 × 50 mm 接口区的其余部分（长边壁中段、外圈墙）交给优化。
+CLAMP_WALL = 2.0                                  # 夹头上下槽壁厚（≥ 最小厚度 1.9 mm）
+CLAMP_U0 = TENON_H / 2 - ARM_T - 0.5              # 夹头内端（臂内侧面 12.5 再让 0.5）= 12.0
+ARM_SWEEP = HOOK_H - CLEAR                        # 扣入时卡扣臂向内弯 1.2 mm
+KEEP_U0 = TENON_H / 2 - ARM_T - ARM_SWEEP - 0.5   # 槽中段可填时，两端留空口袋的内端 = 10.8（臂弯进来再让 0.5）
+
+
+def _uv_box(j, u0, u1, v0, v1):
+    return _place(box(u0, v0, u1, v1), j)
+
+
+def joint_clamps(j):
+    """横梁 j 方槽两端的夹头（全厚度实心，已去掉方槽）"""
+    b = SLOT_B / 2 + CLAMP_WALL
+    g = shapely.union(_uv_box(j, CLAMP_U0, BEAM_H / 2, -b, b), _uv_box(j, -BEAM_H / 2, -CLAMP_U0, -b, b))
+    return g.difference(joint_slot(j))
+
+
+def joint_keepout(j, fill_mid=False):
+    """必须留空的部分：fill_mid=False → 整个方槽；True → 只留方槽两端卡扣臂（含扣入时向内弯的 1.2 mm）的口袋，
+    两臂之间的槽中段也交给优化（梁身在两臂之间开了让位槽，伸进支撑的只有两条臂）"""
+    s = joint_slot(j)
+    if not fill_mid:
+        return s
+    big = SLOT_A
+    return s.intersection(shapely.union(_uv_box(j, KEEP_U0, big, -big, big), _uv_box(j, -big, -KEEP_U0, -big, big)))
+
+
 def hook_strip(j, x, y, tol):
     """卡钩扣住支撑外侧面的搭接带：方槽两端（长边方向）各一条，宽 HOOK_H − CLEAR"""
     u, v = slot_uv(j, x, y)

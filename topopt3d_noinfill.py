@@ -768,10 +768,17 @@ def parse_mid(mid):
 
 class Free3D:
     def __init__(self, nz, kz=P.KZ, skin=1.5, nwall=P.NWALL, nskin=P.NSKIN, infill=P.INFILL, misuse=False, lateral=True, warp=True, asm_z=True,
-                 hxy=None, dz=None, mid=None, gap=0.0, legacy_top=False):
-        """nz：立方体素时厚度方向的格数（h = T/nz）。给了 dz 时按扁体素：层向 dz（= 打印层高），面内 hxy；
+                 hxy=None, dz=None, mid=None, gap=0.0, legacy_top=False, joint="block", legacy_slot=False, beam_rev=False):
+        """joint：横梁接口怎么固定。block = 26 × 50 mm 接口区整块固定（墙 + 表皮 + 填充，方槽贯通）；
+        clamp = 只固定方槽两端的夹头（params.joint_clamps，实心），其余交给优化，方槽整个留空；
+        clampfill = 同 clamp，两臂之间的槽中段也交给优化（只留两端卡扣臂的口袋，params.joint_keepout）。
+        legacy_slot：横梁面内力按旧做法摊在整面受压槽壁上（默认只加在卡扣臂贴着的那几段，params.slot_bearing_arms）。
+        beam_rev：每个接口再加一个反向的横梁工况「横梁·X反」：面内力 −F_JOINT 顶在对面的槽壁上，轴向力由梁身台肩往外推（内侧面 z = T）。
+        原来只有一个方向 (8, −15) N + 卡钩往里拉；接口区整块固定时四面槽壁都是实的，换成夹头后优化可能只顾这一个方向。
+        nz：立方体素时厚度方向的格数（h = T/nz）。给了 dz 时按扁体素：层向 dz（= 打印层高），面内 hxy；
         厚度方向 NT = T/dz 层，网格补到 NZ（能被 16 整除，多重网格要逐级对半分），T 以上的层是固定的空"""
         self.lateral, self.warp, self.asm_z = lateral, warp, asm_z
+        self.beam_rev = beam_rev
         if dz is None:
             NT = NZ = nz; h = dz = P.T / nz
             mult, q = 1, nz                                     # 多重网格：z 能对半分几次，x、y 也要能分几次
@@ -787,6 +794,15 @@ class Free3D:
         self.vox = h * h * dz                                   # 体素体积 mm³
         zr = np.arange(NZ) < NT; self.zr = zr                   # 厚度 T 以内的层
         domain, solids = P.geometry(True)                       # 设计域、实体区都已经挖掉方槽
+        assert joint in ("block", "clamp", "clampfill"), joint
+        self.joint_mode, self.legacy_slot = joint, legacy_slot
+        if joint == "block":
+            jg = shapely.unary_union([solids["joint_" + j["name"]] for j in P.JOINTS])
+            self.keepout_geom = P.joint_slot()
+        else:   # 夹头：只有方槽两端的限位块固定（实心），原接口区其余部分是设计域；clampfill 时两臂之间的槽中段也是
+            self.keepout_geom = shapely.unary_union([P.joint_keepout(j, joint == "clampfill") for j in P.JOINTS])
+            domain = P.geometry(False)[0].difference(self.keepout_geom)
+            jg = shapely.unary_union([P.joint_clamps(j) for j in P.JOINTS]).intersection(domain)
         self.NX = NX = int(-(-int(np.ceil(domain.bounds[2] / h)) // mult) * mult)
         self.NY = NY = int(-(-int(np.ceil(domain.bounds[3] / h)) // mult) * mult)
         I, J = np.meshgrid(np.arange(NX), np.arange(NY), indexing="ij")
@@ -801,7 +817,6 @@ class Free3D:
             top_g = shapely.union(P.sn_rect(-w, mid[0], -w, 0.0), P.sn_rect(mid[1], P.S_END, -w, 0.0))
         regs = dict(top=top_g, lip=P.sn_rect(-w, 0.0, 0.0, P.LIP_H),
                     feet=shapely.union(box(0, 0, P.FOOT_LEN, w), box(P.X_MAX - P.FOOT_LEN, 0, P.X_MAX, w)))
-        jg = shapely.unary_union([solids["joint_" + j["name"]] for j in P.JOINTS])
         self.joint_geom = jg
         jnt = shapely.contains_xy(jg, xc, yc) & dom
         cols = {k: shapely.contains_xy(g, xc, yc) & dom & ~jnt for k, g in regs.items()}
@@ -821,6 +836,8 @@ class Free3D:
         cov, fw = print_columns(jg, NX, NY, h, nwall * P.LINE_W)
         fwn = np.where(jnt, np.clip(fw / np.maximum(cov, 1e-9), 0, 1), 0.0)
         Ej, mj = print_voxels(jnt.astype(float), fwn, self.fs, infill ** 2, infill)
+        if joint != "block":                                    # 夹头小，按实心打印（切片不用加修改器）
+            Ej = mj = np.broadcast_to(jnt[:, :, None], (NX, NY, NZ)).astype(float)
         f3 = np.broadcast_to(fixs[:, :, None], (NX, NY, NZ))
         self.E_fix = np.where(f3, 1.0, Ej) * zr; self.m_fix = np.where(f3, 1.0, mj) * zr
         self.design3 = self.cols["design"][:, :, None] & zr[None, None, :]
@@ -1111,16 +1128,27 @@ class Free3D:
         if self.lateral:   # z 向体力：随材料分布（侧向磕碰 / 惯性），每轮按当前设计重新组装（set_mass）
             F.append(new()); names.append("z向体力")
         # 横梁：面内力经卡扣臂顶在受压一侧的方槽槽壁上（全厚度）；轴向力由卡钩扣在外侧面（z=0）的搭接带上
-        for j in P.JOINTS:
-            w2 = P.slot_bearing(j, xn, yn, P.F_JOINT, 0.75 * h) * jn
-            w3 = m3(w2); assert w3.sum() > 0
+        bear = P.slot_bearing if self.legacy_slot else P.slot_bearing_arms
+
+        def beam_case(j, sgn):
+            fj = sgn * np.asarray(P.F_JOINT, float)
+            w3 = m3(bear(j, xn, yn, fj, 0.75 * h) * jn); assert w3.sum() > 0
             f = new()
             for d in range(2):
-                f[d::3] += P.F_JOINT[d] * w3 / w3.sum()
-            hk = np.zeros((NX + 1, NY + 1, NZ + 1), bool); hk[:, :, 0] = jn & P.hook_strip(j, xn, yn, 0.75 * h)
-            idx = np.nonzero(hk.ravel())[0]; assert idx.size > 0
-            f[3 * idx + 2] += P.F_JOINT_Z / idx.size
-            F.append(f); names.append("横梁·" + j["cn"])
+                f[d::3] += fj[d] * w3 / w3.sum()
+            ax_ = np.zeros((NX + 1, NY + 1, NZ + 1), bool)
+            if sgn > 0:     # 卡钩扣住外侧面（z = 0）往里拉
+                ax_[:, :, 0] = jn & P.hook_strip(j, xn, yn, 0.75 * h)
+            else:           # 梁身台肩顶住内侧面（z = T）往外推
+                ax_[:, :, self.NT] = jn & shapely.contains_xy(P.joint_rect(P.BEAM_W, P.BEAM_H, j), xn, yn) & ~shapely.contains_xy(P.joint_slot(j), xn, yn)
+            idx = np.nonzero(ax_.ravel())[0]; assert idx.size > 0
+            f[3 * idx + 2] += sgn * P.F_JOINT_Z / idx.size
+            return f
+        for j in P.JOINTS:
+            F.append(beam_case(j, 1)); names.append("横梁·" + j["cn"])
+        if self.beam_rev:
+            for j in P.JOINTS:
+                F.append(beam_case(j, -1)); names.append("横梁·" + j["cn"] + "反")
         if misuse:   # 与二维复核相同的误用工况：手肘撑在前部 / 转轴处 150 N，只看应力，不计入加权柔度
             f = new(); press(f, 10, 40, 150.0); F.append(f); names.append("前部误用150N")
             f = new(); press(f, 175, P.S_END, 150.0); F.append(f); names.append("后部误用150N")
@@ -1291,6 +1319,10 @@ def main():
     ap.add_argument("--mid", default=None, help="斜面中段不贴笔记本：s0,s1（沿斜面 mm），或 joints = 前、顶两个接口区之间；载荷只加在头尾")
     ap.add_argument("--gap", type=float, default=0.0, help="配 --mid：中段表皮条不固定，斜面下这么深（mm）以内固定为空，笔记本碰不到中段；0 = 只改载荷（复核旧设计用）")
     ap.add_argument("--legacy_top", action="store_true", help="旧的顶面加载节点（只在表皮条上，不含贴齐斜面的接口区；复现 2026-11-22 以前的结果用）")
+    ap.add_argument("--joint", choices=("block", "clamp", "clampfill"), default="block",
+                    help="横梁接口：block = 26×50 mm 接口区整块固定；clamp = 只固定方槽两端限位夹头，其余交给优化；clampfill = 再加上两臂之间的槽中段")
+    ap.add_argument("--legacy_slot", action="store_true", help="横梁面内力摊在整面受压槽壁上（旧做法）；默认只加在卡扣臂贴着的那几段")
+    ap.add_argument("--beam_rev", action="store_true", help="每个接口再加一个反向横梁工况（−F_JOINT 顶对面槽壁 + 台肩往外推），权重同正向")
     ap.add_argument("--kz", type=float, default=P.KZ)
     ap.add_argument("--penal", type=float, default=3.0)
     ap.add_argument("--maxit", type=int, default=220)
@@ -1317,7 +1349,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     M = Free3D(a.nz, kz=a.kz, skin=a.skin, lateral=a.lateral, warp=a.warp > 0, asm_z=a.asm_z, misuse=a.buck > 0, hxy=a.hxy, dz=a.dz,
-               mid=a.mid, gap=a.gap, legacy_top=a.legacy_top)
+               mid=a.mid, gap=a.gap, legacy_top=a.legacy_top, joint=a.joint, legacy_slot=a.legacy_slot,
+               beam_rev=a.beam_rev)
     NX, NY, NZ, h = M.NX, M.NY, M.NZ, M.h
     if M.mid:
         print(f"斜面中段 s = {M.mid[0]:.1f}–{M.mid[1]:.1f} mm 不贴笔记本：载荷只加在头尾" + (f"；中段斜面下 {M.gap:g} mm 以内固定为空" if M.gap > 0 else "（表皮条照旧固定）"), flush=True)
