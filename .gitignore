@@ -15,6 +15,10 @@ out/**/model_noinfill*/
 out/**/noinfill*.log
 out/**/model_noinfill*.log
 web/noinfill*_preview.html
+web/panel_contact_preview.html
+# 面板 / 后横梁接触优化：复核应力场（可由 --post_only 重新生成）；后横梁的试验结果没有采用
+out/**/*_contact/fields.npz
+out/**/beam_contact/
 # 远程跑完的标记、零散日志
 out/**/run_done*.txt
 out/*_rerun.log

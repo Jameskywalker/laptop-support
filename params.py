@@ -86,6 +86,7 @@ SLOT_CORNER_R = 0.6       # 方槽四角让位圆（打印内角会被喷嘴倒�
 ARM_T = 2.5               # 卡扣臂厚
 ARM_ROOT = 15.0           # 卡扣臂伸进梁身的长度（两侧开让位槽，加长弹性段、降低应变）
 RELIEF_W = 1.5            # 卡扣臂外侧让位槽宽
+SLIT_W = 1.5              # 卡扣臂内侧让位缝宽（扣入时臂往里弯 HOOK_H − CLEAR = 1.2 mm）；两臂之间其余部分实心（2026-11-22 前是整块挖空 25 × 15 mm）
 HOOK_H = 1.4              # 卡钩高度：扣住外侧面的搭接量 = HOOK_H - CLEAR = 1.2 mm
 HOOK_FLAT = 1.0           # 卡钩顶部平台长
 HOOK_RAMP = 3.0           # 导入斜面长
@@ -276,7 +277,8 @@ def mid_span(mid):
 
 def snap_end(sx, half, yc=0.0):
     """横梁/面板一端的卡扣，打印平面坐标：X 沿横向，支撑内侧面在 X = sx·half；Y 沿截面长边，卡扣中心在 Y = yc。
-    返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、两臂之间让位。"""
+    返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、臂内侧让位缝（SLIT_W），
+    两臂之间离支撑内侧面 0.5 mm 以内留空（不伸进方槽）。两臂之间原来整块挖空，卡扣和本体之间只剩两条台肩条连着。"""
     yA = TENON_H / 2; yI = yA - ARM_T
     uc = T + SNAP_PLAY; uL = uc + HOOK_FLAT + HOOK_RAMP
 
@@ -288,7 +290,9 @@ def snap_end(sx, half, yc=0.0):
         parts.append(Polygon([T_(uc, sy * (yA - 0.01)), T_(uc, sy * (yA + HOOK_H)), T_(uc + HOOK_FLAT, sy * (yA + HOOK_H)), T_(uL, sy * (yA - 0.01))]))
         w = RELIEF_W
         cuts.append(LineString([T_(-ARM_ROOT + w / 2, sy * (yA + w / 2)), T_(2, sy * (yA + w / 2))]).buffer(w / 2))
-    cuts.append(Polygon([T_(-ARM_ROOT, -yI), T_(3, -yI), T_(3, yI), T_(-ARM_ROOT, yI)]).buffer(-2).buffer(2))
+        s = SLIT_W
+        cuts.append(LineString([T_(-ARM_ROOT + s / 2, sy * (yI - s / 2)), T_(3, sy * (yI - s / 2))]).buffer(s / 2))
+    cuts.append(Polygon([T_(-0.5, -yI), T_(3, -yI), T_(3, yI), T_(-0.5, yI)]))
     return parts, cuts
 
 

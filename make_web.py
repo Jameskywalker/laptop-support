@@ -17,6 +17,20 @@ def b64(a):
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
 
 
+def panel_info():
+    """面板说明和刚度：有 panel_contact（卡扣按真实接触重新优化）就用它，否则用 panel.py 的复核"""
+    pc = f"{P.OUT_DIR}/panel_contact/verify.json"
+    if os.path.exists(pc):
+        v = json.load(open(pc)); r = {a["工况"]: (a, b) for a, b in zip(v["ref"], v["new"])}
+        tw = [b["柔度"] / a["柔度"] for k, (a, b) in r.items() if "绕法线" in k]
+        rk = r["侧向错动"]
+        return dict(note="前、顶两个接口合成一块；卡扣按真实接触（台肩、槽壁、卡钩单向接触）拓扑优化，四分之一对称，外框加三角桁架；平放打印，四角卡扣与横梁端头相同",
+                    spec=f"侧向错动的柔度是 X 斜撑版的 {rk[1]['柔度'] / rk[0]['柔度']:.2f}；单侧支撑绕面板法线扭 2 N·m 时是 {max(tw):.2f}")
+    v = json.load(open(f"{P.OUT_DIR}/panel/verify.json"))
+    return dict(note="前、顶两个接口合成一块，拓扑优化成 X 形斜撑；平放打印，四角卡扣与横梁端头相同",
+                spec=f"上部受 {v['fe'][0]['力_N']:g} N 横向力，卡扣处错动 {v['fe'][0]['加载点最大位移_mm'] * 1000:.1f} µm")
+
+
 def pack(fn):
     m = trimesh.load(fn)
     v = np.asarray(m.vertices); f = np.asarray(m.faces)
@@ -62,7 +76,7 @@ for v in ORDER:
         snap=snap_section(md),
         meshes=dict(support=pack(f"{md}/support_left.stl"), beam=pack(f"{md}/beam.stl"),
                     **({"panel": pack(f"{md}/panel.stl")} if P.panel_joints() else {})),
-        panel=json.load(open(f"{P.OUT_DIR}/panel/verify.json")) if P.panel_joints() else None,
+        panel=panel_info() if P.panel_joints() else None,
         profile=dict(ext=ring(pg.exterior.coords), holes=[ring(h.coords) for h in pg.interiors]),
         domain=ring(dom.exterior.coords),
         density=dict(w=nelx, h=nely, hmm=float(r["h"]), data=b64(np.clip(np.round(G * 255), 0, 255).astype(np.uint8))),
