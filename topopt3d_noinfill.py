@@ -352,7 +352,7 @@ class Pipeline:
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
     pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -376,6 +376,13 @@ class Pipeline:
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
         self.ground = ground or ground_r > 0                     # True：接地，见 ground_forward
         self.h_xy = h; self.isl_A = island_area; self.isl_b = island_beta      # 底面孤岛最小面积 mm²（0 = 不限），见 island_forward
+        self.isl_soft = island_soft; self.isl_conn = island_connect            # 可导近似：局部面积（island_soft_forward）/ 连到主框（island_connect_forward）
+        if island_soft > 0:
+            Rs_ = int(np.floor(island_soft / h + 1e-9)); os_ = np.arange(-Rs_, Rs_ + 1)
+            si, sj = np.meshgrid(os_, os_, indexing="ij")
+            self.isl_k = cp.asarray(((si * h) ** 2 + (sj * h) ** 2 <= island_soft ** 2 + 1e-9).astype(np.float64))
+        self.seed0 = self.fixed[:, :, 0] & (self.fval[:, :, 0] > 0.5)           # 主框的种子：贴床那层的固定实心格（接口区、固定条）
+        self.isl_maxit = 5000
         self.g_ker = None                                        # ground_r > 0：床面那层先在面内膨胀（圆盘，半径 ground_r mm）
         if ground_r > 0:
             Rg = int(np.floor(ground_r / h + 1e-9)); og = np.arange(-Rg, Rg + 1)
@@ -397,8 +404,9 @@ class Pipeline:
         xb, dxb = T2.project(xt, float(beta), 0.5)
         xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
         xa, ic = xb, None
-        if self.isl_A > 0 and beta >= self.isl_b:
-            xa, ic = self.island_forward(xa)
+        if (self.isl_A > 0 or self.isl_conn) and beta >= self.isl_b:
+            xa, ic = (self.island_connect_forward(xa) if self.isl_conn else
+                      self.island_soft_forward(xa) if self.isl_soft > 0 else self.island_forward(xa))
         if self.ground:
             xg, gc = self.ground_forward(xa)
             xi, c = self.am_forward(xg)
@@ -426,12 +434,79 @@ class Pipeline:
         lab, n = cnd.label(b0 > 0.5, structure=cp.ones((3, 3), dtype=bool))
         n = int(n)
         if n == 0:
-            return xb, dict(m=None, n=0, ns=0)
+            return xb, dict(kind="label", m=None, n=0, ns=0, msg=" 小孤岛=0/0")
         area = cp.bincount(lab.ravel(), minlength=n + 1) * (self.h_xy ** 2)
         small = area < self.isl_A; small[0] = False
         m = small[lab] & self.free[:, :, 0]
         xa = xb.copy(); xa[:, :, 0] = cp.where(m, 0.0, b0)
-        return xa, dict(m=m, n=n, ns=int(small.sum()))
+        return xa, dict(kind="label", m=m, n=n, ns=int(small.sum()), msg=f" 小孤岛={int(small.sum())}/{n}")
+
+    def island_soft_forward(self, xb):
+        """底面孤岛的可导近似①（局部面积）：贴床每格看半径 isl_soft 内贴床材料的面积 A_loc（按自己的密度归一：u = A_loc/(x̄_0+e)，
+        均匀灰度时 u = 整个圆盘面积，不偏），u 不到 isl_A 的格子按 g = ½(1+tanh(4(u/A−1))) 关掉：ξ_0 = x̄_0·g。
+        几个小点挨得近，彼此的面积算在一起 —— 梯度会鼓励把它们连成一片"""
+        b0 = xb[:, :, 0]; A = self.isl_A; kap = 4.0
+        Aloc = cnd.correlate(b0, self.isl_k, mode="constant", cval=0.0) * self.h_xy ** 2
+        den = b0 + 1e-3; u = Aloc / den
+        th = cp.tanh(kap * (u / A - 1.0)); gt_ = 0.5 * (1 + th); gp = 0.5 * kap / A * (1 - th * th)
+        free0 = self.free[:, :, 0]
+        xa = xb.copy(); xa[:, :, 0] = cp.where(free0, b0 * gt_, b0)
+        nb = (b0 > 0.5) & free0
+        ns = int((nb & (gt_ < 0.5)).sum())
+        return xa, dict(kind="soft", b0=b0, g=gt_, gp=gp, den=den, u=u, msg=f" 关掉的床面格={ns}/{int(nb.sum())}")
+
+    def island_connect_forward(self, xb):
+        """底面孤岛的可导近似②（连到主框）：从贴床那层的固定实心格（种子）出发，按十字邻域生长：
+        R ← min(x̄_0, max(R 自己和四邻))，收敛后 R(p) = 从主框沿材料走到 p 的所有路径里"最细处密度"的最大值。
+        二值时连得上 = 1、连不上 = 0；均匀灰度时 R = x̄_0，不偏。ξ_0 = R。
+        R 对 x̄_0 连续、分段线性（同 max/min），导数只落在路径最细的那一格 src(p) 上 —— 缺口格子有梯度：补上它，整串点都被托住。
+        （软最大值不行：偏低的话灰度场里每格衰减，偏高的话一块里的格子互相抬高，孤点也会"长"成连上）"""
+        b0 = xb[:, :, 0]; seed = self.seed0; NX, NY = b0.shape
+        idx = cp.arange(NX * NY, dtype=cp.int64).reshape(NX, NY)
+        R = cp.where(seed, 1.0, -1.0); src = cp.where(seed, -1, -2).astype(cp.int64)    # -1：种子（常数），-2：还没到
+        nit = 0
+        for it in range(self.isl_maxit):
+            M = R.copy(); Ms = src.copy()
+            for ax, s in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                C = cp.full_like(R, -1.0); Cs = cp.full_like(src, -2)
+                if ax == 0:
+                    if s == 1: C[1:] = R[:-1]; Cs[1:] = src[:-1]
+                    else: C[:-1] = R[1:]; Cs[:-1] = src[1:]
+                else:
+                    if s == 1: C[:, 1:] = R[:, :-1]; Cs[:, 1:] = src[:, :-1]
+                    else: C[:, :-1] = R[:, 1:]; Cs[:, :-1] = src[:, 1:]
+                bt = C > M
+                M = cp.where(bt, C, M); Ms = cp.where(bt, Cs, Ms)
+            reach = M >= 0
+            Rn = cp.where(seed, 1.0, cp.where(reach, cp.minimum(b0, M), -1.0))
+            srcn = cp.where(seed, -1, cp.where(reach, cp.where(b0 <= M, idx, Ms), -2))
+            nit = it + 1
+            if it % 10 == 9 and bool((Rn == R).all()):
+                R, src = Rn, srcn; break
+            R, src = Rn, srcn
+        Rf = cp.maximum(R, 0.0)
+        free0 = self.free[:, :, 0]
+        xa = xb.copy(); xa[:, :, 0] = cp.where(free0, Rf, b0)
+        nb = (b0 > 0.5) & free0
+        ns = int((nb & (Rf < 0.5)).sum())
+        return xa, dict(kind="connect", src=src, msg=f" 连不上主框的床面格={ns}/{int(nb.sum())}（{nit} 步）")
+
+    def island_backward(self, g, ic):
+        """dF/dξ_0 → dF/dx̄_0（各种底面孤岛处理）"""
+        if ic is None or ic.get("kind") == "label" and ic["m"] is None:
+            return g
+        g = g.copy(); G = g[:, :, 0]; free0 = self.free[:, :, 0]
+        if ic["kind"] == "label":
+            g[:, :, 0] = cp.where(ic["m"], 0.0, G)
+        elif ic["kind"] == "soft":
+            Gf = cp.where(free0, G, 0.0)
+            W = Gf * ic["b0"] * ic["gp"] / ic["den"]
+            g[:, :, 0] = cp.where(free0, Gf * ic["g"], G) + cnd.correlate(W, self.isl_k, mode="constant", cval=0.0) * self.h_xy ** 2 - W * ic["u"]
+        else:                                   # ξ_0(p) = x̄_0(src(p))：梯度加到最细处那一格
+            src = ic["src"]; Gf = cp.where(free0, G, 0.0); ok = src >= 0
+            gb0 = cp.bincount(src[ok].ravel(), weights=Gf[ok].ravel(), minlength=G.size).reshape(G.shape)
+            g[:, :, 0] = cp.where(free0, 0.0, G) + gb0
+        return g
 
     def ground_forward(self, xb):
         """接地：底面投影非空的地方才能有材料 —— 每一柱里各层的密度不超过床面那层，x̄_g,k = smin(x̄_k, x̄_0)。
@@ -526,9 +601,7 @@ class Pipeline:
             gq = cp.where(c["br"], gxe * c["q"], 0.0)
             gxi = (0.0 if gxi is None else gxi) + gq
             gdir = -gq * c["s"]
-        g = self.ground_backward(self.am_backward(gxi, c), c)
-        if c.get("isl") is not None and c["isl"]["m"] is not None:
-            g = g.copy(); g[:, :, 0] = cp.where(c["isl"]["m"], 0.0, g[:, :, 0])
+        g = self.island_backward(self.ground_backward(self.am_backward(gxi, c), c), c.get("isl"))
         gt = (g + gdir) * c["dxb"]
         if gxe is not None:
             gt = gt + gxe * c["s"] * c["dxe"]
@@ -1188,6 +1261,8 @@ def main():
     ap.add_argument("--sup_r", type=float, default=0.0, help="悬空面内膨胀半径 mm（> 0 时按膨胀后的面积计，见 SupportEst）")
     ap.add_argument("--ground", action="store_true", help="接地：底面投影非空才能有材料（每柱各层不超过床面那层）。配 45°：悬空龙骨不能伸到空床面上方，逼出尖拱管道 / 沙漏形；配 --no_am：悬空只能在有底板的地方")
     ap.add_argument("--island_area", type=float, default=0.0, help="底面孤岛最小面积 mm²：贴床那层面积更小的连通块不算打印（尖刺落在床面上的尖）；0 = 不限")
+    ap.add_argument("--island_soft", type=float, default=0.0, help="底面孤岛的可导近似①：按半径 r mm 内的贴床面积算（阈值用 --island_area）；导出时仍按精确的最小面积去掉")
+    ap.add_argument("--island_connect", action="store_true", help="底面孤岛的可导近似②：贴床那层要和主框（接口区、固定条）连通，软生长计算；导出时去掉连不上的块")
     ap.add_argument("--island_beta", type=float, default=0.0, help="β 达到这个值以后才限制底面孤岛（0 = 从头开始）")
     ap.add_argument("--ground_r", type=float, default=0.0, help="接地放宽：床面那层先在面内膨胀 r mm 再当底面（竖墙可按 45° 外扩到 r）；> 0 时自动打开 --ground")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
@@ -1251,8 +1326,12 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta)
-    if a.island_area > 0:
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect)
+    if a.island_connect:
+        print("底面孤岛（可导近似）：贴床那层要和主框连通（从固定实心格软生长）", flush=True)
+    elif a.island_soft > 0:
+        print(f"底面孤岛（可导近似）：半径 {a.island_soft:g} mm 内贴床面积不到 {a.island_area:g} mm² 的格子逐渐关掉", flush=True)
+    elif a.island_area > 0:
         print(f"底面孤岛：贴床那层面积小于 {a.island_area:g} mm² 的连通块不算打印" + (f"（β ≥ {a.island_beta:g} 起）" if a.island_beta > 0 else ""), flush=True)
     if a.ground or a.ground_r > 0:
         print("接地：每柱各层的密度不超过床面那层" + (f"在面内膨胀 {a.ground_r:g} mm 后的形状" if a.ground_r > 0 else "（底面投影非空才能有材料）"), flush=True)
@@ -1378,7 +1457,7 @@ def main():
                          buck=binfo, ks=fG))
         bs = (" 屈曲 λ " + " / ".join(f"{v:.1f}" for k, v in binfo.items() if k != "假模态比例") + f" KS−1={fG:+.3f}"
               + (f" 假模态{binfo['假模态比例']}" if "假模态比例" in binfo else "")) if binfo else ""
-        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs}{f" 支撑≈{sup/1000:.2f}cm³ 总目标={ctot:.4f}" if supest is not None else ""}{f" 小孤岛={cache['isl']['ns']}/{cache['isl']['n']}" if cache.get("isl") else ""} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
+        print(f"it {it:3d} 目标/二维={c:.4f}（翘曲项 {pen / w.dot(comps_b):.4f}）用料/目标={mratio:.3f}{bs}{f" 支撑≈{sup/1000:.2f}cm³ 总目标={ctot:.4f}" if supest is not None else ""}{cache['isl']['msg'] if cache.get("isl") else ""} ch={change:.3f} β={beta:g} 灰度={grey:.3f} "
               f"CG={sum(its)} {time.time()-ti:.1f}s t={time.time()-t0:.0f}s", flush=True)
         if it % 20 == 0:
             fig_layers(M, cp.asnumpy(xi), f"{a.out}/layers_it{it}.png", f"it={it} β={beta:g} 加权柔度/二维={c:.3f}")

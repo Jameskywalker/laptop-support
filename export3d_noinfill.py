@@ -29,7 +29,7 @@ import topopt3d_noinfill as N
 
 
 # ---------------- 二值化与清理 ----------------
-def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0):
+def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_connect=False):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
     B00 = B; n_small = 0
@@ -37,6 +37,11 @@ def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, isla
         lab0, n0 = label(B[:, :, 0], structure=np.ones((3, 3), bool))
         small = np.bincount(lab0.ravel(), minlength=n0 + 1) * M.h ** 2 < island_area; small[0] = False
         B = B.copy(); B[:, :, 0] &= ~(small[lab0] & d3[:, :, 0]); n_small = int(small.sum())
+    if island_connect:                                      # 连到主框：贴床那层（4 连通）不含固定实心格的块去掉
+        lab0, n0 = label(B[:, :, 0])
+        fix0 = (M.E_fix[:, :, 0] > 0) & ~d3[:, :, 0]
+        keep = np.zeros(n0 + 1, bool); keep[np.unique(lab0[fix0 & B[:, :, 0]])] = True; keep[0] = True
+        B = B.copy(); B[:, :, 0] &= ~(~keep[lab0] & d3[:, :, 0]); n_small += int((~keep).sum())
     B0 = B
     if ground or ground_r > 0:                              # 接地：床面那层（膨胀 ground_r 后）没料的柱子整柱去掉
         g0 = B[:, :, 0]
@@ -313,7 +318,7 @@ def main():
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
-    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0), island_area=float(ha.get("island_area") or 0.0))
+    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0), island_area=float(ha.get("island_area") or 0.0), island_connect=bool(ha.get("island_connect")))
     _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
     sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
                            e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
