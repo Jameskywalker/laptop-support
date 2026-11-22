@@ -1328,7 +1328,7 @@ def main():
     a.rmin_used = rmin
     pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect)
     if a.island_connect:
-        print("底面孤岛（可导近似）：贴床那层要和主框连通（从固定实心格软生长）", flush=True)
+        print("底面孤岛（可导近似）：贴床那层要和主框连通（从固定实心格按 min/max 生长，梯度落在路径最细处）", flush=True)
     elif a.island_soft > 0:
         print(f"底面孤岛（可导近似）：半径 {a.island_soft:g} mm 内贴床面积不到 {a.island_area:g} mm² 的格子逐渐关掉", flush=True)
     elif a.island_area > 0:
