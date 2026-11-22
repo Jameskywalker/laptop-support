@@ -6,7 +6,7 @@
 :root {
   --bg: #ECEFF2; --panel: #FFFFFF; --fg: #17202A; --muted: #5A6773; --line: #D2D9E0;
   --accent: #2958CC; --accent-fg: #FFFFFF; --view: #E2E7EC; --bed: #C7D0D8; --grid: #AEB9C4;
-  --flat: #6E8AA8; --ref: #8A96A3;
+  --flat: #6E8AA8; --ref: #8A96A3; --c2: #C4622D; --c3: #8E5CC9;
   --v0: #440154; --v1: #3B528B; --v2: #21918C; --v3: #5EC962; --v4: #FDE725;
   --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Hiragino Sans GB", system-ui, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -14,11 +14,11 @@
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --bg: #0E1318; --panel: #151C23; --fg: #E2E8EE; --muted: #8C99A6; --line: #27313B;
   --accent: #7FA4FF; --accent-fg: #0E1318; --view: #111820; --bed: #26313C; --grid: #3A4652;
-  --flat: #7F9BBA; --ref: #6F7C89; color-scheme: dark } }
+  --flat: #7F9BBA; --ref: #6F7C89; --c2: #E8915A; --c3: #B38CF0; color-scheme: dark } }
 :root[data-theme="dark"] {
   --bg: #0E1318; --panel: #151C23; --fg: #E2E8EE; --muted: #8C99A6; --line: #27313B;
   --accent: #7FA4FF; --accent-fg: #0E1318; --view: #111820; --bed: #26313C; --grid: #3A4652;
-  --flat: #7F9BBA; --ref: #6F7C89; color-scheme: dark }
+  --flat: #7F9BBA; --ref: #6F7C89; --c2: #E8915A; --c3: #B38CF0; color-scheme: dark }
 body { background: var(--bg); color: var(--fg); font-family: var(--sans); line-height: 1.55 }
 .wrap { max-width: 1320px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 22px 36px; display: grid; gap: 18px }
 header { display: grid; gap: 6px; max-width: 72ch }
@@ -71,15 +71,17 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
 
 .cmp td.num b { font-weight: 600 }
 .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: baseline }
-.sw.free { background: var(--accent) } .sw.gable { background: var(--v2) } .sw.flat { background: var(--ref) }
-.bar i.gable { background: var(--v2) }
-.bar.two { height: 12px } .bar.two i { height: 5px; bottom: auto } .bar.two i.gable { top: 6px }
+/* 设计配色：c0 = 本次，c1… = 对照，flat = 二维方案 */
+.sw.c0, .bar i.c0 { background: var(--accent) } .sw.c1, .bar i.c1 { background: var(--v2) } .sw.c2, .bar i.c2 { background: var(--c2) } .sw.c3, .bar i.c3 { background: var(--c3) }
+.sw.flat { background: var(--ref) }
+.bar.multi i { bottom: auto }
+.cmp.many td.barc { width: 26% }
 </style>
 
 <div class="wrap">
   <header>
     <div class="eyebrow">DESK40 · 40° 前挡落桌 · 单侧支撑 · 不用稀疏填充</div>
-    <h1>无填充支撑</h1>
+    <h1 id="title">无填充支撑</h1>
     <p id="lead">直接在三维体素上做拓扑优化，不从二维结果出发。打印时侧面贴床，内部不用稀疏填充：模型里有材料的地方都是实心，空腔和封顶的拱由优化给出。每个体素都要落在下一层的十字邻域上，所以斜面不超过 45°，空腔顶部收成尖拱。</p>
   </header>
   <div class="main">
@@ -133,34 +135,43 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   const fmt = (v, d) => Number(v).toFixed(d);
   const des = D.designs, byKey = Object.fromEntries(des.map(d => [d.key, d]));
-  const ck = D.cmpKey || 'gable', sh = D.short || { free: '三维', gable: '尖拱', flat: '二维' };
-  const free = byKey.free, gable = byKey[ck], flat = byKey.flat;
+  const sh = D.short || { free: '三维', gable: '尖拱', flat: '二维' };
+  const free = byKey.free, flat = byKey.flat;
+  const others = des.filter(d => d.key !== 'free' && d.key !== 'flat'), cmpD = [free, ...others];   // 对照设计（尖拱空腔或别的三维结果）
+  const num = (v, d) => (v == null ? '—' : fmt(v, d));
+  const alt = (get) => { const xs = others.map(d => [d, get(d)]).filter(([, v]) => v != null); return xs.length ? '（' + xs.map(([d, v]) => sh[d.key] + ' ' + v).join('、') + '）' : ''; };
+  if (D.title) { document.title = D.title; $('title').textContent = D.title; }
 
   // ---------- 面板 ----------
   const pct = (r) => (r < 1 ? '低 ' + Math.round((1 - r) * 100) + '%' : '高 ' + Math.round((r - 1) * 100) + '%');
   if (D.leadExtra) $('lead').textContent += D.leadExtra;
   $('lead').textContent += '同样用料下，加权柔度比二维方案' + pct(free.weighted) + '（越低越硬）。';
   const facts = [
-    ['单片用料（PETG）', fmt(free.mass, 0) + ' g（二维 ' + fmt(flat.mass, 0) + '）'],
-    ['加权柔度（二维 = 1）', fmt(free.weighted, 2) + '（' + sh[ck] + ' ' + fmt(gable.weighted, 2) + '）'],
-    ['封闭空腔', D.cavities.length + ' 个，共 ' + fmt(D.cavities.reduce((a, b) => a + b, 0), 0) + ' mm³'],
-    ['悬空（> 45°，宽 > 2 mm）', fmt(D.overhang.area, 1) + ' mm²'],
-    ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²'],
+    ['单片用料（PETG）', fmt(free.mass, 0) + ' g（' + [...others, flat].map(d => sh[d.key] + ' ' + fmt(d.mass, 0)).join('、') + '）'],
+    ['加权柔度（二维 = 1）', fmt(free.weighted, 2) + alt(d => fmt(d.weighted, 2))],
+    ['封闭空腔', D.cavities.length + ' 个，共 ' + fmt(D.cavities.reduce((a, b) => a + b, 0), 0) + ' mm³' + alt(d => d.cav ? d.cav.length + ' 个 ' + fmt(d.cav.reduce((a, b) => a + b, 0), 0) + ' mm³' : null)],
+    ['悬空（> 45°，宽 > 2 mm）', fmt(D.overhang.area, 1) + ' mm²' + alt(d => d.oh != null ? fmt(d.oh, 1) : null)],
+    ['收顶短桥（宽 ≤ 2 mm）', fmt(D.overhang.bridge, 1) + ' mm²' + alt(d => d.bridge != null ? fmt(d.bridge, 1) : null)],
     ['薄壁', D.thinFact || ('最薄 ' + fmt(D.h, 2) + ' mm（3 层），占有料面积 ' + Math.round(D.thin * 100) + '%')],
     ['网格', D.hxy ? ('优化用 ' + fmt(D.hxy, 2) + ' × ' + fmt(D.hxy, 2) + ' × ' + fmt(D.h, 2) + ' mm 扁体素（层向 = 打印层高，厚度方向 ' + D.nz + ' 层）')
               : ('优化用 ' + fmt(D.h, 3) + ' mm 立方体素（厚度方向 ' + D.nz + ' 格）' + (D.layer ? '；STL 平滑后按 ' + fmt(D.layer, 1) + ' mm 打印层重建' : ''))],
     ...(D.padsInfo ? [['TPU 垫', D.padsInfo]] : []),
   ];
   $('facts').innerHTML = facts.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
-  const xmax = Math.max(1.25, ...D.cases.map(c => Math.max(free.rel[c], gable.rel[c])));
-  $('comp').innerHTML = '<tr><th>工况</th><th class="num"><span class="sw free"></span>' + sh.free + '</th><th class="num"><span class="sw gable"></span>' + sh[ck] + '</th><th></th></tr>' + D.cases.map(c =>
-    '<tr><td>' + c + '</td><td class="num"><b>' + fmt(free.rel[c], 2) + '</b></td><td class="num">' + fmt(gable.rel[c], 2) + '</td><td class="barc"><div class="bar two"><i style="width:' +
-    (free.rel[c] / xmax * 100).toFixed(1) + '%"></i><i class="gable" style="width:' + (gable.rel[c] / xmax * 100).toFixed(1) + '%"></i><b style="left:' + (100 / xmax).toFixed(1) + '%"></b></div></td></tr>').join('') +
-    '<tr><td><b>加权</b></td><td class="num"><b>' + fmt(free.weighted, 2) + '</b></td><td class="num">' + fmt(gable.weighted, 2) + '</td><td></td></tr>';
+  const xmax = Math.max(1.25, ...D.cases.flatMap(c => cmpD.map(d => d.rel[c] || 0)));
+  const nb = cmpD.length, hb = nb <= 2 ? 5 : 3;                          // 每个设计一条细条，上下叠放
+  const bars = (get) => '<div class="bar multi" style="height:' + (nb * (hb + 1) - 1) + 'px">' + cmpD.map((d, i) => get(d) == null ? '' :
+    '<i class="c' + i + '" style="top:' + i * (hb + 1) + 'px;height:' + hb + 'px;width:' + (get(d) / xmax * 100).toFixed(1) + '%"></i>').join('') +
+    '<b style="left:' + (100 / xmax).toFixed(1) + '%"></b></div>';
+  const cells = (get) => cmpD.map((d, i) => '<td class="num">' + (i ? '' : '<b>') + num(get(d), 2) + (i ? '' : '</b>') + '</td>').join('');
+  $('comp').classList.toggle('many', nb > 2);
+  $('comp').innerHTML = '<tr><th>工况</th>' + cmpD.map((d, i) => '<th class="num"><span class="sw c' + i + '"></span>' + sh[d.key] + '</th>').join('') + '<th></th></tr>' +
+    D.cases.map(c => '<tr><td>' + c + '</td>' + cells(d => d.rel[c]) + '<td class="barc">' + bars(d => d.rel[c]) + '</td></tr>').join('') +
+    '<tr><td><b>加权</b></td>' + cells(d => d.weighted) + '<td class="barc">' + bars(d => d.weighted) + '</td></tr>';
   const rows = [['屈曲系数 · 前部', 'buck_f', 1], ['屈曲系数 · 后部', 'buck_r', 1], ['应力 99.9% · 前部 MPa', 'vm_f', 1], ['应力 99.9% · 后部 MPa', 'vm_r', 1],
                 ['侧向位移 · 后部 µm', 'z_r', 0]];
-  $('mis').innerHTML = '<tr><th></th><th class="num"><span class="sw flat"></span>' + sh.flat + '</th><th class="num"><span class="sw gable"></span>' + sh[ck] + '</th><th class="num"><span class="sw free"></span>' + sh.free + '</th></tr>' +
-    rows.map(([k, f, d]) => '<tr><td>' + k + '</td>' + [flat, gable, free].map(x => '<td class="num">' + fmt(x[f], d) + '</td>').join('') + '</tr>').join('');
+  $('mis').innerHTML = '<tr><th></th>' + cmpD.map((d, i) => '<th class="num"><span class="sw c' + i + '"></span>' + sh[d.key] + '</th>').join('') + '<th class="num"><span class="sw flat"></span>' + sh.flat + '</th></tr>' +
+    rows.map(([k, f, d]) => '<tr><td>' + k + '</td>' + [...cmpD, flat].map(x => '<td class="num">' + num(x[f], d) + '</td>').join('') + '</tr>').join('');
   $('notes').innerHTML = D.notes.map(t => '<li>' + t + '</li>').join('');
 
   // 模型按钮

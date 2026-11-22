@@ -42,47 +42,64 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=f"{P.OUT_DIR}/model_noinfill")
     ap.add_argument("--tol", type=float, default=0.06)
-    ap.add_argument("--cmp-dir", default=None, help="另一次导出的目录，取它的三维设计作对照（比值各按它自己的二维方案算），例如孔位改动前的那次")
-    ap.add_argument("--names", default="新孔位三维,新孔位,旧孔位三维,旧孔位", help="--cmp-dir 时的标签：本次全称,本次简称,对照全称,对照简称")
+    ap.add_argument("--cmp-dir", nargs="+", default=None, help="另外一次或几次导出的目录，取它们的三维设计作对照（比值各按它自己的二维方案算），例如孔位改动前的那次")
+    ap.add_argument("--names", default="新孔位三维,新孔位,旧孔位三维,旧孔位", help="--cmp-dir 时的标签：本次全称,本次简称，再按 --cmp-dir 的顺序每个对照一对 全称,简称")
+    ap.add_argument("--title", default=None, help="页面标题（默认「无填充支撑」）")
+    ap.add_argument("--out", default="web/noinfill_preview.html")
     ap.add_argument("--lead", default="横梁孔上移 5 mm、接口区贴齐斜面后重新优化；", help="--cmp-dir 时导语前面加的话")
     ap.add_argument("--cmp-note", default="旧孔位三维：孔中心离斜面 18 mm 时的上一版（屈曲 ≥ 20、最薄 1.9 mm），比值按它自己那时的二维方案算。")
     a = ap.parse_args()
     ver = json.load(open(f"{a.dir}/verify.json"))
     res = {r["key"]: dict(r, label=nm) for nm, r in ver["results"].items()}
-    if a.cmp_dir:
-        v2 = json.load(open(f"{a.cmp_dir}/verify.json"))
-        res["free_old"] = [dict(r, label=nm, key="free_old") for nm, r in v2["results"].items() if r["key"] == "free"][0]
+    cdirs = a.cmp_dir or []
+    ckeys = ["free_old"] if len(cdirs) == 1 else [f"cmp{i + 1}" for i in range(len(cdirs))]
+    cver = {}
+    for k, d in zip(ckeys, cdirs):
+        cver[k] = json.load(open(f"{d}/verify.json"))
+        res[k] = [dict(r, label=nm, key=k) for nm, r in cver[k]["results"].items() if r["key"] == "free"][0]
     names = ver["names"]
-    cases = [c for c in names if c not in ("侧推后段", "z向体力", "前部误用150N", "后部误用150N")]
-    iF, iR = names.index("前部误用150N"), names.index("后部误用150N")
-    cmp = "free_old" if "free_old" in res else "gable"
-    keys = ("free", cmp, "flat")
+    cases = [c for c in names if c not in ("侧推后段", "前部误用150N", "后部误用150N")]
+    cmpk = ckeys or ["gable"]
+    cmp = cmpk[0]
+    keys = ("free", *cmpk, "flat")
     ha = ver["args"]
     cons = bool(ha.get("buck") or ha.get("tmin"))
     designs = []
     for k in keys:
         r = res[k]
         st = r["stress"]
-        designs.append(dict(key=k, label=r["label"], mass=r["petg_g"], weighted=r["weighted_orig"],
-                            rel={c: r["rel"][names.index(c)] for c in cases},
-                            buck_f=r["buckling"]["前部误用150N"], buck_r=r["buckling"]["后部误用150N"],
-                            vm_f=st[iF]["VM_99_9pct_MPa"], vm_r=st[iR]["VM_99_9pct_MPa"],
-                            z_f=st[iF]["z向位移_mm"] * 1000, z_r=st[iR]["z向位移_mm"] * 1000))
+        v = cver.get(k, ver); nk = v["names"]
+        iF, iR = nk.index("前部误用150N"), nk.index("后部误用150N")
+        dd = dict(key=k, label=r["label"], mass=r["petg_g"], weighted=r["weighted"],       # 加权：全部优化工况（含 z 向体力）
+                  rel={c: r["rel"][nk.index(c)] for c in cases if c in nk},
+                  buck_f=r["buckling"]["前部误用150N"], buck_r=r["buckling"]["后部误用150N"],
+                  vm_f=st[iF]["VM_99_9pct_MPa"], vm_r=st[iR]["VM_99_9pct_MPa"],
+                  z_f=st[iF]["z向位移_mm"] * 1000, z_r=st[iR]["z向位移_mm"] * 1000)
+        if k in cver or k == "free":                                                      # 三维设计各自的网格检查
+            dd.update(cav=v["mesh"]["cavities_mm3"], oh=v["overhang"]["悬空总面积_mm2"], bridge=v["overhang"]["短桥面积_mm2"],
+                      joint=v["args"].get("joint", "block"))
+        designs.append(dd)
     src = dict(free=f"{a.dir}/support_noinfill_left.stl", gable=f"{a.dir}/support_gable_left.stl",
-               free_old=(f"{a.cmp_dir}/support_noinfill_left.stl" if a.cmp_dir else
-                         f"{a.dir}/support_ref_left.stl" if os.path.exists(f"{a.dir}/support_ref_left.stl") else f"{ver.get('ref_model_dir')}/support_noinfill_left.stl"))
-    meshes = {k: display_mesh(src[k], a.tol) for k in ("free", cmp)}
+               free_old=(f"{a.dir}/support_ref_left.stl" if os.path.exists(f"{a.dir}/support_ref_left.stl") else f"{ver.get('ref_model_dir')}/support_noinfill_left.stl"))
+    src.update({k: f"{d}/support_noinfill_left.stl" for k, d in zip(ckeys, cdirs)})
+    meshes = {k: display_mesh(src[k], a.tol) for k in ("free", *cmpk)}
     meshes["flat"] = trimesh.load(f"{P.MODEL_DIR}/support_left.stl")
     nm4 = a.names.split(",")
-    labels = dict(free=nm4[0] if a.cmp_dir else "新三维" if cons else "无填充三维", free_old=nm4[2] if a.cmp_dir else "旧三维（无约束）", gable="尖拱空腔", flat="二维方案")
-    short = dict(free=nm4[1] if a.cmp_dir else "新三维" if cons else "三维", free_old=nm4[3] if a.cmp_dir else "旧三维", gable="尖拱", flat="二维")
+    assert not cdirs or len(nm4) == 2 + 2 * len(cdirs), "--names 要给 本次全称,本次简称 + 每个 --cmp-dir 一对 全称,简称"
+    labels = dict(free=nm4[0] if a.cmp_dir else "新三维" if cons else "无填充三维", free_old="旧三维（无约束）", gable="尖拱空腔", flat="二维方案")
+    short = dict(free=nm4[1] if a.cmp_dir else "新三维" if cons else "三维", free_old="旧三维", gable="尖拱", flat="二维")
+    for i, k in enumerate(ckeys):
+        labels[k], short[k] = nm4[2 + 2 * i], nm4[3 + 2 * i]
     Ls = np.eye(4); Ls[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]; Ls[:3, 3] = [-P.SPACING / 2 - P.T / 2, 0, 0]
     Rs = np.diag([-1, 1, 1, 1]) @ Ls
     rear = [j for j in P.JOINTS if j.get("part", "beam") == "beam"][0]
     m0 = meshes["free"]
     gw = ver.get("gable_wall_mm")
+    blk = [short[k] for k in ckeys if cver[k]["args"].get("joint", "block") == "block"]
     notes = [
-        "打印：侧面贴床，不加支撑。切片时内部按实心打印（墙圈数加够，或稀疏填充设 100%）；三个横梁接口区加修改器，仍用 4 圈墙 + 15–25% 填充。",
+        "打印：侧面贴床，不加支撑。切片时内部按实心打印（墙圈数加够，或稀疏填充设 100%）；" +
+        ("三个横梁接口区加修改器，仍用 4 圈墙 + 15–25% 填充。" if ha.get("joint", "block") == "block" else
+         "横梁接口只剩方槽两端的实心夹头，整件都按实心打印，不用修改器" + (f"（{'、'.join(blk)}仍要在三个接口区加修改器）" if blk else "") + "。"),
         ("没有封闭空腔（体素模型里两个十几 mm³ 的小空腔，顶是平的，在补 45° 斜坡时被补实了）。" if not ver["mesh"]["cavities_mm3"] else
          "封闭空腔留在零件里面，FDM 不用清理。" + ("空腔顶部按 45° 逐层收成尖顶，不用搭桥。" if ver["overhang"]["短桥面积_mm2"] < 1 else "空腔顶部最后一层是跨度不到 2 mm 的短桥。")),
         "左右两片是镜像件，都是 z = 0 的那面贴床；装配时这一面朝外，卡钩扣在这一面。",
@@ -99,11 +116,12 @@ def main():
                         f"再按 {sm['layer_mm']:g} mm 打印层重建：伸出超过 45° 的地方在下面补斜坡，再削掉补不到的细边，用料调回原值；复核数据也是按平滑后的形状算的。")
     B = np.load(f"{a.dir}/binary.npz")["B"]
     t = B.sum(2); thin = float((t[t > 0] <= 1).mean())          # 只有一层体素厚的柱子占比
-    th = res["free"].get("thin"); tho = res.get(cmp, {}).get("thin")
+    th = res["free"].get("thin"); tho = [(short[k], res[k]["thin"]) for k in cmpk if res.get(k, {}).get("thin")]
+    alt = lambda f: ("（" + "、".join(f"{s} {t[f] * 100:.1f}%" for s, t in tho) + "）") if tho else ""
     thin_fact = None
     if th:
-        thin_fact = (f"比 {th['tmin_mm']:g} mm 薄的部分占体积 {th['薄于tmin体积比例'] * 100:.1f}%" + (f"（{short[cmp]} {tho['薄于tmin体积比例'] * 100:.0f}%）" if tho else "")
-                     + f"；只有一层体素厚的柱子 {th['单层柱子比例'] * 100:.1f}%" + (f"（{short[cmp]} {tho['单层柱子比例'] * 100:.0f}%）" if tho else ""))
+        thin_fact = (f"比 {th['tmin_mm']:g} mm 薄的部分占体积 {th['薄于tmin体积比例'] * 100:.1f}%" + alt("薄于tmin体积比例")
+                     + f"；只有一层体素厚的柱子 {th['单层柱子比例'] * 100:.1f}%" + alt("单层柱子比例"))
     if cons:
         notes.insert(0, f"这一版在优化里加了两个约束：两个 150 N 误用工况的线性屈曲系数 ≥ {ha.get('buck', 0):g}（按腐蚀后的设计算，偏保守），"
                         f"最小厚度 {ha.get('tmin', 0):g} mm（比它薄的板和杆在腐蚀设计里消失，只吃料不出力）。")
@@ -113,7 +131,7 @@ def main():
         pj = json.load(open(f"{P.OUT_DIR}/pads/pads.json"))
         pads_info = (f"U 形卡套，每片支撑 {len(pj['parts'])} 件（{'、'.join(pj['parts'])}），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
-    data = dict(T=P.T, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
+    data = dict(T=P.T, title=a.title, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
                 leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=(int(round(P.T / ha["dz"])) if ha.get("dz") else int(ha["nz"])), h=(ha["dz"] if ha.get("dz") else P.T / int(ha["nz"])),
                 hxy=(ha.get("hxy") or None), layer=(sm["layer_mm"] if sm else ha.get("dz")), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
                 center=[float(m0.bounds[:, 0].mean()), float(m0.bounds[:, 1].mean())], xmax=float(m0.bounds[1, 0]),
@@ -125,7 +143,7 @@ def main():
                 beam=pack(trimesh.load(f"{P.MODEL_DIR}/beam.stl")), panel=pack(trimesh.load(f"{P.MODEL_DIR}/panel.stl")),
                 pads=pack(trimesh.load(pads_stl)) if pads_info else None, padsInfo=pads_info)
     html = open("web/template_noinfill.html", encoding="utf-8").read().replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
-    open("web/noinfill_preview.html", "w", encoding="utf-8").write(html)
+    open(a.out, "w", encoding="utf-8").write(html)
     print("网格面数", {k: len(m.faces) for k, m in meshes.items()}, f"；页面 {len(html)/1e6:.2f} MB")
 
 

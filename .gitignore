@@ -14,7 +14,7 @@ out/**/noinfill*/
 out/**/model_noinfill*/
 out/**/noinfill*.log
 out/**/model_noinfill*.log
-web/noinfill_preview.html
+web/noinfill*_preview.html
 # 远程跑完的标记、零散日志
 out/**/run_done*.txt
 out/*_rerun.log
