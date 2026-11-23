@@ -1,37 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
-# 中间结果（可由脚本重新生成）
-out/**/coarse_nojoint/
-out/raised25/fine_nonrobust/
-out/**/profile.pkl
-# 三维优化试验的输出（体积大、可由 topopt3d.py / export3d.py / make_web3d.py 重新生成）
-out/**/topo3d/
-out/**/model3d/
-web/support3d_preview.html
-# 无填充三维优化的输出（同上，可由 topopt3d_noinfill.py / export3d_noinfill.py / make_web_noinfill.py 重新生成）
-out/**/noinfill*/
-out/**/model_noinfill*/
-out/**/noinfill*.log
-out/**/model_noinfill*.log
-web/noinfill*_preview.html
-web/panel_contact_preview.html
-# 面板 / 后横梁接触优化：复核应力场（可由 --post_only 重新生成）；后横梁的试验结果没有采用
-out/**/*_contact/fields.npz
-out/**/beam_contact/
-# 远程跑完的标记、零散日志
-out/**/run_done*.txt
-out/*_rerun.log
-# 插指 + U 形卡子试验：STL / STEP 可由 clip_trial.py --skip_fe 重新生成
-out/**/clip_trial/*.stl
-out/**/clip_trial/*.step
-# 面板 / 后横梁三维优化（link3d.py）：试算的各次结果、粗网格那步、大文件（STL、result.npz、过程图）不提交；
-# 选定那次只留 report.json、history.json、binary.npz（二值体素，--post_only 可据此重新复核、导出 STL）
-out/**/link3d_runs/
-out/**/link3d_*_h1/
-out/**/link3d_*/*.stl
-out/**/link3d_*/result.npz
-out/**/link3d_*/layers_it*.png
-web/link3d_preview.html
-# STEP 不提交（拓扑优化轮廓是几千段短折线，每段一个面，单个装配体就几十 MB；build3d.py / run_all.sh 会重新导出）。2026-11-23 已从历史里删掉
-out/**/*.step
+# 仓库只放源文件。计算结果、导出的模型、过程图都可以由脚本重新生成，不提交（2026-11-23 已从历史里删掉）：
+#   run_all.sh（二维支撑、面板、横梁、装配体、网页）、run_noinfill.sh（无填充三维支撑）、run_link3d.sh（三维面板 / 后横梁）、
+#   clip_trial.py（插指 + U 形卡子）、pads.py（TPU 垫）
+out/
+# make_web*.py 由 web/template*.html 生成的预览网页
+web/*_preview.html

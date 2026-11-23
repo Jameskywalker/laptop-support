@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 在租的 GPU 机器上（Vast.ai，镜像 vastai/base-image）装环境：解包代码 → uv + Python 3.12 → requirements-gpu（不装 build123d）→ 试 CuPy。
-# 本地先打包：git archive --format=tar.gz -o remote_bundle.tar.gz HEAD -- $(git ls-files '*.py') requirements.txt requirements-gpu.txt out/desk40/model/profile.json
+# 本地先打包（out/ 不在仓库里，从工作区打包；要先跑过 run_all.sh 生成 profile.json）：
+#   tar czf remote_bundle.tar.gz $(git ls-files '*.py') requirements.txt requirements-gpu.txt out/desk40/model/profile.json
+# 跑三维面板 / 后横梁（run_link3d.sh）还要带上 out/desk40/clip_trial/*_outline.json
 # 再 scp remote_bundle.tar.gz 和本脚本到 /workspace/，ssh 上去 bash /workspace/setup.sh（5090 上约 1 分钟）
 set -euo pipefail
 mkdir -p /workspace/laptop_support && cd /workspace/laptop_support
