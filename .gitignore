@@ -33,3 +33,5 @@ out/**/link3d_*/*.stl
 out/**/link3d_*/result.npz
 out/**/link3d_*/layers_it*.png
 web/link3d_preview.html
+# STEP 不提交（拓扑优化轮廓是几千段短折线，每段一个面，单个装配体就几十 MB；build3d.py / run_all.sh 会重新导出）。2026-11-23 已从历史里删掉
+out/**/*.step

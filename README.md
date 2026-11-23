@@ -445,6 +445,8 @@ STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/mode
 | `clip_trial/` | 插指 + U 形卡子试验：横梁、面板、卡子的轮廓，接触复核 `report.json` |
 | `link3d_beam/`、`link3d_panel/` | 后横梁、面板的无填充三维优化（插指版）：`report.json`（新旧零件各工况复核）、`binary.npz`（二值体素） |
 
+仓库里不放 STEP（`model/*.step`，单个装配体就几十 MB），跑 `run_all.sh`（或只跑 `build3d.py`）会重新导出；STL 照常提交。
+
 ## 打印与装配
 
 1. **材料**：建议 PETG（笔记本底部常有 40–50 °C，PLA 软化温度约 55–60 °C，长期受力容易蠕变）。层高 0.2 mm，4 圈墙，20–25% gyroid 填充，上下各 4 层实心，**不需要加支撑**。
