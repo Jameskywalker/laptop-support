@@ -86,6 +86,7 @@ SLOT_CORNER_R = 0.6       # 方槽四角让位圆（打印内角会被喷嘴倒�
 ARM_T = 2.5               # 卡扣臂厚
 ARM_ROOT = 15.0           # 卡扣臂伸进梁身的长度（两侧开让位槽，加长弹性段、降低应变）
 RELIEF_W = 1.5            # 卡扣臂外侧让位槽宽
+SLIT_W = 1.5              # 卡扣臂内侧让位缝宽（扣入时臂往里弯 HOOK_H − CLEAR = 1.2 mm）；两臂之间其余部分实心（2026-11-22 前是整块挖空 25 × 15 mm）
 HOOK_H = 1.4              # 卡钩高度：扣住外侧面的搭接量 = HOOK_H - CLEAR = 1.2 mm
 HOOK_FLAT = 1.0           # 卡钩顶部平台长
 HOOK_RAMP = 3.0           # 导入斜面长
@@ -276,7 +277,8 @@ def mid_span(mid):
 
 def snap_end(sx, half, yc=0.0):
     """横梁/面板一端的卡扣，打印平面坐标：X 沿横向，支撑内侧面在 X = sx·half；Y 沿截面长边，卡扣中心在 Y = yc。
-    返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、两臂之间让位。"""
+    返回 (要并上的多边形, 要挖掉的多边形)：两条卡扣臂 + 卡钩 + 导入斜面；臂外侧让位槽、臂内侧让位缝（SLIT_W），
+    两臂之间离支撑内侧面 0.5 mm 以内留空（不伸进方槽）。两臂之间原来整块挖空，卡扣和本体之间只剩两条台肩条连着。"""
     yA = TENON_H / 2; yI = yA - ARM_T
     uc = T + SNAP_PLAY; uL = uc + HOOK_FLAT + HOOK_RAMP
 
@@ -288,7 +290,9 @@ def snap_end(sx, half, yc=0.0):
         parts.append(Polygon([T_(uc, sy * (yA - 0.01)), T_(uc, sy * (yA + HOOK_H)), T_(uc + HOOK_FLAT, sy * (yA + HOOK_H)), T_(uL, sy * (yA - 0.01))]))
         w = RELIEF_W
         cuts.append(LineString([T_(-ARM_ROOT + w / 2, sy * (yA + w / 2)), T_(2, sy * (yA + w / 2))]).buffer(w / 2))
-    cuts.append(Polygon([T_(-ARM_ROOT, -yI), T_(3, -yI), T_(3, yI), T_(-ARM_ROOT, yI)]).buffer(-2).buffer(2))
+        s = SLIT_W
+        cuts.append(LineString([T_(-ARM_ROOT + s / 2, sy * (yI - s / 2)), T_(3, sy * (yI - s / 2))]).buffer(s / 2))
+    cuts.append(Polygon([T_(-0.5, -yI), T_(3, -yI), T_(3, yI), T_(-0.5, yI)]))
     return parts, cuts
 
 
@@ -297,6 +301,69 @@ def snap_strain():
     delta = HOOK_H - CLEAR
     L = ARM_ROOT + T + SNAP_PLAY
     return 1.5 * ARM_T * delta / L ** 2
+
+
+# ---------------- 刚性插指 + U 形卡子（2026-11-22 试验：SNAP_END=clip） ----------------
+# 端头不再用弹性卡扣臂：两根实心插指正好占住原来卡扣臂和它往里弯的口袋（|y| FING_IN–15），
+# 后接口槽中间那根穿槽斜撑（clampfill 的设计区）可以保留。插指伸出支撑外侧面，外侧各开一个缺口；
+# U 形卡子从截面短边方向压进去：两条实心腿夹在支撑外侧面和缺口外壁之间，承受往外拔的力；
+# 中间两条细卡扣往里弯一下、卡钩扣住插指底面，只管卡子自己不掉，弯的方向和受力方向垂直。
+SNAP_END = os.environ.get("SNAP_END", "arm")      # "arm" = 弹性卡扣臂（现在），"clip" = 插指 + 卡子
+FING_IN = KEEP_U0 + 0.3        # 插指内侧面 |y| = 11.1（离 clampfill 让位口袋内端 0.3 mm）
+FING_LEN = 24.0                # 插指从支撑内侧面量起的长度
+NECK_Y = 13.5                  # 缺口处插指只剩 |y| ∈ [FING_IN, NECK_Y]
+CLIP_T = 5.0                   # 卡子厚（沿横梁轴向）
+CLIP_PLAY = 0.2                # 卡子腿和缺口外壁之间的间隙
+NOTCH_U0 = T - 0.2             # 缺口从支撑外侧面里面 0.2 mm 开始：卡子腿只压支撑，不碰缺口内壁
+NOTCH_U1 = T + CLIP_T + CLIP_PLAY                 # 缺口外壁 = 20.2
+LEG_Y = (NECK_Y + 0.2, 19.0)   # 卡子腿 |y| 范围：压在支撑外侧面 |y| 15.2–19（夹头实心区 |u| ≤ 20）
+CLIP_ARM_T = 2.0               # 中间细卡扣宽（弯的方向）
+CLIP_HOOK = 0.8                # 卡钩扣住插指底面的搭接
+CLIP_GAP = 0.2                 # 卡子横梁和插指顶面、卡钩和插指底面之间的间隙
+NOTCH_R = 0.0                  # 缺口内角倒圆半径（卡子腿对应倒角）
+
+
+def clip_end(sx, half, yc=0.0):
+    """插指端头，打印平面坐标同 snap_end。返回 (要并上的, 要挖掉的)：两根插指；插指外侧缺口；两插指之间离支撑内侧面 0.5 mm 以内留空"""
+    def T_(u, y):
+        return (sx * (half + u), yc + y)
+
+    def B(u0, u1, y0, y1):
+        return Polygon([T_(u0, y0), T_(u1, y0), T_(u1, y1), T_(u0, y1)])
+    parts, cuts = [], []
+    for sy in (1, -1):
+        y0, y1 = sorted([sy * FING_IN, sy * TENON_H / 2])
+        parts.append(B(-1.0, FING_LEN, y0, y1))
+        n0, n1 = sorted([sy * NECK_Y, sy * (TENON_H / 2 + 1.0)])
+        c = B(NOTCH_U0, NOTCH_U1, n0, n1)
+        cuts.append(c.buffer(-NOTCH_R, quad_segs=8).buffer(NOTCH_R, quad_segs=8) if NOTCH_R > 0 else c)
+    cuts.append(B(-0.5, FING_LEN + 1.0, -FING_IN, FING_IN))
+    return parts, cuts
+
+
+def end_geometry(sx, half, yc=0.0, style=None):
+    return (clip_end if (style or SNAP_END) == "clip" else snap_end)(sx, half, yc)
+
+
+def clip_outline():
+    """U 形卡子的打印轮廓（平面朝下打印，厚 CLIP_T）：x 沿截面长边（插指 y），y 沿截面短边（v，0 = 横梁中面，卡子从 +v 一侧压进去）"""
+    h = BEAM_W / 2
+    top0 = h + CLIP_GAP; top1 = top0 + 4.0
+    a1 = FING_IN - 0.3; a0 = a1 - CLIP_ARM_T; hk = FING_IN + CLIP_HOOK
+    hb = -h - CLIP_GAP                     # 卡钩扣合面
+    g = [box(-LEG_Y[1], top0, LEG_Y[1], top1)]
+    for s in (1, -1):
+        g.append(box(*sorted([s * LEG_Y[0], s * LEG_Y[1]])[:1], -h - 1.0, *sorted([s * LEG_Y[0], s * LEG_Y[1]])[1:], top0 + 0.01))
+        # 卡钩下端只伸到插指底面下 1.5 mm：后接口离支撑底边只有 5 mm，后脚套侧壁包到底边上方 3 mm
+        pts = [(a0, top0 + 0.01), (a0, hb - 1.3), (a1, hb - 1.3), (hk, hb - 0.4), (hk, hb), (a1, hb), (a1, top0 + 0.01)]
+        g.append(Polygon([(s * x, y) for x, y in pts]))
+    return shapely.unary_union(g)
+
+
+def clip_strain():
+    """卡子中间细卡扣扣入时的最大弯曲应变（悬臂梁 ε = 1.5·t·δ/L²，L 从卡子横梁到卡钩中部）"""
+    L = (BEAM_W / 2 + CLIP_GAP) + (BEAM_W / 2 + CLIP_GAP + 0.4)
+    return 1.5 * CLIP_ARM_T * CLIP_HOOK / L ** 2
 
 
 def geometry(use_joint=USE_JOINT):

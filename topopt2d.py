@@ -289,11 +289,12 @@ def main():
     optimize(m, F, names, imp, free, fixed, a, thick=P.T, vf_mode=P.VF_MODE, t0=t0)
 
 
-def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_groups=None, t0=None, escale=None, cnorm=None):
+def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_groups=None, t0=None, escale=None, cnorm=None, sym=None):
     """SIMP + 密度过滤 + Heaviside 投影（可选鲁棒三场）+ β 续进 + OC。结果写到 a.out。
     fe_groups 不给时所有工况共用约束 free；给了就按组用不同约束（MultiFE）。
     escale：每个单元的刚度系数（默认全 1），比如非设计实体按打印结构（墙 + 填充）折算时用
-    cnorm：各工况柔度的归一化基准（默认第一轮灰度设计的柔度）；给参考设计的柔度时，目标就是"相对参考设计的柔度比"加权和"""
+    cnorm：各工况柔度的归一化基准（默认第一轮灰度设计的柔度）；给参考设计的柔度时，目标就是"相对参考设计的柔度比"加权和
+    sym：对称平均算子（nel × nel 稀疏矩阵，每行在一个单元的对称像上取平均）；给了就每轮把灵敏度和设计变量对称化"""
     t0 = t0 or time.time()
     os.makedirs(a.out, exist_ok=True)
     H, Hs = build_filter(m, a.rmin, getattr(a, "pad_void", False))
@@ -316,6 +317,8 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
         host = np.asarray
         print("后端: CPU（PARDISO）")
     dev = nx.asarray
+    if sym is not None:
+        sym = nsp.csr_matrix(sym) if a.gpu else sym
     vmask = m.active if vf_mode == "active" else m.in_dom      # 体积约束统计的区域
     nd = int(vmask.sum())
     Hs = dev(Hs); KEd = dev(KE); imp = dev(imp); edof = dev(m.edof); vmf = dev(vmask.astype(float))
@@ -360,6 +363,8 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
         if a.robust and (it == 1 or it % 10 == 0):
             xi_, _ = physics(x, beta, 0.5)
             vd_star = a.vf * float(xdd[vidx].mean()) / max(float(xi_[vidx].mean()), 1e-9)
+        if sym is not None:
+            dc = sym @ dc; dv = sym @ dv
         dc[inact] = 0; dc = nx.minimum(dc, -1e-30)
         dv = nx.maximum(dv, 1e-30)
         move = 0.1 if beta < 8 else 0.05
@@ -375,6 +380,8 @@ def optimize(m, F, names, imp, free, fixed, a, thick, vf_mode="active", fe_group
             else: l2 = lm
         change = float(nx.abs(xn - xa).max())
         x[act] = xn
+        if sym is not None:
+            x = sym @ x; x[solid] = 1.0; x[void] = 0.0
         xe, dxe = physics(x, beta, eta_e)
         xp, _ = physics(x, beta, 0.5)
         vol = float(xp[vidx].mean())

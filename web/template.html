@@ -248,7 +248,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
       right:  {name: '支撑（右）', dims: dimS, mass: MASS.support_each, note: '与左边是同一个零件，只是装配时翻过来', color: '--part'},
       beam:   {name: '横梁 × ' + BJ.length, dims: dimB, mass: MASS.beam, note: (BJ.length > 1 ? BJ.length + ' 根是同一个零件（' + BJ.map(function(j){ return j.cn; }).join(' / ') + '），打印 ' + BJ.length + ' 份；' : '在' + BJ.map(function(j){ return j.cn; }).join('') + '接口；') + '40 mm 宽面贴床，两端卡扣，不用螺钉', color: '--beam'}
     };
-    if (PN) PARTS.panel = {name: '面板', dims: dimP, mass: MASS.panel, note: '前、顶两个接口合成一块，拓扑优化成 X 形斜撑；平放打印，四角卡扣与横梁端头相同', color: '--beam'};
+    if (PN) PARTS.panel = {name: '面板', dims: dimP, mass: MASS.panel, note: (V.panel && V.panel.note) || '前、顶两个接口合成一块，平放打印，四角卡扣与横梁端头相同', color: '--beam'};
   }
 
   /* ---------- 规格单 ---------- */
@@ -269,7 +269,7 @@ code{font-family:var(--f-mono);font-size:12px;color:var(--ink)}
       ['最小特征', '杆宽 ' + info.min_member_mm + ' mm · 孔宽 ' + info.min_hole_mm + ' mm'],
       ['150 N 误用', '最大应力 ' + maxVM.toFixed(1) + ' MPa' + (atLip ? '（在前挡区）' : '')]
     ];
-    if (PN && V.panel) specs.push(['面板侧向刚度', '上部受 ' + V.panel.fe[0]['力_N'] + ' N 横向力，卡扣处错动 ' + (V.panel.fe[0]['加载点最大位移_mm'] * 1000).toFixed(1) + ' µm']);
+    if (PN && V.panel) specs.push(['面板刚度', V.panel.spec]);
     $('#specs').innerHTML = specs.map(function(r){ return '<dt>' + r[0] + '</dt><dd>' + r[1] + '</dd>'; }).join('');
     $('#parts').innerHTML = Object.keys(PARTS).map(function(k){
       var p = PARTS[k];

@@ -15,7 +15,8 @@ for v in ${VARIANTS[@]}; do
   export STAND_VARIANT=$v
   $PY topopt2d.py --robust --h 1 --rmin 4 --maxit 450 "${GPU_FLAG[@]}"
   $PY postprocess.py
-  $PY panel.py "${GPU_FLAG[@]}"      # 有面板的方案：面板拓扑优化 + 轮廓 + 复核；没有则跳过
+  $PY panel.py "${GPU_FLAG[@]}"      # 有面板的方案：面板拓扑优化（卡扣当刚性夹住，X 斜撑）→ 作为下一步的参考设计；没有则跳过
+  $PY panel_contact.py "${GPU_FLAG[@]}"   # 卡扣按真实接触、加支撑扭转工况、四分之一对称重新优化 → out/<方案>/panel_contact/（build3d 用这个）
   $PY build3d.py
   $PY render.py
   if [ "${PADS:-0}" = 1 ]; then      # 可选：TPU 卡套（顶面垫、前挡垫、前后脚套），检查和支撑的贴合

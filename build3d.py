@@ -10,6 +10,7 @@
 """
 import json
 import math
+import os
 import shapely
 from shapely.geometry import Polygon, LineString, box
 from shapely.geometry.polygon import orient
@@ -90,7 +91,8 @@ parts = {"support_left": support_left, "support_right": support_right, "beam": b
 # 面板（前、顶两个接口合成一块，见 panel.py）：打印坐标的 Y=0 在前卡扣中心，所以按前接口摆放
 panel_w = None
 if P.panel_joints():
-    po = json.load(open(f"{P.OUT_DIR}/panel/panel_outline.json"))
+    pfn = f"{P.OUT_DIR}/panel_contact/panel_outline.json"          # 卡扣按真实接触重新优化的面板（panel_contact.py），没有就用 panel.py 的
+    po = json.load(open(pfn if os.path.exists(pfn) else f"{P.OUT_DIR}/panel/panel_outline.json"))
     panel = extrude_poly(Polygon(po["exterior"], po["holes"]), P.PANEL_T)
     parts["panel"] = panel
     panel_w = at_joint(panel, P.panel_joints()[0])

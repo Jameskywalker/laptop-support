@@ -73,7 +73,8 @@ core_h = P.BEAM_W - skin; core_w = P.BEAM_H - 2 * wall
 v_beam = (Lb * (P.BEAM_H * P.BEAM_W - core_w * core_h) + Lb * core_w * core_h * 0.15) / 1000
 v_panel = 0.0
 if HAS_PANEL:     # 面板平放打印：四周为墙、上下为表皮、中间填充，与支撑同一算法
-    _po = json.load(open(f"{P.OUT_DIR}/panel/panel_outline.json"))
+    _pfn = f"{P.OUT_DIR}/panel_contact/panel_outline.json"          # 与 build3d 相同：有卡扣按真实接触重新优化的面板就用它
+    _po = json.load(open(_pfn if os.path.exists(_pfn) else f"{P.OUT_DIR}/panel/panel_outline.json"))
     pp = Polygon(_po["exterior"], _po["holes"])
     v_panel = ((pp.area - pp.buffer(-wall).area) * P.PANEL_T + pp.buffer(-wall).area * skin + pp.buffer(-wall).area * (P.PANEL_T - skin) * 0.15) / 1000
 chk["print_mass_g_est"] = dict(support_each=round(v_sup * 1.24), beam=round(v_beam * 1.24), beams=NB, panel=round(v_panel * 1.24),
