@@ -22,3 +22,6 @@ out/**/beam_contact/
 # 远程跑完的标记、零散日志
 out/**/run_done*.txt
 out/*_rerun.log
+# 插指 + U 形卡子试验：STL / STEP 可由 clip_trial.py --skip_fe 重新生成
+out/**/clip_trial/*.stl
+out/**/clip_trial/*.step
