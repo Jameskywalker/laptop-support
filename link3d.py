@@ -58,11 +58,11 @@ def part_layout(part, H=None, width=None):
     if part == "panel":
         import panel as PN
         lay = dict(VC=[float(v) for v in PN.VC], VLEN=float(PN.VLEN), V0=float(PN.V0), joints=[("L", 0), ("L", 1), ("R", 0), ("R", 1)],
-                   H=float(H or P.PANEL_T), ref=f"{P.OUT_DIR}/clip_trial/panel_clip_outline.json", mass_g=83.0)
+                   H=float(H or P.PANEL_T), ref=f"{P.OUT_DIR}/clip_trial/panel_clip_outline.json", mass_g=60.0)
     else:
         W = float(width or 80.0)
         lay = dict(VC=[W / 2], VLEN=W, V0=W / 2, joints=[("L", 0), ("R", 0)], H=float(H or 32.0),
-                   ref=f"{P.OUT_DIR}/clip_trial/beam_clip_outline.json", mass_g=53.0)
+                   ref=f"{P.OUT_DIR}/clip_trial/beam_clip_outline.json", mass_g=30.0)
     assert lay["H"] >= TS
     return lay
 
@@ -222,26 +222,33 @@ class Case:
         self.group = "面内"
 
 
-def make_cases(G):
+def make_cases(G, preset="relaxed"):
+    """preset:
+      'relaxed'（默认）：按装配后面板 + 后横梁协同受力的主次分配权重——面内主工况占 ~85%，孤立面外/单接口扭转降为 ~15% 保底；
+      'legacy'：旧版面内 / 面外各占 50% 的权重。"""
     J = {q: i for i, q in enumerate(G.joints)}
     f, M = F_LOAD, M_LOAD
     one = lambda q, **ld: ([J[q]], ld)
     C = []
     if G.part == "panel":
         left, right = [J[("L", 0)], J[("L", 1)]], [J[("R", 0)], J[("R", 1)]]
-        C += [Case(G, "侧向错动", 1.0, [one(("L", 0)), one(("R", 0)), one(("L", 1), ta=f / 2), one(("R", 1), ta=f / 2)]),
-              Case(G, "撑开", 0.5, [one(("L", 0)), one(("L", 1)), one(("R", 0), ta=f / 2), one(("R", 1), ta=f / 2)]),
-              Case(G, "前后错动", 0.5, [one(("L", 0)), one(("R", 0)), one(("L", 1), tv=f / 2), one(("R", 1), tv=-f / 2)])]
+        w_rack, w_sp, w_fb = (1.5, 1.0, 1.0) if preset == "relaxed" else (1.0, 0.5, 0.5)
+        C += [Case(G, "侧向错动", w_rack, [one(("L", 0)), one(("R", 0)), one(("L", 1), ta=f / 2), one(("R", 1), ta=f / 2)]),
+              Case(G, "撑开", w_sp, [one(("L", 0)), one(("L", 1)), one(("R", 0), ta=f / 2), one(("R", 1), ta=f / 2)]),
+              Case(G, "前后错动", w_fb, [one(("L", 0)), one(("R", 0)), one(("L", 1), tv=f / 2), one(("R", 1), tv=-f / 2)])]
+        ew = dict(rz=0.25, tz=0.15, ra=0.10, rv=0.10) if preset == "relaxed" else dict(rz=0.5, tz=0.5, ra=0.5, rv=0.5)
         ext = (("绕法线", "rz", M, "转"), ("法向错动", "tz", f, ""), ("绕横向轴", "ra", M, "扭"), ("绕斜面方向轴", "rv", M, "转"))
     else:
         left, right = [J[("L", 0)]], [J[("R", 0)]]
-        C += [Case(G, "撑开", 0.5, [(left, {}), (right, dict(ta=f))]),
-              Case(G, "压拢", 0.5, [(left, {}), (right, dict(ta=-f))]),
-              Case(G, "前后错动", 1.0, [(left, {}), (right, dict(tv=f))])]
+        w_sp, w_sq, w_fb = (1.5, 1.5, 1.0) if preset == "relaxed" else (0.5, 0.5, 1.0)
+        C += [Case(G, "撑开", w_sp, [(left, {}), (right, dict(ta=f))]),
+              Case(G, "压拢", w_sq, [(left, {}), (right, dict(ta=-f))]),
+              Case(G, "前后错动", w_fb, [(left, {}), (right, dict(tv=f))])]
+        ew = dict(rz=0.15, tz=0.15, ra=0.10, rv=0.10) if preset == "relaxed" else dict(rz=0.5, tz=0.5, ra=0.5, rv=0.5)
         ext = (("绕竖直轴", "rz", M, "转"), ("上下错动", "tz", f, ""), ("绕横向轴", "ra", M, "扭"), ("绕前后轴", "rv", M, "转"))
     for nm, key, val, verb in ext:
         for sg, sn in ((1, "正"), (-1, "反")):
-            c = Case(G, f"右支撑{nm}{sn}{verb}", 0.5, [(left, {}), (right, {key: sg * val})])
+            c = Case(G, f"右支撑{nm}{sn}{verb}", ew[key], [(left, {}), (right, {key: sg * val})])
             c.group = "面内" if key == "rz" else "面外"
             C.append(c)
     return C
@@ -760,9 +767,10 @@ def main():
     ap.add_argument("--h", type=float, default=0.5)
     ap.add_argument("--H", type=float, default=None, help="杆身最大厚度 mm（面板默认 16，后横梁默认 32）")
     ap.add_argument("--width", type=float, default=None, help="后横梁设计范围前后总宽（默认 80）")
-    ap.add_argument("--mass_g", type=float, default=None, help="用料目标 g（面板默认 83，后横梁 53；按 1.24 g/cm³ 实心）")
+    ap.add_argument("--mass_g", type=float, default=None, help="用料目标 g（面板默认 60，后横梁 30；按 1.24 g/cm³ 实心）")
+    ap.add_argument("--weights", choices=("relaxed", "legacy"), default="relaxed", help="工况权重方案：relaxed（默认，面内主承力 ~85% / 面外保底 ~15%）或 legacy（旧 50/50）")
     ap.add_argument("--no_open", action="store_true", help="面板不加透空约束")
-    ap.add_argument("--open_scale", type=float, default=1.0, help="面板投影面积上限 = 现在面板 × 此值")
+    ap.add_argument("--open_scale", type=float, default=1.4, help="面板投影面积上限 = 现在面板 × 此值（默认 1.4，仍保留约 58% 透空）")
     ap.add_argument("--rmin", type=float, default=1.2)
     ap.add_argument("--x0", type=float, default=0.5, help="均匀初值（0 = 按用料目标）")
     ap.add_argument("--pmean", type=float, default=1.0, help="目标 = 各工况柔度比的 q 次幂平均（1 = 加权平均）")
@@ -799,7 +807,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
     G = Geo(a.part, a.h, a.H, a.width)
-    c = G.contacts(); cases = make_cases(G)
+    c = G.contacts(); cases = make_cases(G, a.weights)
     print(f"{a.part}: 网格 {G.NX}×{G.NY}×{G.NZ}（h={G.h} mm，厚 {G.H} mm），{G.NX * G.NY * G.NZ / 1e6:.2f} M 体素；设计 {int(G.design3.sum()) / 1e6:.2f} M，"
           f"固定实心 {G.solid3.sum() * G.vox / 1000:.2f} cm³", flush=True)
     kinds = {}
@@ -816,7 +824,9 @@ def main():
         q.act = r.pop("act")
     fe.drop()
     ref_C = np.array([r["柔度"] for r in ref])
-    rep = dict(part=a.part, grid=[G.NX, G.NY, G.NZ], h=G.h, H=G.H, ref_mass_g=round(mref / 1000 * RHO, 1), ref_proj_mm2=A_ref, ref=ref,
+    rep = dict(part=a.part, grid=[G.NX, G.NY, G.NZ], h=G.h, H=G.H, weights_preset=a.weights, weights=[float(q.w) for q in cases],
+               open_scale=None if (a.part != "panel" or a.no_open) else a.open_scale,
+               ref_mass_g=round(mref / 1000 * RHO, 1), ref_proj_mm2=A_ref, ref=ref,
                contacts=kinds, t_ref_s=round(time.time() - t0, 1))
     if a.check:
         fig_check(G, cases, ref, f"{out}/check.png")

@@ -29,17 +29,21 @@ def pack(fn, tol):
 
 def part_data(part, specs, tol):
     cur = f"{P.OUT_DIR}/clip_trial/{part}_clip.stl"
-    designs, ratios, names, groups = [], {}, None, None
+    reps = []
     for spec in specs:
         label, d = spec.split("=", 1)
-        rep = json.load(open(f"{d}/report.json"))
-        if names is None:
-            names = [r["工况"] for r in rep["new"]]; groups = [r["组"] for r in rep["new"]]
-            ref = rep
+        reps.append((label, d, json.load(open(f"{d}/report.json"))))
+    ref = reps[0][2]
+    names = [r["工况"] for r in ref["new"]]; groups = [r["组"] for r in ref["new"]]
+    # 同一零件下的多个对比方案用同一套权重算加权柔度：优先用含 weights 字段的方案（新版 relaxed），否则回退旧权重
+    w_src = next((rep["weights"] for _, _, rep in reps if "weights" in rep), None)
+    w = np.array(w_src, float) if w_src is not None else np.array([1.0 if (part, n) in (("panel", "侧向错动"), ("beam", "前后错动")) else 0.5 for n in names])
+    gi = np.array([g == "面内" for g in groups])
+    designs, ratios = [], {}
+    for label, d, rep in reps:
         key = os.path.basename(os.path.normpath(d))
         ratios[key] = [round(float(x), 3) for x in rep["ratio"]]
-        w = np.array([1.0 if (part, n) in (("panel", "侧向错动"), ("beam", "前后错动")) else 0.5 for n in names])   # 同 link3d.make_cases
-        r = np.array(rep["ratio"]); gi = np.array([g == "面内" for g in groups])
+        r = np.array(rep["ratio"])
         designs.append(dict(key=key, label=label, mass_g=rep["mass_g"], proj=rep.get("proj_mm2"), h=rep["h"],
                             weighted=round(float(w @ r / w.sum()), 3), inplane=round(float(w[gi] @ r[gi] / w[gi].sum()), 3),
                             outplane=round(float(w[~gi] @ r[~gi] / w[~gi].sum()), 3), mesh=pack(f"{d}/{part}_3d.stl", tol)))
