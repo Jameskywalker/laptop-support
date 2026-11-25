@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--out", default="web/noinfill_preview.html")
     ap.add_argument("--lead", default="横梁孔上移 5 mm、接口区贴齐斜面后重新优化；", help="--cmp-dir 时导语前面加的话")
     ap.add_argument("--cmp-note", default="旧孔位三维：孔中心离斜面 18 mm 时的上一版（屈曲 ≥ 20、最薄 1.9 mm），比值按它自己那时的二维方案算。")
+    ap.add_argument("--link-tol", type=float, default=0.08, help="三维面板 / 后横梁显示网格简化容差 mm")
     a = ap.parse_args()
     ver = json.load(open(f"{a.dir}/verify.json"))
     res = {r["key"]: dict(r, label=nm) for nm, r in ver["results"].items()}
@@ -131,6 +132,18 @@ def main():
         pj = json.load(open(f"{P.OUT_DIR}/pads/pads.json"))
         pads_info = (f"U 形卡套，每片支撑 {len(pj['parts'])} 件（{'、'.join(pj['parts'])}），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
+    # 装配视图里的连接件（面板 + 后横梁）：自动收录已生成的三维优化版（正式 0.5 mm、轻量化 1 mm）和二维旧版，可在网页里切换
+    link_cands = [
+        ("link3d", "三维正式 83g/51g", f"{P.OUT_DIR}/link3d_beam/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel/panel_3d.stl", True),
+        ("link3d_light", "三维轻量 60g/29g", f"{P.OUT_DIR}/link3d_beam_light_h1/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel_light_h1/panel_3d.stl", True),
+        ("flat2d", "二维旧版", f"{P.MODEL_DIR}/beam.stl", f"{P.MODEL_DIR}/panel.stl", False),
+    ]
+    links = []
+    for k, lbl, bf, pf, simp in link_cands:
+        if os.path.exists(bf) and os.path.exists(pf):
+            bm = display_mesh(bf, a.link_tol) if simp else trimesh.load(bf)
+            pm_ = display_mesh(pf, a.link_tol) if simp else trimesh.load(pf)
+            links.append(dict(key=k, label=lbl, beam=pack(bm), panel=pack(pm_)))
     data = dict(T=P.T, title=a.title, thin=thin, thinFact=thin_fact, cmpKey=cmp, short=short,
                 leadExtra=((a.lead if a.cmp_dir else "") + (f"这一版加了屈曲系数 ≥ {ha.get('buck', 0):g} 和最小厚度 {ha.get('tmin', 0):g} mm 两个约束。" if cons else "")), nz=(int(round(P.T / ha["dz"])) if ha.get("dz") else int(ha["nz"])), h=(ha["dz"] if ha.get("dz") else P.T / int(ha["nz"])),
                 hxy=(ha.get("hxy") or None), layer=(sm["layer_mm"] if sm else ha.get("dz")), warp=float(ha.get("warp", 0.0)), bed=[P.BED_W, P.BED_D],
@@ -140,7 +153,7 @@ def main():
                 models=[dict(key=k, label=labels[k], mesh=pack(meshes[k])) for k in keys],
                 supportMats=[Ls.ravel().round(6).tolist(), Rs.ravel().round(6).tolist()],
                 beamMat=T_beam(rear).ravel().round(6).tolist(), panelMat=T_beam(P.panel_joints()[0]).ravel().round(6).tolist(),
-                beam=pack(trimesh.load(f"{P.MODEL_DIR}/beam.stl")), panel=pack(trimesh.load(f"{P.MODEL_DIR}/panel.stl")),
+                links=links, beam=links[0]["beam"], panel=links[0]["panel"],
                 pads=pack(trimesh.load(pads_stl)) if pads_info else None, padsInfo=pads_info)
     html = open("web/template_noinfill.html", encoding="utf-8").read().replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     open(a.out, "w", encoding="utf-8").write(html)

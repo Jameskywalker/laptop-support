@@ -65,7 +65,14 @@ def thin_stats(M, B, tmin):
     rz = tmin / 2 / M.dz; Rz = int(np.ceil(rz)); oz = np.arange(-Rz, Rz + 1)
     di, dj, dk = np.meshgrid(o, o, oz, indexing="ij")
     ball = (di / r) ** 2 + (dj / r) ** 2 + (dk / rz) ** 2 <= 1 + 1e-9         # 扁体素时是椭球（物理上仍是直径 tmin 的球）
-    thin = S & ~binary_opening(S, structure=ball) & M.design3
+    if ball.size > 500:                                                      # 超细网格（如 0.2³）用精确欧氏距离变换做球开运算，快几十倍
+        rad = tmin / 2.0
+        d1 = distance_transform_edt(np.pad(S, 1), sampling=(M.h, M.h, M.dz))[1:-1, 1:-1, 1:-1]
+        core = d1 > rad + 1e-9
+        opened = distance_transform_edt(~core, sampling=(M.h, M.h, M.dz)) <= rad + 1e-9 if core.any() else np.zeros_like(S)
+    else:
+        opened = binary_opening(S, structure=ball)
+    thin = S & ~opened & M.design3
     sol = S & M.design3
     t = sol.sum(2)
     return dict(tmin_mm=tmin, 薄于tmin体积比例=round(float(thin.sum() / max(1, sol.sum())), 4),
@@ -257,8 +264,8 @@ def build_mesh(M, F, step=1, fine=None):
     mesh = mesh - extrude(M.keepout_geom, -1, P.T + 1)       # 方槽（clampfill 时只是两端卡扣臂的口袋）
     if fine is not None:
         mesh = mesh.simplify(0.02)          # 0.02 mm 以内合并近似共面的三角形，面数降到约 1/4
-    elif M.dz != M.h:
-        mesh = mesh.simplify(0.01)          # 扁体素：表面全是平台阶，合并共面三角形（不然 STL 有几百 MB）
+    elif M.dz != M.h or M.h <= P.LAYER_H + 1e-6:
+        mesh = mesh.simplify(0.01)          # 扁体素 / 0.2 mm 细体素：表面全是平台阶，合并共面三角形（不然 STL 有几百 MB）
     return mesh
 
 
@@ -324,8 +331,8 @@ def main():
         print(f"横梁接口：{M.joint_mode}" + ("；横梁面内力摊在整面槽壁上（旧做法）" if M.legacy_slot else ""), flush=True)
     if M.mid or M.legacy_top:
         print(f"顶面载荷：" + (f"中段 s = {M.mid[0]:.1f}–{M.mid[1]:.1f} 不加载（中段空隙 {M.gap:g} mm）" if M.mid else "") + ("旧加载节点" if M.legacy_top else ""), flush=True)
-    if M.dz != M.h and smooth_on:
-        print("扁体素：层向已经是打印层高，不做平滑（--smooth 只用于立方体素）", flush=True)
+    if (M.dz != M.h or M.dz <= P.LAYER_H + 1e-6) and smooth_on:
+        print("层向已经是打印层高，不做平滑（--smooth 只用于粗立方体素）", flush=True)
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
@@ -333,6 +340,7 @@ def main():
     _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
     sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
                            e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
+    del _S; cp.get_default_memory_pool().free_all_blocks()
     print(f"估算树状支撑（阈值 {ha.get('sup_angle', 30.0):g}°）：{sup_est/1000:.2f} cm³", flush=True)
     print("二值化：", info, flush=True)
     fine = None

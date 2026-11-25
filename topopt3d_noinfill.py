@@ -26,6 +26,7 @@ from shapely.geometry import Polygon, box
 from scipy.ndimage import distance_transform_edt, label
 import cupy as cp
 import cupyx.scipy.ndimage as cnd
+import cupyx.scipy.fft as cfft
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -350,19 +351,25 @@ class Pipeline:
     fixed：固定体素（实心或空）的掩码，fval 是它们的值；固定实心都是从床面起的整柱，天然有支撑。
     最小厚度（eta_e 不为 None）：同一个过滤场再按更高的阈值 η_e 投影，得到"腐蚀"设计 ξ_e = ξ·x̄_e（乘上 ξ 带上支撑情况）。
     刚度、屈曲都按 ξ_e 算、用料按 ξ 算：比最小厚度薄的杆件 / 板腐蚀后就没了，只吃料不出力，优化自然不要它们。
-    pad_void：过滤时网格外（床面以下、顶面以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，厚度只要求一半。"""
+    pad_void：腐蚀设计过滤时网格外（床面以下、厚度 T 以上）按空，不按网格内的邻居归一 —— 否则贴床的板按镜像算，
+    厚度只要求一半。打印设计 x̄（阈值 0.5）始终按有效厚度内（0 ≤ k < nt）的邻居归一，否则层向体素细（如 dz = 0.2 mm）
+    时床面那层即使全实心 x̃ 也只剩 ~0.55，窄墙掉到 0.5 以下、贴床直接断开并沿 AM 滤波往上整片塌掉。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False, nt=None):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
         di, dj, dk = np.meshgrid(o, o, oz, indexing="ij")
         K = np.maximum(0.0, rmin - np.sqrt((h * di) ** 2 + (h * dj) ** 2 + (dz * dk) ** 2))     # 按物理距离的锥形核（体素扁时是椭球）
         self.K = cp.asarray(K)
-        if pad_void:
-            self.Ks = float(K.sum())
-        else:
-            self.Ks = cnd.correlate(cp.ones(shape), self.K, mode="constant", cval=0.0)   # 只按网格内的邻居归一（z 两面不吃料）
+        self._fft = None
+        if K.size > 512:                                                                         # 大核（如 0.2³ 时 19³）用 cuFFT 卷积，快 ~100 倍
+            fshape = tuple(cfft.next_fast_len(s + k - 1) for s, k in zip(shape, K.shape))
+            self._fft = (fshape, cfft.rfftn(self.K, s=fshape), (R, R, Rz), shape)
+        nt = shape[2] if nt is None else int(nt)
+        valid = cp.zeros(shape, cp.float64); valid[:, :, :nt] = 1.0
+        self.Ks_p = cp.maximum(self._corr(valid), 1e-12)                                        # 打印设计：有效厚度内归一（床面/顶面不吃料）
+        self.Ks = float(K.sum()) if pad_void else self.Ks_p                                     # 腐蚀设计（及外部 filt 兼容）：pad_void 时网格外按空
         self.eta_e = eta_e
         self.fixed = cp.asarray(fixed); self.fval = cp.asarray(fval, cp.float64)
         self.free = ~self.fixed
@@ -391,8 +398,15 @@ class Pipeline:
             self.g_ker = cp.asarray(kd)
             self.gQ = p_am + np.log(int(kd.sum())) / np.log(xi0)          # 同 AM：均匀 ξ0 时 smax = ξ0
 
+    def _corr(self, x):
+        if self._fft is None:
+            return cnd.correlate(x, self.K, mode="constant", cval=0.0)
+        fshape, Kf, (r0, r1, r2), (n0, n1, n2) = self._fft
+        y = cfft.irfftn(cfft.rfftn(x, s=fshape) * Kf, s=fshape)
+        return y[r0:r0 + n0, r1:r1 + n1, r2:r2 + n2].copy()
+
     def filt(self, x):
-        return cnd.correlate(x, self.K, mode="constant", cval=0.0) / self.Ks
+        return self._corr(x) / self.Ks
 
     def _ss(self, A):
         """支撑邻域求和（十字或圆盘，都对称，所以也是自己的转置）"""
@@ -400,8 +414,8 @@ class Pipeline:
 
     def forward(self, x, beta):
         xf = cp.where(self.fixed, self.fval, x)
-        xt = self.filt(xf)
-        xb, dxb = T2.project(xt, float(beta), 0.5)
+        xt_raw = self._corr(xf)
+        xb, dxb = T2.project(xt_raw / self.Ks_p, float(beta), 0.5)
         xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
         xa, ic = xb, None
         if (self.isl_A > 0 or self.isl_conn) and beta >= self.isl_b:
@@ -418,7 +432,7 @@ class Pipeline:
         if self.eta_e is not None:
             # 腐蚀设计 ξ_e = x̄_e·s，s = ξ/x̄ 是打印设计里"被下层托住"的比例（AM 滤波只对打印设计做一次：
             # 腐蚀设计在床面那层会被吃掉，单独做 AM 滤波的话上面全塌）。灰度阶段 ξ_e ≈ x̄_e，不会两个灰度相乘塌成空
-            xe, dxe = T2.project(xt, float(beta), self.eta_e)
+            xe, dxe = T2.project(xt_raw / self.Ks, float(beta), self.eta_e)
             xe = cp.where(self.fixed, self.fval, xe); dxe = cp.where(self.fixed, 0.0, dxe)
             den = cp.maximum(cp.maximum(xb, xi), 1e-12)
             s = xi / den
@@ -602,10 +616,10 @@ class Pipeline:
             gxi = (0.0 if gxi is None else gxi) + gq
             gdir = -gq * c["s"]
         g = self.island_backward(self.ground_backward(self.am_backward(gxi, c), c), c.get("isl"))
-        gt = (g + gdir) * c["dxb"]
+        gt = (g + gdir) * c["dxb"] / self.Ks_p
         if gxe is not None:
-            gt = gt + gxe * c["s"] * c["dxe"]
-        return cnd.correlate(gt / self.Ks, self.K, mode="constant", cval=0.0) * self.free
+            gt = gt + gxe * c["s"] * c["dxe"] / self.Ks
+        return self._corr(gt) * self.free
 
 
 def rmin_for_thickness(tmin, h, eta_e=0.75, dz=None):
@@ -628,7 +642,8 @@ def rmin_for_thickness(tmin, h, eta_e=0.75, dz=None):
                 return n
         return None
     nt_x, nt_z = max(1, int(round(tmin / h))), max(1, int(round(tmin / dz)))
-    rs = np.arange(1.0, 8.0, 0.02) * max(h, dz)
+    rmax = max(8.0, tmin / max(h, dz) * 1.5)
+    rs = np.arange(1.0, rmax, 0.02) * max(h, dz)
     okx = [r for r in rs if n_min(r, h, 0) == nt_x]
     if not okx:
         raise ValueError(f"最小厚度 {tmin} mm 在 h={h} 下找不到合适的过滤半径")
@@ -844,6 +859,7 @@ class Free3D:
         use_centered_kernels()
         self.D = T3.material_D(P.E_MAT, P.NU, kz); self.kz = kz
         self.gmin = 1e-6
+        self.offload = 3 * (NX + 1) * (NY + 1) * (NZ + 1) > 100_000_000          # 超大网格（如 0.2³，230M 自由度）：F / U / 屈曲子空间暂存主机内存，按工况进出显存，省 ~40 GB 显存
         self._loads_bc(misuse)
         self.mg = T3.MGCG(NX, NY, NZ, h, dz, self.D, cp.asarray(self.fm, F32))
         self.KE0 = self.mg.levels[0].KE
@@ -855,21 +871,34 @@ class Free3D:
             self.mgs.append(T3.MGCG(NX, NY, NZ, h, dz, self.D, self.fms[1]))
         self.case_bc = [1 if (asm_z and nm in ASM_CASES) else 0 for nm in self.names]
         for l in range(len(self.F)):
-            self.F[l] = self.F[l] * self.fms[self.case_bc[l]]
+            if self.offload:
+                fm_c = self.fm_asm if self.case_bc[l] == 1 else self.fm
+                self.F[l] = self.F[l] * fm_c
+            else:
+                self.F[l] = self.F[l] * self.fms[self.case_bc[l]]
         self.lat = self.names.index("z向体力") if lateral else None
         self.q_lat = None
         # 只差一个倍数的工况（误用 150 N 就是前压 / 后压按比例放大：载荷区、方向、约束都一样）：只解一次，位移按比例给
         self.alias = {}
         for l in range(len(self.F)):
-            fl_ = self.F[l].astype(cp.float64); nl = float(cp.linalg.norm(fl_))
+            fl_ = self.F[l].astype(np.float64) if self.offload else self.F[l].astype(cp.float64)
+            nl = float(np.linalg.norm(fl_) if self.offload else cp.linalg.norm(fl_))
             if l == self.lat or nl == 0.0:
                 continue
             for m in range(l):
                 if m == self.lat or m in self.alias or self.case_bc[m] != self.case_bc[l]:
                     continue
-                fm_ = self.F[m].astype(cp.float64); k = float(fl_ @ fm_) / float(fm_ @ fm_)
-                if float(cp.linalg.norm(fl_ - k * fm_)) <= 1e-6 * nl:
+                fm_ = self.F[m].astype(np.float64) if self.offload else self.F[m].astype(cp.float64)
+                k = float(fl_ @ fm_) / float(fm_ @ fm_)
+                dn = float(np.linalg.norm(fl_ - k * fm_) if self.offload else cp.linalg.norm(fl_ - k * fm_))
+                if dn <= 1e-6 * nl:
                     self.alias[l] = (m, k); break
+
+    def _dev(self, v):
+        return cp.asarray(v, F32)
+
+    def _store(self, v):
+        return cp.asnumpy(v) if self.offload else v
 
     # ---------- z 向体力 ----------
     def set_mass(self, m):
@@ -885,11 +914,11 @@ class Free3D:
             di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
             nf[di:di + self.NX, dj:dj + self.NY, dk:dk + self.NZ] += e
         f = cp.zeros(3 * nf.size, F32); f[2::3] = nf.ravel()
-        self.F[self.lat] = f * self.fm_d
+        self.F[self.lat] = self._store(f * self.fm_d)
 
     def body_sens(self):
         """d(F_lat·U_lat)/dm 中载荷随设计变化的那一项的一半：每个单元 8 个节点 z 向位移之和 × 单元力系数"""
-        uz = self.U[self.lat][2::3].reshape(self.NX + 1, self.NY + 1, self.NZ + 1)
+        uz = self._dev(self.U[self.lat])[2::3].reshape(self.NX + 1, self.NY + 1, self.NZ + 1)
         s = cp.zeros((self.NX, self.NY, self.NZ), F32)
         for a in range(8):
             di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
@@ -900,11 +929,12 @@ class Free3D:
     def warp_measures(self):
         """面内工况 l 引起的顶面平均 z 位移：全长 W_a = L_side·U_l / F_side，后半段 W_r = L_rear·U_l / F_side（互易定理）"""
         ia, ir = self.names.index("侧推"), self.names.index("侧推后段")
+        Fa, Fr = self._dev(self.F[ia]).astype(cp.float64), self._dev(self.F[ir]).astype(cp.float64)
         out = {}
         for nm in WARP_CASES:
             l = self.names.index(nm)
-            Ul = self.U[l].astype(cp.float64)
-            out[nm] = (float(cp.dot(self.F[ia].astype(cp.float64), Ul)) / P.F_SIDE, float(cp.dot(self.F[ir].astype(cp.float64), Ul)) / P.F_SIDE)
+            Ul = self._dev(self.U[l]).astype(cp.float64)
+            out[nm] = (float(cp.dot(Fa, Ul)) / P.F_SIDE, float(cp.dot(Fr, Ul)) / P.F_SIDE)
         return out
 
     def mutual_energy(self, a, b):
@@ -949,7 +979,7 @@ class Free3D:
         DB = cp.asarray((self.D @ T3._hex_B(self.h, self.h, self.dz, 0, 0, 0)).ravel(), F32)
         Eg = cp.asarray(E, F32).ravel()
         sig = cp.empty(6 * L0.nel, F32)
-        T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], sig, Eg, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
+        T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self._dev(self.U[l]), sig, Eg, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
         sig = sig.reshape(-1, 6); sig[Eg < emin] = 0
         return sig.ravel()
 
@@ -1021,13 +1051,13 @@ class Free3D:
         """工况 l 的单元中心应力 D·B·u（单位模量，nel×6 摊平）"""
         L0 = self.mg.levels[0]
         sig = cp.empty(6 * L0.nel, F32)
-        T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], sig, cp.ones(L0.nel, F32), self._DB(), *self._dims()))
+        T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self._dev(self.U[l]), sig, cp.ones(L0.nel, F32), self._DB(), *self._dims()))
         return sig
 
     def buck_init(self, cases, nb=8, seed=0):
         """每个屈曲工况一个子空间（nb 个向量），优化过程中接着上一轮迭代"""
         rng = np.random.default_rng(seed); n = self.F[0].size
-        self.bk = {l: dict(X=[cp.asarray(rng.standard_normal(n), F32) * self.fms[self.case_bc[l]] for _ in range(nb)], shift=0.0)
+        self.bk = {l: dict(X=[self._store(cp.asarray(rng.standard_normal(n), F32) * self.fms[self.case_bc[l]]) for _ in range(nb)], shift=0.0)
                    for l in cases}
 
     def buck_step(self, l, sig, nit=2, tol=1e-3):
@@ -1036,11 +1066,14 @@ class Free3D:
         st = self.bk[l]; b = self.case_bc[l]; fm, mg = self.fms[b], self.mgs[b]
         KG = self.kgeo(sig, fm=fm); KG64 = self.kgeo(sig, double=True, fm=fm); A64 = self.kmul64(fm)
         X = st["X"]; nb = len(X); mu0 = st.get("mu")
-        for _ in range(nit):
+        for step_i in range(nit):
             # CG 初值 μ_j·x_j：x_j 是上一步的 Ritz 向量（μ_j 同序），收敛后 K⁻¹(−K_G)x_j ≈ μ_j·x_j，只剩一点要修正。
             # 容差不变（相对 ‖b‖），所以结果和从零开始一样准，只是 CG 少走几步
-            G = cp.stack([mg.solve(-KG(x), None if mu0 is None else F32(mu0[j]) * x, tol=tol)[0] + F32(st["shift"]) * x
-                          for j, x in enumerate(X)])
+            G = cp.empty((nb, self.F[0].size), F32)
+            for j in range(nb):
+                xj = self._dev(X[j])
+                G[j] = mg.solve(-KG(xj), None if mu0 is None else F32(mu0[j]) * xj, tol=tol)[0] + F32(st["shift"]) * xj
+                del xj
             del X
             Am = np.zeros((nb, nb)); Bm = np.zeros((nb, nb))
             for j in range(nb):
@@ -1049,12 +1082,13 @@ class Free3D:
                 for i in range(j, nb):
                     zi = G[i].astype(cp.float64) if i != j else zj
                     Am[i, j] = Am[j, i] = float(cp.dot(zi, ga)); Bm[i, j] = Bm[j, i] = float(cp.dot(zi, kz))
+                del zj, ga, kz
             Li = np.linalg.inv(np.linalg.cholesky(Bm))
             mu, V = np.linalg.eigh(Li @ Am @ Li.T)
             C = Li.T @ V                                          # Cᵀ Bm C = I → Φ = Gᵀ C 是 K 归一化的
             Phi = cp.asarray(C.T, F32) @ G
             del G
-            X = [p / cp.linalg.norm(p) for p in Phi]
+            X = [self._store(p / cp.linalg.norm(p)) if (step_i == nit - 1) else (p / cp.linalg.norm(p)) for p in Phi]
             mu0 = mu
             if mu.min() < 0:
                 st["shift"] = max(st["shift"], 1.05 * float(-mu.min()))
@@ -1080,8 +1114,9 @@ class Free3D:
         a = cp.empty(3 * L0.nn, F32)
         _kfun("kstrT")(T3._blocks(L0.nn), (T3._TB,), (t, a, self._DB(), self.fms[b], *dims))
         w = self.solve_rhs(a, b, tol)
-        s = float(cp.linalg.norm(self.U[l])) / max(float(cp.linalg.norm(w)), 1e-30)    # 两个向量量级拉平再算互能，免得单精度相消
-        Cw = self.mutual_energy(w * F32(s), self.U[l]).ravel() / F32(s)
+        Ul = self._dev(self.U[l])
+        s = float(cp.linalg.norm(Ul)) / max(float(cp.linalg.norm(w)), 1e-30)    # 两个向量量级拉平再算互能，免得单精度相消
+        Cw = self.mutual_energy(w * F32(s), Ul).ravel() / F32(s)
         return A, Bq, Cw
 
     def mode_energy_split(self, ph, low):
@@ -1156,7 +1191,7 @@ class Free3D:
             f = new(); press(f, 175, P.S_END, 150.0); F.append(f); names.append("后部误用150N")
         self.names = names
         self.imp = np.array([IMP.get(k, 0.5) for k in names])
-        self.F = [cp.asarray(v, F32) for v in F]
+        self.F = [np.asarray(v, np.float32) if self.offload else cp.asarray(v, F32) for v in F]
         self.U = [None] * len(F)
         # 约束（与二维相同）：前脚只给竖向、后脚铰支；两脚 z 向靠摩擦约束
         fixed = np.zeros(3 * nn, bool)
@@ -1168,8 +1203,9 @@ class Free3D:
                 if ch in how: fixed[3 * idx + d] = True
             fixed[3 * idx + 2] = True
         self.fm = (~fixed).astype(np.float32)
+        fm_mul = self.fm if self.offload else cp.asarray(self.fm)
         for v in self.F:
-            v *= cp.asarray(self.fm)
+            v *= fm_mul
         # 装配约束：卡钩搭接带（外侧面 z=0）和梁身台肩（内侧面 z=T，梁身截面内、方槽外）上的节点 z 向固定
         fa = fixed.reshape(NX + 1, NY + 1, NZ + 1, 3).copy()
         for j in P.JOINTS:
@@ -1189,13 +1225,14 @@ class Free3D:
         for l, Fv in enumerate(self.F):
             if l in self.alias:                                 # 某个前面工况的倍数：U = k·U_m，柔度 = k²·c_m
                 m, k = self.alias[l]
-                self.U[l] = self.U[m] * F32(k); comps[l] = k * k * comps[m]; its.append(0)
+                self.U[l] = self.U[m] * np.float32(k) if self.offload else self.U[m] * F32(k)
+                comps[l] = k * k * comps[m]; its.append(0)
                 continue
             mg, A64 = self.mgs[self.case_bc[l]], A64s[self.case_bc[l]]
             # 混合精度迭代修正：残差用双精度算，修正量用单精度多重网格 CG 解（按当前相对残差自适应收紧内层容差，少重启且不过度求解）。
             # 整体面外弯曲（侧推、z 向体力）的位移场很光滑，单精度矩阵乘相消误差大，只用单精度时 CG 自报收敛、实际残差可达百分之几
-            b = Fv.astype(cp.float64); bn = float(cp.linalg.norm(b))
-            x = cp.zeros_like(b) if self.U[l] is None else self.U[l].astype(cp.float64)
+            b = self._dev(Fv).astype(cp.float64); bn = float(cp.linalg.norm(b))
+            x = cp.zeros_like(b) if self.U[l] is None else self._dev(self.U[l]).astype(cp.float64)
             it = 0
             if bn > 0.0:
                 for _ in range(12):
@@ -1205,8 +1242,10 @@ class Free3D:
                         break
                     d, k = mg.solve((r / rn).astype(F32), None, tol=min(0.5, max(0.3 * tol * bn / rn, inner)))
                     x += d.astype(cp.float64) * rn; it += k
-            self.U[l] = x.astype(F32)
-            comps[l] = float(cp.dot(Fv.astype(cp.float64), self.U[l].astype(cp.float64))); its.append(it)   # 体力工况遍布全部节点，单精度累加误差大
+            u32 = x.astype(F32)
+            comps[l] = float(cp.dot(b, u32.astype(cp.float64))); its.append(it)   # 体力工况遍布全部节点，单精度累加误差大
+            self.U[l] = self._store(u32)
+            del b, x, u32
         return comps, its
 
     def energy(self, w):
@@ -1214,7 +1253,9 @@ class Free3D:
         L0 = self.mg.levels[0]
         ce = cp.zeros(L0.nel, F32)
         for l in range(len(self.F)):
-            T3._K()["kener"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], ce, self.KE0, np.float32(w[l]), np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
+            if w[l] == 0.0:
+                continue
+            T3._K()["kener"](T3._blocks(L0.nel), (T3._TB,), (self._dev(self.U[l]), ce, self.KE0, np.float32(w[l]), np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
         return ce.reshape(self.NX, self.NY, self.NZ)
 
     def stresses(self, mask):
@@ -1232,11 +1273,12 @@ class Free3D:
         nm_ = nm_.ravel()
         out = []
         for l, nm in enumerate(self.names):
-            T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (self.U[l], sig, ones, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
+            Ul = self._dev(self.U[l])
+            T3._K()["kstress"](T3._blocks(L0.nel), (T3._TB,), (Ul, sig, ones, DB, np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)))
             S = sig.reshape(-1, 6)[mk]
             vm = cp.sqrt(0.5 * ((S[:, 0] - S[:, 1]) ** 2 + (S[:, 1] - S[:, 2]) ** 2 + (S[:, 2] - S[:, 0]) ** 2) + 3 * (S[:, 3] ** 2 + S[:, 4] ** 2 + S[:, 5] ** 2))
             tz = cp.sqrt(S[:, 4] ** 2 + S[:, 5] ** 2)
-            u = self.U[l].reshape(-1, 3)[nm_]
+            u = Ul.reshape(-1, 3)[nm_]
             pct = lambda v: float(cp.percentile(v, 99.9))
             out.append(dict(工况=nm, 最大位移_mm=float(cp.sqrt((u ** 2).sum(1)).max()),
                             面内位移_mm=float(cp.sqrt(u[:, 0] ** 2 + u[:, 1] ** 2).max()), z向位移_mm=float(cp.abs(u[:, 2]).max()),
@@ -1375,7 +1417,7 @@ def main():
     M.set_mass(m2)
     comps_b, its_b = M.solve(E2, a.tol)
     print(f"基准（二维方案按打印结构）柔度 {np.round(comps_b, 5).tolist()}，CG {its_b}，{time.time()-tb:.1f}s", flush=True)
-    fres = {nm: float(np.linalg.norm(cp.asnumpy(M.F[M.names.index(nm)].reshape(-1, 3).sum(0)).astype(float))) for nm in WARP_CASES}
+    fres = {nm: float(np.linalg.norm((M.F[M.names.index(nm)] if M.offload else cp.asnumpy(M.F[M.names.index(nm)])).reshape(-1, 3).sum(0).astype(float))) for nm in WARP_CASES}
     if M.warp:
         wb = M.warp_measures()
         print("基准翘曲比（顶面平均 z 位移 / 沿载荷方向平均位移 c/|F|，全长、后半段）:",
@@ -1389,7 +1431,7 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect, nt=M.NT)
     if a.island_connect:
         print("底面孤岛（可导近似）：贴床那层要和主框连通（从固定实心格按 min/max 生长，梯度落在路径最细处）", flush=True)
     elif a.island_soft > 0:

@@ -45,7 +45,7 @@ header p { margin: 0; color: var(--muted); font-size: 15px }
 .layer input { flex: 1; min-width: 0; accent-color: var(--accent) }
 .layer output { font-family: var(--mono); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; min-width: 15ch }
 .play { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 8px; padding: 5px 10px; cursor: pointer }
-.layer.off { opacity: .45; pointer-events: none }
+.off { opacity: .45; pointer-events: none }
 aside { display: grid; gap: 14px; min-width: 0 }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 10px; min-width: 0 }
 h2 { font-size: 13px; margin: 0; font-weight: 650; letter-spacing: .02em }
@@ -93,6 +93,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
       <div class="controls">
         <div><span class="lbl">视图</span><span class="seg" id="seg-view"><button id="v-print" data-v="print" aria-pressed="true">打印姿态</button><button id="v-asm" data-v="asm" aria-pressed="false">装配</button></span></div>
         <div><span class="lbl">模型</span><span class="seg" id="seg-model"></span></div>
+        <div id="linkbox" hidden><span class="lbl">连接件</span><span class="seg" id="seg-link"></span></div>
         <div id="padsbox" hidden><span class="lbl">TPU 垫</span><span class="seg" id="seg-pads"><button data-p="on" aria-pressed="true">显示</button><button data-p="off" aria-pressed="false">隐藏</button></span></div>
         <div><span class="lbl">剖切</span><span class="seg" id="seg-cut"><button id="c-z" data-c="z" aria-pressed="true">逐层</button><button id="c-x" data-c="x" aria-pressed="false">横切</button></span></div>
         <div class="layer" id="layerbox">
@@ -196,7 +197,11 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     return g;
   }
   const G = {}; D.models.forEach(m => G[m.key] = geom(m.mesh));
-  const Gb = geom(D.beam), Gp = geom(D.panel);
+  const linkSets = (D.links && D.links.length) ? D.links : [{ key: 'default', label: '连接件', beam: D.beam, panel: D.panel }];
+  if (linkSets.length > 1) {
+    $('linkbox').hidden = false;
+    $('seg-link').innerHTML = linkSets.map((l, i) => `<button data-l="${l.key}" aria-pressed="${i === 0}">${l.label}</button>`).join('');
+  }
 
   const viewer = $('viewer');
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -243,10 +248,16 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const am = {};
   for (const m of D.models) { am[m.key] = []; for (const mat of D.supportMats) {
     const o = new THREE.Mesh(G[m.key], matSup); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); am[m.key].push(o); } }
-  for (const [g, mat] of [[Gb, D.beamMat], [Gp, D.panelMat]]) { const o = new THREE.Mesh(g, matLink); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); }
+  const alm = {};
+  for (const l of linkSets) {
+    alm[l.key] = [];
+    for (const [pk, mat] of [[l.beam, D.beamMat], [l.panel, D.panelMat]]) {
+      const o = new THREE.Mesh(geom(pk), matLink); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); alm[l.key].push(o);
+    }
+  }
   padObjs.slice(1).forEach(o => asm.add(o));
 
-  const S = { view: 'print', model: D.models[0].key, cut: 'z', pos: 1, pads: 'on' };
+  const S = { view: 'print', model: D.models[0].key, link: linkSets[0].key, cut: 'z', pos: 1, pads: 'on' };
   function render() { renderer.render(scene, camera); }
   function frame(obj) {
     const box = new THREE.Box3().setFromObject(obj), c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
@@ -258,12 +269,14 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     print.visible = S.view === 'print'; asm.visible = S.view === 'asm';
     for (const k in pm) pm[k].visible = k === S.model;
     for (const k in am) am[k].forEach(o => o.visible = k === S.model);
+    for (const k in alm) alm[k].forEach(o => o.visible = k === S.link);
     matSup.clippingPlanes = S.view === 'print' ? [clip] : [];
     matSup.needsUpdate = true;
     matPad.clippingPlanes = matSup.clippingPlanes; matPad.needsUpdate = true;
     padObjs.forEach(o => o.visible = S.pads === 'on');
     $('layerbox').classList.toggle('off', S.view !== 'print');
     $('seg-cut').parentElement.classList.toggle('off', S.view !== 'print');
+    $('linkbox').classList.toggle('off', S.view !== 'asm');
     if (S.cut === 'z') {
       const k = Math.max(1, Math.round(S.pos * NL)), zc = k * D.T / NL;
       clip.normal.set(0, 0, -1); clip.constant = zc + 1e-3;
@@ -279,14 +292,14 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   function seg(id, key) {
     $(id).addEventListener('click', (e) => {
       const b = e.target.closest('button'); if (!b) return;
-      S[key] = b.dataset.v || b.dataset.m || b.dataset.c || b.dataset.p;
+      S[key] = b.dataset.v || b.dataset.m || b.dataset.l || b.dataset.c || b.dataset.p;
       $(id).querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
       if (key === 'cut') { S.pos = 1; slider.value = 1000; }
       apply(key === 'view');
     });
   }
   const slider = $('layer');
-  seg('seg-view', 'view'); seg('seg-model', 'model'); seg('seg-cut', 'cut'); seg('seg-pads', 'pads');
+  seg('seg-view', 'view'); seg('seg-model', 'model'); seg('seg-link', 'link'); seg('seg-cut', 'cut'); seg('seg-pads', 'pads');
   $('padsbox').hidden = !D.pads;
   slider.addEventListener('input', () => { S.pos = +slider.value / 1000; apply(false); });
   let timer = null;
