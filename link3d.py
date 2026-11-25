@@ -258,7 +258,7 @@ def make_cases(G, preset="relaxed"):
 class GPUFE:
     """矩阵无关多重网格（topopt3d.MGCG，去平移 kernel），每个约束集一套层级；残差用双精度、迭代修正"""
 
-    def __init__(self, G, tol=1e-5, inner=1e-2):
+    def __init__(self, G, tol=1e-5, inner=3e-4):
         N3.use_centered_kernels()
         self.G = G; self.tol, self.inner = tol, inner
         self.D = T3.material_D(P.E_MAT, P.NU, P.KZ)
@@ -310,10 +310,11 @@ class GPUFE:
             if bn > 0:
                 for _ in range(15):
                     r = b - self.k64(x, fm)
-                    if float(cp.linalg.norm(r)) <= self.tol * bn:
+                    rn = float(cp.linalg.norm(r))
+                    if rn <= self.tol * bn:
                         break
-                    d, k = mg.solve((r / bn).astype(F32), None, tol=self.inner)
-                    x += d.astype(cp.float64) * bn; self.its += k
+                    d, k = mg.solve((r / rn).astype(F32), None, tol=min(0.5, max(0.15 * self.tol * bn / rn, self.inner)))
+                    x += d.astype(cp.float64) * rn; self.its += k
             H["x"][c] = x.astype(F32)
             U = x + g
             Rs.append(cp.asnumpy(self.k64(U, self.ones)[cd]))

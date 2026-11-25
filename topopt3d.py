@@ -11,7 +11,7 @@
 - 体积约束：与二维结果按 P.T 拉伸的体积相同。
 用法: STAND_VARIANT=desk40 python topopt3d.py [--maxit 80] [--kz 0.5] [--tmax 19.2] [--dilate 3]
 """
-import argparse, functools, json, logging, os, time
+import argparse, functools, json, logging, os, time, weakref
 import numpy as np
 import scipy.sparse as sp
 from scipy.ndimage import binary_dilation
@@ -169,6 +169,136 @@ __global__ void kstress(const float* __restrict__ u, float* __restrict__ sig, co
         sig[6 * e + c] = g[e] * s;
     }
 }
+// 融合 V-cycle kernel（单精度，1 字节约束掩码 fm8）：减少数组分配与重复访存
+__global__ void kjacobi0(const float* __restrict__ b, float* __restrict__ u, const float* __restrict__ dinv, float w, long ndof) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ndof) u[i] = w * dinv[i] * b[i];
+}
+__global__ void kjacobi(const float* __restrict__ u, const float* __restrict__ b, float* __restrict__ out,
+                        const float* __restrict__ g, const float* __restrict__ KEg, const float* __restrict__ dinv,
+                        const unsigned char* __restrict__ fm8, float w, int nx, int ny, int nz) {
+    LOAD_KE
+    const int nyn = ny + 1, nzn = nz + 1;
+    const long n = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= (long)(nx + 1) * nyn * nzn) return;
+    const unsigned char msk = fm8[n];
+    const long q = 3 * n;
+    if (msk == 0) { out[q] = 0.f; out[q + 1] = 0.f; out[q + 2] = 0.f; return; }
+    NODE_IJK(n)
+    float o0 = 0.f, o1 = 0.f, o2 = 0.f;
+    for (int a = 0; a < 8; a++) {
+        const int ei = i - (a & 1), ej = j - ((a >> 1) & 1), ek = k - (a >> 2);
+        if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+        const float ge = g[((long)ei * ny + ej) * nz + ek];
+        const float* Ka = KE + 72 * a;
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+        #pragma unroll
+        for (int bb = 0; bb < 8; bb++) {
+            const long m = 3 * (((long)(ei + (bb & 1)) * nyn + (ej + ((bb >> 1) & 1))) * nzn + (ek + (bb >> 2)));
+            const float u0 = u[m], u1 = u[m + 1], u2 = u[m + 2];
+            const int c = 3 * bb;
+            s0 += Ka[c] * u0 + Ka[c + 1] * u1 + Ka[c + 2] * u2;
+            s1 += Ka[24 + c] * u0 + Ka[25 + c] * u1 + Ka[26 + c] * u2;
+            s2 += Ka[48 + c] * u0 + Ka[49 + c] * u1 + Ka[50 + c] * u2;
+        }
+        o0 += ge * s0; o1 += ge * s1; o2 += ge * s2;
+    }
+    out[q]     = (msk & 1) ? (u[q]     + w * dinv[q]     * (b[q]     - o0)) : 0.f;
+    out[q + 1] = (msk & 2) ? (u[q + 1] + w * dinv[q + 1] * (b[q + 1] - o1)) : 0.f;
+    out[q + 2] = (msk & 4) ? (u[q + 2] + w * dinv[q + 2] * (b[q + 2] - o2)) : 0.f;
+}
+__global__ void kresid(const float* __restrict__ u, const float* __restrict__ b, float* __restrict__ out,
+                       const float* __restrict__ g, const float* __restrict__ KEg,
+                       const unsigned char* __restrict__ fm8, int nx, int ny, int nz) {
+    LOAD_KE
+    const int nyn = ny + 1, nzn = nz + 1;
+    const long n = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= (long)(nx + 1) * nyn * nzn) return;
+    const unsigned char msk = fm8[n];
+    const long q = 3 * n;
+    if (msk == 0) { out[q] = 0.f; out[q + 1] = 0.f; out[q + 2] = 0.f; return; }
+    NODE_IJK(n)
+    float o0 = 0.f, o1 = 0.f, o2 = 0.f;
+    for (int a = 0; a < 8; a++) {
+        const int ei = i - (a & 1), ej = j - ((a >> 1) & 1), ek = k - (a >> 2);
+        if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+        const float ge = g[((long)ei * ny + ej) * nz + ek];
+        const float* Ka = KE + 72 * a;
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+        #pragma unroll
+        for (int bb = 0; bb < 8; bb++) {
+            const long m = 3 * (((long)(ei + (bb & 1)) * nyn + (ej + ((bb >> 1) & 1))) * nzn + (ek + (bb >> 2)));
+            const float u0 = u[m], u1 = u[m + 1], u2 = u[m + 2];
+            const int c = 3 * bb;
+            s0 += Ka[c] * u0 + Ka[c + 1] * u1 + Ka[c + 2] * u2;
+            s1 += Ka[24 + c] * u0 + Ka[25 + c] * u1 + Ka[26 + c] * u2;
+            s2 += Ka[48 + c] * u0 + Ka[49 + c] * u1 + Ka[50 + c] * u2;
+        }
+        o0 += ge * s0; o1 += ge * s1; o2 += ge * s2;
+    }
+    out[q]     = (msk & 1) ? (b[q]     - o0) : 0.f;
+    out[q + 1] = (msk & 2) ? (b[q + 1] - o1) : 0.f;
+    out[q + 2] = (msk & 4) ? (b[q + 2] - o2) : 0.f;
+}
+__global__ void krestrict(const float* __restrict__ f, float* __restrict__ c, const unsigned char* __restrict__ cfm8,
+                          int nx, int ny, int nz, int ax0, int ax1, int ax2) {
+    const int cnx = ax0 ? nx / 2 : nx, cny = ax1 ? ny / 2 : ny, cnz = ax2 ? nz / 2 : nz;
+    const int cnyn = cny + 1, cnzn = cnz + 1;
+    const long cn = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (cn >= (long)(cnx + 1) * cnyn * cnzn) return;
+    const unsigned char msk = cfm8[cn];
+    const long cq = 3 * cn;
+    if (msk == 0) { c[cq] = 0.f; c[cq + 1] = 0.f; c[cq + 2] = 0.f; return; }
+    const int ck = cn % cnzn; const long cr_ = cn / cnzn; const int cj = cr_ % cnyn; const int ci = cr_ / cnyn;
+    const int fi0 = ax0 ? 2 * ci : ci, fj0 = ax1 ? 2 * cj : cj, fk0 = ax2 ? 2 * ck : ck;
+    const int nyn = ny + 1, nzn = nz + 1;
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+    const int di0 = ax0 ? -1 : 0, di1 = ax0 ? 1 : 0;
+    const int dj0 = ax1 ? -1 : 0, dj1 = ax1 ? 1 : 0;
+    const int dk0 = ax2 ? -1 : 0, dk1 = ax2 ? 1 : 0;
+    for (int di = di0; di <= di1; di++) {
+        const int fi = fi0 + di; if (fi < 0 || fi > nx) continue;
+        const float wi = (di == 0) ? 1.f : 0.5f;
+        for (int dj = dj0; dj <= dj1; dj++) {
+            const int fj = fj0 + dj; if (fj < 0 || fj > ny) continue;
+            const float wij = wi * ((dj == 0) ? 1.f : 0.5f);
+            for (int dk = dk0; dk <= dk1; dk++) {
+                const int fk = fk0 + dk; if (fk < 0 || fk > nz) continue;
+                const float w = wij * ((dk == 0) ? 1.f : 0.5f);
+                const long fq = 3 * (((long)fi * nyn + fj) * nzn + fk);
+                s0 += w * f[fq]; s1 += w * f[fq + 1]; s2 += w * f[fq + 2];
+            }
+        }
+    }
+    c[cq]     = (msk & 1) ? s0 : 0.f;
+    c[cq + 1] = (msk & 2) ? s1 : 0.f;
+    c[cq + 2] = (msk & 4) ? s2 : 0.f;
+}
+__global__ void kprolong(const float* __restrict__ e, float* __restrict__ u, const unsigned char* __restrict__ fm8,
+                         int nx, int ny, int nz, int ax0, int ax1, int ax2) {
+    const int nyn = ny + 1, nzn = nz + 1;
+    const long n = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= (long)(nx + 1) * nyn * nzn) return;
+    const unsigned char msk = fm8[n];
+    if (msk == 0) return;
+    NODE_IJK(n)
+    const int cnyn = (ax1 ? ny / 2 : ny) + 1, cnzn = (ax2 ? nz / 2 : nz) + 1;
+    const int ci = ax0 ? (i >> 1) : i, oi = ax0 ? (i & 1) : 0;
+    const int cj = ax1 ? (j >> 1) : j, oj = ax1 ? (j & 1) : 0;
+    const int ck = ax2 ? (k >> 1) : k, ok = ax2 ? (k & 1) : 0;
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+    const float wt = 1.f / (float)((1 + oi) * (1 + oj) * (1 + ok));
+    for (int di = 0; di <= oi; di++)
+    for (int dj = 0; dj <= oj; dj++)
+    for (int dk = 0; dk <= ok; dk++) {
+        const long cq = 3 * (((long)(ci + di) * cnyn + (cj + dj)) * cnzn + (ck + dk));
+        s0 += e[cq]; s1 += e[cq + 1]; s2 += e[cq + 2];
+    }
+    const long q = 3 * n;
+    if (msk & 1) u[q]     += wt * s0;
+    if (msk & 2) u[q + 1] += wt * s1;
+    if (msk & 4) u[q + 2] += wt * s2;
+}
 }
 '''
 
@@ -176,16 +306,42 @@ __global__ void kstress(const float* __restrict__ u, float* __restrict__ sig, co
 @functools.cache
 def _K():
     mod = cp.RawModule(code=_SRC, options=("--use_fast_math",))
-    return {n: mod.get_function(n) for n in ("kmul", "kdiag", "kener", "kstress")}
+    return {n: mod.get_function(n) for n in ("kmul", "kdiag", "kener", "kstress", "kjacobi0", "kjacobi", "kresid", "krestrict", "kprolong")}
 
 
-_jacobi = cp.ElementwiseKernel("float32 b, float32 Au, float32 dinv, float32 w", "float32 u",
-                               "u += w * dinv * (b - Au)", "mg_jacobi")
 _TB = 256
 
 
 def _blocks(n):
     return ((n + _TB - 1) // _TB,)
+
+
+def _pack_fm8(fm):
+    a = (fm.reshape(-1, 3) > 0.5).astype(cp.uint8)
+    return (a[:, 0] | (a[:, 1] << 1) | (a[:, 2] << 2)).astype(cp.uint8)
+
+
+class _VWork:
+    """V-cycle 临时工作区（同网格尺寸的多套 MGCG 共用，全部释放后自动回收显存）"""
+
+    def __init__(self, levels):
+        self.bufs = []
+        for l, L in enumerate(levels[:-1]):
+            nd = 3 * L.nn
+            self.bufs.append((None if l == 0 else cp.empty(nd, F32), cp.empty(nd, F32), cp.empty(nd, F32), cp.empty(nd, F32)))
+        self.rc_coarse = cp.empty(3 * levels[-1].nn, F32)
+
+
+_VWORK = weakref.WeakValueDictionary()
+
+
+def _get_vwork(levels):
+    key = tuple((L.nx, L.ny, L.nz) for L in levels)
+    ws = _VWORK.get(key)
+    if ws is None:
+        ws = _VWork(levels)
+        _VWORK[key] = ws
+    return ws
 
 
 # ======================= 多重网格 =======================
@@ -197,6 +353,7 @@ class Level:
         self.KE_np = hex_KE(dx, dy, dz, D)
         self.KE = cp.asarray(self.KE_np.ravel(), F32)
         self.fm = fm
+        self.fm8 = _pack_fm8(fm)
         self.g = None; self.dinv = None; self.omega = None; self._pv = None
 
     def A(self, u):
@@ -223,22 +380,6 @@ class Level:
 
 def _sl(ax, s, nd=4):
     return tuple(s if d == ax else slice(None) for d in range(nd))
-
-
-def _prolong1(a, ax):
-    shp = list(a.shape); shp[ax] = 2 * a.shape[ax] - 1
-    f = cp.empty(shp, a.dtype)
-    f[_sl(ax, slice(0, None, 2))] = a
-    f[_sl(ax, slice(1, None, 2))] = 0.5 * (a[_sl(ax, slice(0, -1))] + a[_sl(ax, slice(1, None))])
-    return f
-
-
-def _restrict1(f, ax):
-    c = f[_sl(ax, slice(0, None, 2))].copy()
-    odd = 0.5 * f[_sl(ax, slice(1, None, 2))]
-    c[_sl(ax, slice(0, -1))] += odd
-    c[_sl(ax, slice(1, None))] += odd
-    return c
 
 
 class CoarseDirect:
@@ -312,6 +453,7 @@ class MGCG:
                                      cp.ascontiguousarray(fmc).ravel()))
             self.axes.append(ax)
         self.coarse = CoarseDirect(self.levels[-1])
+        self._ws = _get_vwork(self.levels)
 
     def describe(self):
         return " → ".join(f"{L.nx}×{L.ny}×{L.nz}({L.dx:g}×{L.dy:g}×{L.dz:g})" for L in self.levels)
@@ -329,24 +471,33 @@ class MGCG:
             self.levels[l + 1].estimate_omega(self.omega)
         self.coarse.factor(self.levels[-1].g)
 
-    def vcycle(self, l, b):
+    def _vcycle(self, l, b):
         if l == len(self.levels) - 1:
             return self.coarse.solve(b)
+        K = _K()
         L, Lc, ax = self.levels[l], self.levels[l + 1], self.axes[l]
+        _, u0, u1, rbuf = self._ws.bufs[l]
         w = L.omega
-        u = w * L.dinv * b
+        dims = (np.int32(L.nx), np.int32(L.ny), np.int32(L.nz))
+        blk = _blocks(L.nn); tb = (_TB,)
+        K["kjacobi0"](_blocks(3 * L.nn), tb, (b, u0, L.dinv, w, np.int64(3 * L.nn)))
+        u_cur, u_tmp = u0, u1
         for _ in range(self.nu_s - 1):
-            _jacobi(b, L.A(u), L.dinv, w, u)
-        r = (b - L.A(u)).reshape(L.shape)
-        for d in range(3):
-            if ax[d]: r = _restrict1(r, d)
-        e = self.vcycle(l + 1, cp.ascontiguousarray(r).ravel() * Lc.fm).reshape(Lc.shape)
-        for d in (2, 1, 0):
-            if ax[d]: e = _prolong1(e, d)
-        u += e.ravel() * L.fm
+            K["kjacobi"](blk, tb, (u_cur, b, u_tmp, L.g, L.KE, L.dinv, L.fm8, w, *dims))
+            u_cur, u_tmp = u_tmp, u_cur
+        K["kresid"](blk, tb, (u_cur, b, rbuf, L.g, L.KE, L.fm8, *dims))
+        rc = self._ws.rc_coarse if l + 1 == len(self.levels) - 1 else self._ws.bufs[l + 1][0]
+        a0, a1, a2 = np.int32(ax[0]), np.int32(ax[1]), np.int32(ax[2])
+        K["krestrict"](_blocks(Lc.nn), tb, (rbuf, rc, Lc.fm8, *dims, a0, a1, a2))
+        e = self._vcycle(l + 1, rc)
+        K["kprolong"](blk, tb, (e, u_cur, L.fm8, *dims, a0, a1, a2))
         for _ in range(self.nu_s):
-            _jacobi(b, L.A(u), L.dinv, w, u)
-        return u
+            K["kjacobi"](blk, tb, (u_cur, b, u_tmp, L.g, L.KE, L.dinv, L.fm8, w, *dims))
+            u_cur, u_tmp = u_tmp, u_cur
+        return u_cur
+
+    def vcycle(self, l, b):
+        return self._vcycle(l, b).copy()
 
     def solve(self, b, x=None, tol=1e-5, maxit=300):
         A = self.levels[0].A
@@ -357,14 +508,14 @@ class MGCG:
             x = x.copy(); r = b - A(x)
         if float(cp.linalg.norm(r)) <= tol * bn:
             return x, 0
-        z = self.vcycle(0, r); p = z.copy(); rz = float(cp.dot(r, z))
+        z = self._vcycle(0, r); p = z.copy(); rz = float(cp.dot(r, z))
         for it in range(1, maxit + 1):
             q = A(p)
             alpha = rz / float(cp.dot(p, q))
             x += np.float32(alpha) * p; r -= np.float32(alpha) * q
             if float(cp.linalg.norm(r)) <= tol * bn:
                 break
-            z = self.vcycle(0, r)
+            z = self._vcycle(0, r)
             rz2 = float(cp.dot(r, z)); p = z + np.float32(rz2 / rz) * p; rz = rz2
         return x, it
 

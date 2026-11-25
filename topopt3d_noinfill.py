@@ -1001,7 +1001,7 @@ class Free3D:
         L0 = self.mg.levels[0]
         return np.int32(L0.nx), np.int32(L0.ny), np.int32(L0.nz)
 
-    def solve_rhs(self, b, bc, tol=1e-4, inner=1e-2):
+    def solve_rhs(self, b, bc, tol=1e-4, inner=3e-4):
         """当前刚度下解 K x = b（约束组 bc），混合精度迭代修正，同 solve()"""
         mg = self.mgs[bc]; A64 = self.kmul64(self.fms[bc])
         b = b.astype(cp.float64); bn = float(cp.linalg.norm(b)); x = cp.zeros_like(b)
@@ -1010,9 +1010,11 @@ class Free3D:
         b = b / bn                                               # 先归一：右端很小时单精度会下溢
         for _ in range(12):
             r = b - A64(x)
-            if float(cp.linalg.norm(r)) <= tol:
+            rn = float(cp.linalg.norm(r))
+            if rn <= tol:
                 break
-            d, _ = mg.solve(r.astype(F32), None, tol=inner); x += d
+            d, _ = mg.solve((r / rn).astype(F32), None, tol=min(0.5, max(0.3 * tol / rn, inner)))
+            x += d.astype(cp.float64) * rn
         return (x * bn).astype(F32)
 
     def unit_stress(self, l):
@@ -1177,7 +1179,7 @@ class Free3D:
         self.fm_asm = (~fa.ravel()).astype(np.float32)
 
     # ---------- 有限元 ----------
-    def solve(self, E, tol=1e-5, inner=1e-2):
+    def solve(self, E, tol=1e-5, inner=3e-4):
         """E：体素刚度系数（0..1，形状 NX×NY×NZ）→ 各工况柔度"""
         g = (F32(self.gmin) + F32(1 - self.gmin) * cp.asarray(E, F32)).ravel()
         for mg in self.mgs:
@@ -1190,17 +1192,19 @@ class Free3D:
                 self.U[l] = self.U[m] * F32(k); comps[l] = k * k * comps[m]; its.append(0)
                 continue
             mg, A64 = self.mgs[self.case_bc[l]], A64s[self.case_bc[l]]
-            # 混合精度迭代修正：残差用双精度算，修正量用单精度多重网格 CG 解。整体面外弯曲（侧推、z 向体力）的位移场很光滑，
-            # 单精度矩阵乘相消误差大，只用单精度时 CG 自报收敛、实际残差可达百分之几
+            # 混合精度迭代修正：残差用双精度算，修正量用单精度多重网格 CG 解（按当前相对残差自适应收紧内层容差，少重启且不过度求解）。
+            # 整体面外弯曲（侧推、z 向体力）的位移场很光滑，单精度矩阵乘相消误差大，只用单精度时 CG 自报收敛、实际残差可达百分之几
             b = Fv.astype(cp.float64); bn = float(cp.linalg.norm(b))
             x = cp.zeros_like(b) if self.U[l] is None else self.U[l].astype(cp.float64)
             it = 0
-            for _ in range(12):
-                r = b - A64(x)
-                if float(cp.linalg.norm(r)) <= tol * bn:
-                    break
-                d, k = mg.solve(r.astype(F32), None, tol=inner)
-                x += d; it += k
+            if bn > 0.0:
+                for _ in range(12):
+                    r = b - A64(x)
+                    rn = float(cp.linalg.norm(r))
+                    if rn <= tol * bn:
+                        break
+                    d, k = mg.solve((r / rn).astype(F32), None, tol=min(0.5, max(0.3 * tol * bn / rn, inner)))
+                    x += d.astype(cp.float64) * rn; it += k
             self.U[l] = x.astype(F32)
             comps[l] = float(cp.dot(Fv.astype(cp.float64), self.U[l].astype(cp.float64))); its.append(it)   # 体力工况遍布全部节点，单精度累加误差大
         return comps, its
