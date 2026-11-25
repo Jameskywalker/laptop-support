@@ -76,6 +76,26 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
 .sw.flat { background: var(--ref) }
 .bar.multi i { bottom: auto }
 .cmp.many td.barc { width: 26% }
+[hidden] { display: none !important }
+.cpanel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; display: grid; gap: 9px }
+.crow { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
+.preset { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 999px; padding: 4px 10px 4px 7px; cursor: pointer }
+.preset:hover { border-color: var(--accent) }
+.preset[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600 }
+.preset i { width: 12px; height: 12px; border-radius: 50%; border: 1px solid color-mix(in srgb, var(--fg) 22%, transparent); flex: none }
+.cp { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px 4px 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); font-size: 12px; cursor: pointer }
+.cp:hover { border-color: var(--accent) }
+.cp.dim { opacity: .68 }
+.cp input[type=color] { -webkit-appearance: none; appearance: none; border: 1px solid color-mix(in srgb, var(--fg) 20%, transparent); border-radius: 5px; width: 22px; height: 22px; padding: 0; background: none; cursor: pointer }
+.cp input[type=color]::-webkit-color-swatch-wrapper { padding: 0 }
+.cp input[type=color]::-webkit-color-swatch { border: 0; border-radius: 4px }
+.cp input[type=color]::-moz-color-swatch { border: 0; border-radius: 4px }
+.cp span { color: var(--fg); font-weight: 500 }
+.cp code { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase }
+.cact { font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 8px; padding: 5px 10px; cursor: pointer }
+.cact:hover { color: var(--fg); border-color: var(--accent) }
+.cp:focus-within, .preset:focus-visible, .cact:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
 </style>
 
 <div class="wrap">
@@ -100,6 +120,22 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
           <button class="play" id="play" type="button">播放</button>
           <input type="range" id="layer" min="0" max="1000" value="1000" aria-label="剖切位置">
           <output id="layerout" for="layer"></output>
+        </div>
+      </div>
+      <div class="cpanel" id="cpanel">
+        <div class="crow">
+          <div><span class="lbl">着色</span><span class="seg" id="seg-cmode"><button data-cm="height" aria-pressed="true">按高度</button><button data-cm="solid" aria-pressed="false">自定义</button></span></div>
+          <div><span class="lbl">质感</span><span class="seg" id="seg-finish"><button data-fn="matte" aria-pressed="false">哑光</button><button data-fn="std" aria-pressed="true">标准</button><button data-fn="gloss" aria-pressed="false">亮光</button></span></div>
+          <div class="presets" id="presets"></div>
+        </div>
+        <div class="crow">
+          <label class="cp" id="cp-sup"><input type="color" id="col-sup" value="#353b42"><span>支撑</span><code id="hex-sup">#353B42</code></label>
+          <label class="cp" id="cp-panel"><input type="color" id="col-panel" value="#b9c2cc"><span>面板</span><code id="hex-panel">#B9C2CC</code></label>
+          <label class="cp" id="cp-beam"><input type="color" id="col-beam" value="#b9c2cc"><span>后横梁</span><code id="hex-beam">#B9C2CC</code></label>
+          <label class="cp" id="cp-pad" hidden><input type="color" id="col-pad" value="#2f3338"><span>TPU 垫</span><code id="hex-pad">#2F3338</code></label>
+          <label class="cp" id="cp-bg"><input type="color" id="col-bg" value="#e2e7ec"><span>背景</span><code id="hex-bg">自动</code></label>
+          <button class="cact" id="btn-sync" type="button" title="把面板和后横梁设为与支撑相同颜色">统一 PETG</button>
+          <button class="cact" id="btn-reset" type="button">重置</button>
         </div>
       </div>
     </div>
@@ -218,9 +254,10 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
 
   const clip = new THREE.Plane(new THREE.Vector3(0, 0, -1), D.T);
   const NL = D.layer ? Math.round(D.T / D.layer) : D.nz;     // 逐层剖切：按打印层（STL 按打印层重建时），否则按体素层
-  const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.65, metalness: 0 });
-  const matLink = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.7, metalness: 0, color: 0xb9c2cc });
-  const matPad = new THREE.MeshStandardMaterial({ flatShading: true, side: THREE.DoubleSide, roughness: 0.95, metalness: 0, color: 0x2f3338 });   // TPU 垫：深灰
+  const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.58, metalness: 0.04 });
+  const matPanel = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
+  const matBeam = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
+  const matPad = new THREE.MeshStandardMaterial({ flatShading: true, side: THREE.DoubleSide, roughness: 0.92, metalness: 0, color: 0x2f3338 });   // TPU 垫：深灰
   const M4 = (a) => new THREE.Matrix4().set(...a);
 
   // 打印姿态：H3C 热床 330 × 320 mm
@@ -251,11 +288,93 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const alm = {};
   for (const l of linkSets) {
     alm[l.key] = [];
-    for (const [pk, mat] of [[l.beam, D.beamMat], [l.panel, D.panelMat]]) {
-      const o = new THREE.Mesh(geom(pk), matLink); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); alm[l.key].push(o);
+    for (const [pk, mat, mtrl] of [[l.beam, D.beamMat, matBeam], [l.panel, D.panelMat, matPanel]]) {
+      const o = new THREE.Mesh(geom(pk), mtrl); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); alm[l.key].push(o);
     }
   }
   padObjs.slice(1).forEach(o => asm.add(o));
+
+  // ---------- 调色 ----------
+  const PRESETS = [
+    { id: 'height', label: '高度色阶', sw: 'linear-gradient(90deg,var(--v0),var(--v2),var(--v4))', mode: 'height', finish: 'std', sup: '#353b42', panel: '#b9c2cc', beam: '#b9c2cc', pad: '#2f3338' },
+    { id: 'black',  label: '炭黑哑光', sw: '#2b2f36', mode: 'solid', finish: 'matte', sup: '#2b2f36', panel: '#2b2f36', beam: '#2b2f36', pad: '#1e2024' },
+    { id: 'duo',    label: '灰黑撞色', sw: 'linear-gradient(135deg,#353b42 50%,#b9c2cc 50%)', mode: 'solid', finish: 'std', sup: '#353b42', panel: '#b9c2cc', beam: '#495057', pad: '#22252a' },
+    { id: 'warm',   label: '暖白橙',   sw: 'linear-gradient(135deg,#e8e5df 50%,#c85f2d 50%)', mode: 'solid', finish: 'matte', sup: '#e8e5df', panel: '#d0d5da', beam: '#c85f2d', pad: '#2f3338' },
+    { id: 'navy',   label: '藏蓝银灰', sw: 'linear-gradient(135deg,#2b4c7e 50%,#c0c7d0 50%)', mode: 'solid', finish: 'std', sup: '#2b4c7e', panel: '#c0c7d0', beam: '#2b4c7e', pad: '#262a30' },
+    { id: 'olive',  label: '军绿炭灰', sw: 'linear-gradient(135deg,#4e5d46 50%,#33383e 50%)', mode: 'solid', finish: 'matte', sup: '#4e5d46', panel: '#33383e', beam: '#33383e', pad: '#23262a' },
+    { id: 'gray',   label: '全套浅灰', sw: '#bcc4cc', mode: 'solid', finish: 'std', sup: '#bcc4cc', panel: '#bcc4cc', beam: '#bcc4cc', pad: '#2f3338' },
+  ];
+  const FINISH = { matte: [0.88, 0.02], std: [0.58, 0.04], gloss: [0.28, 0.08] };
+  const STORE_KEY = 'noinfill_preview_colors_v1';
+  const defColor = () => ({ mode: 'height', finish: 'std', preset: 'height', customBg: false, sup: '#353b42', panel: '#b9c2cc', beam: '#b9c2cc', pad: '#2f3338', bg: '#e2e7ec' });
+  const C = defColor();
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+    if (saved && typeof saved === 'object') Object.assign(C, saved);
+  } catch (_) {}
+  $('presets').innerHTML = PRESETS.map(p => `<button class="preset" type="button" data-pr="${p.id}" aria-pressed="false"><i style="background:${p.sw}"></i>${p.label}</button>`).join('');
+  $('cp-pad').hidden = !D.pads;
+  function saveColor() { try { localStorage.setItem(STORE_KEY, JSON.stringify(C)); } catch (_) {} }
+  function applyColors(redraw = true) {
+    const isH = C.mode === 'height';
+    if (matSup.vertexColors !== isH) { matSup.vertexColors = isH; matSup.needsUpdate = true; }
+    matSup.color.set(isH ? 0xffffff : C.sup);
+    matPanel.color.set(C.panel);
+    matBeam.color.set(C.beam);
+    matPad.color.set(C.pad);
+    const [r, m] = FINISH[C.finish] || FINISH.std;
+    for (const mt of [matSup, matPanel, matBeam]) { mt.roughness = r; mt.metalness = m; }
+    $('legend').hidden = !isH;
+    $('cp-sup').classList.toggle('dim', isH);
+    $('seg-cmode').querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.cm === C.mode)));
+    $('seg-finish').querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.fn === C.finish)));
+    $('presets').querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.pr === C.preset)));
+    for (const k of ['sup', 'panel', 'beam', 'pad']) {
+      $('col-' + k).value = C[k];
+      $('hex-' + k).textContent = C[k].toUpperCase();
+    }
+    const bgHex = C.customBg ? C.bg : ('#' + new THREE.Color(css('--view')).getHexString());
+    $('col-bg').value = bgHex;
+    $('hex-bg').textContent = C.customBg ? C.bg.toUpperCase() : '自动';
+    if (C.customBg) {
+      renderer.setClearColor(C.bg);
+      viewer.style.setProperty('--view', C.bg);
+      const bc = new THREE.Color(C.bg), lum = 0.299 * bc.r + 0.587 * bc.g + 0.114 * bc.b;
+      viewer.style.setProperty('--muted', lum < 0.45 ? 'rgba(226,232,238,0.75)' : 'rgba(23,32,42,0.65)');
+    } else {
+      renderer.setClearColor(css('--view'));
+      viewer.style.removeProperty('--view');
+      viewer.style.removeProperty('--muted');
+    }
+    saveColor();
+    if (redraw) render();
+  }
+  $('seg-cmode').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    C.mode = b.dataset.cm; C.preset = C.mode === 'height' ? 'height' : ''; applyColors();
+  });
+  $('seg-finish').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    C.finish = b.dataset.fn; C.preset = ''; applyColors();
+  });
+  $('presets').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    const p = PRESETS.find(x => x.id === b.dataset.pr); if (!p) return;
+    Object.assign(C, { mode: p.mode, finish: p.finish, sup: p.sup, panel: p.panel, beam: p.beam, pad: p.pad, preset: p.id });
+    if (p.id === 'height') C.customBg = false;
+    applyColors();
+  });
+  for (const k of ['sup', 'panel', 'beam', 'pad']) {
+    $('col-' + k).addEventListener('input', (e) => {
+      C[k] = e.target.value;
+      if (k === 'sup') C.mode = 'solid';
+      C.preset = '';
+      applyColors();
+    });
+  }
+  $('col-bg').addEventListener('input', (e) => { C.bg = e.target.value; C.customBg = true; applyColors(); });
+  $('btn-sync').addEventListener('click', () => { C.mode = 'solid'; C.panel = C.sup; C.beam = C.sup; C.preset = ''; applyColors(); });
+  $('btn-reset').addEventListener('click', () => { Object.assign(C, defColor()); applyColors(); });
 
   const S = { view: 'print', model: D.models[0].key, link: linkSets[0].key, cut: 'z', pos: 1, pads: 'on' };
   function render() { renderer.render(scene, camera); }
@@ -313,7 +432,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     }, reduce ? 250 : 70);
   });
   controls.addEventListener('change', render);
-  function theme() { renderer.setClearColor(css('--view')); bedMat.color.set(css('--bed')); gridMat.color.set(css('--grid')); render(); }
+  function theme() { bedMat.color.set(css('--bed')); gridMat.color.set(css('--grid')); applyColors(true); }
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', theme);
   new MutationObserver(theme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   new ResizeObserver(() => { const w = viewer.clientWidth, h = viewer.clientHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); render(); }).observe(viewer);
