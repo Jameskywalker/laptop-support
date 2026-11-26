@@ -355,7 +355,7 @@ class Pipeline:
     厚度只要求一半。打印设计 x̄（阈值 0.5）始终按有效厚度内（0 ≤ k < nt）的邻居归一，否则层向体素细（如 dz = 0.2 mm）
     时床面那层即使全实心 x̃ 也只剩 ~0.55，窄墙掉到 0.5 以下、贴床直接断开并沿 AM 滤波往上整片塌掉。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=40.0, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False, nt=None):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=None, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False, nt=None):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -379,7 +379,11 @@ class Pipeline:
         self.m_am, ker = am_stencil(h, dz, am_angle)
         self.am_ker = None if ker is None else cp.asarray(ker.astype(np.float64))
         nst = 5 if ker is None else int(ker.sum())
-        self.P = p_am; self.Q = p_am + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
+        if p_am is None:
+            # 有效外扩步数 nt/m_am 增大（如 0.2³ 时 75 步 vs 0.625³ 的 24 步）时按比例加大 P，
+            # 避免单邻居 45° 悬空边沿 (P/Q)^steps 指数衰减及反传梯度爆炸
+            p_am = min(150.0, max(40.0, round(40.0 * (nt / self.m_am) / 24.0, 1)))
+        self.P = float(p_am); self.Q = self.P + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
         self.ground = ground or ground_r > 0                     # True：接地，见 ground_forward
         self.h_xy = h; self.isl_A = island_area; self.isl_b = island_beta      # 底面孤岛最小面积 mm²（0 = 不限），见 island_forward
@@ -396,7 +400,7 @@ class Pipeline:
             gi, gj = np.meshgrid(og, og, indexing="ij")
             kd = ((gi * h) ** 2 + (gj * h) ** 2 <= ground_r ** 2 + 1e-9).astype(np.float64)
             self.g_ker = cp.asarray(kd)
-            self.gQ = p_am + np.log(int(kd.sum())) / np.log(xi0)          # 同 AM：均匀 ξ0 时 smax = ξ0
+            self.gQ = self.P + np.log(int(kd.sum())) / np.log(xi0)          # 同 AM：均匀 ξ0 时 smax = ξ0
 
     def _corr(self, x):
         if self._fft is None:
@@ -699,9 +703,11 @@ class MMA:
         beta = cp.minimum(cp.minimum(1.0, upp - self.albefa * (upp - x)), x + self.move)
         ux, xl = upp - x, x - low
 
+        r0 = min(1e-5, 1e-2 / max(1, int(x.size)))  # 正则底噪按变量数反比缩放，保持细网格下二次曲率与步长网格无关
+
         def pq(d):
             dp, dn = cp.maximum(d, 0.0), cp.maximum(-d, 0.0)
-            r = 0.001 * (dp + dn) + 1e-5
+            r = 0.001 * (dp + dn) + r0
             return (dp + r) * ux ** 2, (dn + r) * xl ** 2
         p0, q0 = pq(df0)
         PQ = [pq(d) for d in dfv]
@@ -899,8 +905,13 @@ class Free3D:
     def _dev(self, v):
         return cp.asarray(v, F32)
 
-    def _store(self, v):
-        return cp.asnumpy(v) if self.offload else v
+    def _store(self, v, dst=None):
+        if not self.offload:
+            return v
+        if dst is not None and isinstance(dst, np.ndarray) and dst.shape == v.shape and dst.dtype == v.dtype:
+            v.get(out=dst)
+            return dst
+        return cp.asnumpy(v)
 
     # ---------- z 向体力 ----------
     def set_mass(self, m):
@@ -916,7 +927,7 @@ class Free3D:
             di, dj, dk = a & 1, (a >> 1) & 1, a >> 2
             nf[di:di + self.NX, dj:dj + self.NY, dk:dk + self.NZ] += e
         f = cp.zeros(3 * nf.size, F32); f[2::3] = nf.ravel()
-        self.F[self.lat] = self._store(f * self.fm_d)
+        self.F[self.lat] = self._store(f * self.fm_d, self.F[self.lat])
 
     def body_sens(self):
         """d(F_lat·U_lat)/dm 中载荷随设计变化的那一项的一半：每个单元 8 个节点 z 向位移之和 × 单元力系数"""
@@ -1058,8 +1069,8 @@ class Free3D:
 
     def buck_init(self, cases, nb=8, seed=0):
         """每个屈曲工况一个子空间（nb 个向量），优化过程中接着上一轮迭代"""
-        rng = np.random.default_rng(seed); n = self.F[0].size
-        self.bk = {l: dict(X=[self._store(cp.asarray(rng.standard_normal(n), F32) * self.fms[self.case_bc[l]]) for _ in range(nb)], shift=0.0)
+        rng = cp.random.default_rng(seed); n = self.F[0].size
+        self.bk = {l: dict(X=[self._store(rng.standard_normal(n, dtype=F32) * self.fms[self.case_bc[l]]) for _ in range(nb)], shift=0.0)
                    for l in cases}
 
     def buck_step(self, l, sig, nit=2, tol=1e-3):
@@ -1068,6 +1079,7 @@ class Free3D:
         st = self.bk[l]; b = self.case_bc[l]; fm, mg = self.fms[b], self.mgs[b]
         KG = self.kgeo(sig, fm=fm); KG64 = self.kgeo(sig, double=True, fm=fm); A64 = self.kmul64(fm)
         X = st["X"]; nb = len(X); mu0 = st.get("mu")
+        host_bufs = X if self.offload else [None] * nb
         for step_i in range(nit):
             # CG 初值 μ_j·x_j：x_j 是上一步的 Ritz 向量（μ_j 同序），收敛后 K⁻¹(−K_G)x_j ≈ μ_j·x_j，只剩一点要修正。
             # 容差不变（相对 ‖b‖），所以结果和从零开始一样准，只是 CG 少走几步
@@ -1076,7 +1088,8 @@ class Free3D:
                 xj = self._dev(X[j])
                 G[j] = mg.solve(-KG(xj), None if mu0 is None else F32(mu0[j]) * xj, tol=tol)[0] + F32(st["shift"]) * xj
                 del xj
-            del X
+            if not self.offload:
+                del X
             Am = np.zeros((nb, nb)); Bm = np.zeros((nb, nb))
             for j in range(nb):
                 zj = G[j].astype(cp.float64)
@@ -1090,7 +1103,7 @@ class Free3D:
             C = Li.T @ V                                          # Cᵀ Bm C = I → Φ = Gᵀ C 是 K 归一化的
             Phi = cp.asarray(C.T, F32) @ G
             del G
-            X = [self._store(p / cp.linalg.norm(p)) if (step_i == nit - 1) else (p / cp.linalg.norm(p)) for p in Phi]
+            X = [self._store(p / cp.linalg.norm(p), host_bufs[i]) if (step_i == nit - 1) else (p / cp.linalg.norm(p)) for i, p in enumerate(Phi)]
             mu0 = mu
             if mu.min() < 0:
                 st["shift"] = max(st["shift"], 1.05 * float(-mu.min()))
@@ -1227,7 +1240,12 @@ class Free3D:
         for l, Fv in enumerate(self.F):
             if l in self.alias:                                 # 某个前面工况的倍数：U = k·U_m，柔度 = k²·c_m
                 m, k = self.alias[l]
-                self.U[l] = self.U[m] * np.float32(k) if self.offload else self.U[m] * F32(k)
+                if self.offload:
+                    if self.U[l] is None:
+                        self.U[l] = np.empty_like(self.U[m])
+                    np.multiply(self.U[m], np.float32(k), out=self.U[l])
+                else:
+                    self.U[l] = self.U[m] * F32(k)
                 comps[l] = k * k * comps[m]; its.append(0)
                 continue
             mg, A64 = self.mgs[self.case_bc[l]], A64s[self.case_bc[l]]
@@ -1246,7 +1264,7 @@ class Free3D:
                     x += d.astype(cp.float64) * rn; it += k
             u32 = x.astype(F32)
             comps[l] = float(cp.dot(b, u32.astype(cp.float64))); its.append(it)   # 体力工况遍布全部节点，单精度累加误差大
-            self.U[l] = self._store(u32)
+            self.U[l] = self._store(u32, self.U[l])
             del b, x, u32
         return comps, its
 
@@ -1390,6 +1408,7 @@ def main():
     ap.add_argument("--buck_nb", type=int, default=8, help="屈曲子空间维数")
     ap.add_argument("--buck_nk", type=int, default=4, help="每个工况取前几个模态做 KS 聚合")
     ap.add_argument("--buck_nit", type=int, default=2, help="每轮设计迭代的子空间迭代步数（第一轮 10 步）")
+    ap.add_argument("--buck_penal", type=float, default=None, help="屈曲几何刚度惩罚指数 p_G（默认 penal+2 = 5，压制低密度灰区假屈曲模态）")
     ap.add_argument("--ks", type=float, default=40.0, help="KS 聚合系数（作用在 λ_目标/λ 上）")
     ap.add_argument("--opt", choices=("oc", "mma"), default=None, help="优化器；默认有最小厚度或屈曲约束时用 MMA，否则 OC")
     ap.add_argument("--out", default=OUT)
@@ -1443,9 +1462,9 @@ def main():
     if a.ground or a.ground_r > 0:
         print("接地：每柱各层的密度不超过床面那层" + (f"在面内膨胀 {a.ground_r:g} mm 后的形状" if a.ground_r > 0 else "（底面投影非空才能有材料）"), flush=True)
     if not a.no_am and pipe.am_ker is not None:
-        print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住", flush=True)
-    elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0):
-        print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm", flush=True)
+        print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住（P={pipe.P:g}）", flush=True)
+    elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0 or pipe.P != 40.0):
+        print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm（P={pipe.P:g}）", flush=True)
     supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle, c=a.sup_c, e=a.sup_e, r_mm=a.sup_r) if a.sup_mu > 0 else None
     if supest is not None:
         print(f"支撑惩罚 μ={a.sup_mu:g}：每 {a.sup_ref/1000:g} cm³ 估算支撑 = 目标里 {a.sup_mu:g}（阈值 {a.sup_angle:g}°）", flush=True)
@@ -1457,9 +1476,12 @@ def main():
     mma = MMA(1 + len(bcases[:1]), move=a.move) if use_mma else None
     bstate = dict(first=True)
 
+    pG = float(a.penal + 2.0 if a.buck_penal is None else a.buck_penal)
+
     def buck_con(xa_, it):
-        """屈曲约束 KS(λ_目标·μ) − 1 ≤ 0（μ = 1/λ，两个工况各取前 buck_nk 个正的 μ），及其对分析密度的导数"""
-        EG = cp.where(d3, xa_ ** a.penal, cp.asarray(M.E_fix)).astype(F32).ravel()
+        """屈曲约束 KS(λ_目标·μ) − 1 ≤ 0（μ = 1/λ，两个工况各取前 buck_nk 个正的 μ），及其对分析密度的导数。
+        几何刚度惩罚指数 p_G > p_K（默认 5 vs 3）：低密度灰区 E_G/E_K = ξ^(p_G−p_K) → 0，平滑消除灰区假屈曲模态"""
+        EG = cp.where(d3, xa_ ** pG, cp.asarray(M.E_fix)).astype(F32).ravel()
         per = {}
         for l in bcases:
             s0 = M.unit_stress(l)
@@ -1470,7 +1492,7 @@ def main():
         mh = a.buck * np.concatenate([per[l][1] for l in bcases])
         mx = mh.max(); KS = mx + np.log(np.exp(a.ks * (mh - mx)).sum()) / a.ks
         om = a.buck * np.exp(a.ks * (mh - KS))
-        gG = cp.zeros(int(d3.size), F32); o = 0
+        gEG = cp.zeros(int(d3.size), F32); gEK = cp.zeros(int(d3.size), F32); o = 0
         for l in bcases:
             s0, mus, Phs = per[l]
             ol = om[o:o + len(mus)]; o += len(mus)
@@ -1478,8 +1500,10 @@ def main():
             if not keep.any():
                 continue
             A, Bq, Cw = M.buck_sens(l, EG, s0, mus[keep], [p for p, k in zip(Phs, keep) if k], ol[keep])
-            gG += -Bq + F32(1 - M.gmin) * (Cw - A)
-        gG = gG.reshape(NX, NY, NZ).astype(cp.float64) * a.penal * xa_ ** (a.penal - 1) * d3
+            gEG += -Bq
+            gEK += F32(1 - M.gmin) * (Cw - A)
+        gG = (gEG.reshape(NX, NY, NZ).astype(cp.float64) * pG * xa_ ** (pG - 1)
+              + gEK.reshape(NX, NY, NZ).astype(cp.float64) * a.penal * xa_ ** (a.penal - 1)) * d3
         info = {M.names[l]: (round(1.0 / per[l][1][0], 3) if len(per[l][1]) else float("inf")) for l in bcases}
         if it % 10 == 1:                      # 低密度区里的应变能比例：大的话是空区假模态
             low = (xa_ < 0.5) & d3
