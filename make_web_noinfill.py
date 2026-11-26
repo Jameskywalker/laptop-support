@@ -115,6 +115,8 @@ def main():
         sig = f"{sv[0]:g}" if sv[0] == sv[1] else f"平面内 {sv[0]:g}、厚度方向 {sv[1]:g}"
         notes.insert(1, f"表面：优化网格是 {P.T / int(ha['nz']):.3f} mm 的立方体素，直接导出的话缓坡上是这么高的台阶。STL 先把体素平滑（σ = {sig} 个体素），"
                         f"再按 {sm['layer_mm']:g} mm 打印层重建：伸出超过 45° 的地方在下面补斜坡，再削掉补不到的细边，用料调回原值；复核数据也是按平滑后的形状算的。")
+    elif ver.get("iso") == "xi":
+        notes.insert(1, "表面：直接用优化输出的连续密度场 ξ 取 0.5 等值面（仅把二值清理掉的孤岛/碎块压零），保留亚体素连续轮廓，消除二值体素水平锯齿，同时保留细根与 45° 悬空约束；精确固定区与方槽仍按 CAD 布尔合并。")
     B = np.load(f"{a.dir}/binary.npz")["B"]
     t = B.sum(2); thin = float((t[t > 0] <= 1).mean())          # 只有一层体素厚的柱子占比
     th = res["free"].get("thin"); tho = [(short[k], res[k]["thin"]) for k in cmpk if res.get(k, {}).get("thin")]

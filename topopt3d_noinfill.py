@@ -783,7 +783,7 @@ def parse_mid(mid):
 
 class Free3D:
     def __init__(self, nz, kz=P.KZ, skin=1.5, nwall=P.NWALL, nskin=P.NSKIN, infill=P.INFILL, misuse=False, lateral=True, warp=True, asm_z=True,
-                 hxy=None, dz=None, mid=None, gap=0.0, legacy_top=False, joint="block", legacy_slot=False, beam_rev=False):
+                 hxy=None, dz=None, mid=None, gap=0.0, legacy_top=False, joint="block", legacy_slot=False, beam_rev=False, geo_only=False):
         """joint：横梁接口怎么固定。block = 26 × 50 mm 接口区整块固定（墙 + 表皮 + 填充，方槽贯通）；
         clamp = 只固定方槽两端的夹头（params.joint_clamps，实心），其余交给优化，方槽整个留空；
         clampfill = 同 clamp，两臂之间的槽中段也交给优化（只留两端卡扣臂的口袋，params.joint_keepout）。
@@ -856,6 +856,8 @@ class Free3D:
         f3 = np.broadcast_to(fixs[:, :, None], (NX, NY, NZ))
         self.E_fix = np.where(f3, 1.0, Ej) * zr; self.m_fix = np.where(f3, 1.0, mj) * zr
         self.design3 = self.cols["design"][:, :, None] & zr[None, None, :]
+        if geo_only:
+            return
         use_centered_kernels()
         self.D = T3.material_D(P.E_MAT, P.NU, kz); self.kz = kz
         self.gmin = 1e-6

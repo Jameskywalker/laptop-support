@@ -242,11 +242,13 @@ def coarse_from_fine(M, fine):
     return S > 0.5 * (cnt[0][:, None, None] * cnt[1][None, :, None] * cnt[2][None, None, :])
 
 
-def build_mesh(M, F, step=1, fine=None):
+def build_mesh(M, F, step=1, fine=None, simp_tol=None):
     """F：体素场（0..1，固定区为 1）→ manifold；给了 fine（smooth_fine 的结果）就用细网格场的等值面。
     z 两面镜像延拓，切平到 [0, T]；并上精确固定区，挖掉精确方槽"""
     h, F, lev = (M.h, F, 0.5) if fine is None else (fine["lh"], fine["G"], fine["t"])
     hz = M.dz if fine is None else h                        # 扁体素：层向尺寸不同
+    if fine is None and F.shape[2] > M.NT:
+        F = F[:, :, :M.NT]                                  # 补齐多重网格用的空层（z ≥ T）先裁掉，再在 z = T 处镜像，免得顶边被空层斜切
     pz = 3
     G = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
     G = np.pad(G, 2)
@@ -262,7 +264,10 @@ def build_mesh(M, F, step=1, fine=None):
     fixed = shapely.unary_union([g.intersection(dom) for g in M.fixed_regions.values()])
     mesh = mesh + extrude(fixed, 0, P.T)
     mesh = mesh - extrude(M.keepout_geom, -1, P.T + 1)       # 方槽（clampfill 时只是两端卡扣臂的口袋）
-    if fine is not None:
+    if simp_tol is not None:
+        if simp_tol > 0:
+            mesh = mesh.simplify(simp_tol)
+    elif fine is not None:
         mesh = mesh.simplify(0.02)          # 0.02 mm 以内合并近似共面的三角形，面数降到约 1/4
     elif M.dz != M.h or M.h <= P.LAYER_H + 1e-6:
         mesh = mesh.simplify(0.01)          # 扁体素 / 0.2 mm 细体素：表面全是平台阶，合并共面三角形（不然 STL 有几百 MB）
@@ -312,6 +317,9 @@ def main():
     ap.add_argument("--legacy_top", action="store_true", help="按旧的顶面加载节点复核（复现 2026-11-22 以前的数）")
     ap.add_argument("--legacy_slot", action="store_true", help="横梁面内力按旧做法摊在整面受压槽壁上复核（默认只加在卡扣臂贴着的那几段）")
     ap.add_argument("--beam_rev", action="store_true", help="复核时加反向横梁工况（默认取优化时的 --beam_rev）")
+    ap.add_argument("--iso", default="xi", choices=["xi", "binary"], help="不做 --smooth 时等值面用的场：xi = 保留优化连续密度场（平滑亚体素轮廓，默认）；binary = 0/1 二值体素台阶")
+    ap.add_argument("--mesh-only", action="store_true", help="跳过有限元/屈曲复核，复用已有 verify.json（--verify-from 或默认目录），只重导 STL 和悬空检查")
+    ap.add_argument("--verify-from", default=None, help="--mesh-only 时读取哪份 verify.json（默认先看 --md，再看 --dir 对应的默认输出目录）")
     ap.add_argument("--md", default=None, help="输出目录（默认由 --dir 推出；换载荷复核旧设计时另给一个，免得覆盖）")
     a = ap.parse_args()
     sm = [float(v) for v in str(a.smooth).split(",")]
@@ -321,12 +329,13 @@ def main():
     r = np.load(f"{a.dir}/result.npz")
     hist = json.load(open(f"{a.dir}/history.json"))
     ha = hist["args"]
-    md = a.md or (a.dir.replace("noinfill", "model_noinfill") if "noinfill" in a.dir else a.dir + "/model")
+    def_md = a.dir.replace("noinfill", "model_noinfill") if "noinfill" in a.dir else a.dir + "/model"
+    md = a.md or def_md
     os.makedirs(md, exist_ok=True)
     M = N.Free3D(ha["nz"], kz=ha["kz"], skin=ha["skin"], misuse=True, lateral=True, warp=True, asm_z=ha.get("asm_z", True),
                  hxy=ha.get("hxy"), dz=ha.get("dz"), mid=a.mid or ha.get("mid"), gap=ha.get("gap", 0.0),
                  legacy_top=a.legacy_top or ha.get("legacy_top", False), joint=ha.get("joint", "block"),
-                 legacy_slot=a.legacy_slot, beam_rev=a.beam_rev or ha.get("beam_rev", False))    # 复核总带 z 向体力工况；横梁面内力默认按卡扣臂贴着的槽壁段（旧结果复核也一样，--legacy_slot 复现旧数）
+                 legacy_slot=a.legacy_slot, beam_rev=a.beam_rev or ha.get("beam_rev", False), geo_only=a.mesh_only)    # 复核总带 z 向体力工况；横梁面内力默认按卡扣臂贴着的槽壁段（旧结果复核也一样，--legacy_slot 复现旧数）
     if M.joint_mode != "block" or M.legacy_slot:
         print(f"横梁接口：{M.joint_mode}" + ("；横梁面内力摊在整面槽壁上（旧做法）" if M.legacy_slot else ""), flush=True)
     if M.mid or M.legacy_top:
@@ -337,11 +346,12 @@ def main():
     xi = r["xi"].astype(float)
     target = float(r["target"])
     B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0), island_area=float(ha.get("island_area") or 0.0), island_connect=bool(ha.get("island_connect")))
-    _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
-    sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
-                           e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
-    del _S; cp.get_default_memory_pool().free_all_blocks()
-    print(f"估算树状支撑（阈值 {ha.get('sup_angle', 30.0):g}°）：{sup_est/1000:.2f} cm³", flush=True)
+    if not a.mesh_only:
+        _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
+        sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),
+                               e=ha.get("sup_e", 0.47), r_mm=ha.get("sup_r", 0.0))(cp.asarray(_S))[0]
+        del _S; cp.get_default_memory_pool().free_all_blocks()
+        print(f"估算树状支撑（阈值 {ha.get('sup_angle', 30.0):g}°）：{sup_est/1000:.2f} cm³", flush=True)
     print("二值化：", info, flush=True)
     fine = None
     if smooth_on:
@@ -352,90 +362,102 @@ def main():
         print(f"按 {P.LAYER_H} mm 层平滑重建（复核也用平滑后的形状）：", fine["info"], f"{time.time()-tf:.0f}s", flush=True)
         B = Bs
 
-    designs = {}; keys = {}
-    E2, m2, s2 = M.baseline_fields()
-    nm = "二维方案（墙+表皮+15%填充）"; designs[nm] = (E2, m2, s2); keys[nm] = "flat"
     gable_wall = None
-    if not a.no_gable:
-        gable_wall, (Eg, mg, sg) = gable_matched(M, float(m2.sum()) * M.vox)
-        print(f"尖拱空腔对照：墙厚 {gable_wall:.2f} mm 时用料相同", flush=True)
-        nm = f"二维方案 + 尖拱空腔（无填充，墙 {gable_wall:.2f} mm）"; designs[nm] = (Eg, mg, sg); keys[nm] = "gable"
-    tmin = a.tmin or ha.get("tmin") or 1.9
-    thin = {}
-    if a.ref:
-        rr = np.load(f"{a.ref}/result.npz")
-        rj = json.load(open(f"{a.ref}/history.json"))["args"].get("joint", "block")
-        if rj != M.joint_mode:
-            print(f"--ref 的横梁接口是 {rj}，本次是 {M.joint_mode}（固定区不同，不能放在同一个模型里比），跳过", flush=True)
-        elif rr["xi"].shape == xi.shape:
-            Bo, info_o = binarize(M, rr["xi"].astype(float))
-            if smooth_on:               # 对照也按同样方法平滑，网格另存一份给预览
-                fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth, am=a.am)
-                Bo = coarse_from_fine(M, fo) & M.design3
-                to_trimesh(build_mesh(M, None, fine=fo)).export(f"{md}/support_ref_left.stl")
-                del fo
-            nm = "无填充三维（无约束）"; designs[nm] = M.design_fields(Bo.astype(float)); keys[nm] = "free_old"
-            thin[nm] = thin_stats(M, Bo, tmin)
-        else:
-            print(f"--ref 网格 {rr['xi'].shape} 与本次 {xi.shape} 不同，跳过", flush=True)
-    cons = [f"屈曲 ≥ {ha['buck']:g}" if ha.get("buck") else "", f"最薄 {ha['tmin']:g} mm" if ha.get("tmin") else ""]
-    nm = "无填充三维优化" + (f"（{'，'.join(c for c in cons if c)}）" if any(cons) else "")
-    designs[nm] = M.design_fields(B.astype(float)); keys[nm] = "free"
-    thin[nm] = thin_stats(M, B, tmin)
-    print("薄壁统计：", thin, flush=True)
-    res = {}
-    buck_cases = [k for k, nm in enumerate(M.names) if nm in ("前部误用150N", "后部误用150N")]
-    for nm, (E, m, s) in designs.items():
-        M.U = [None] * len(M.F)
-        M.set_mass(m)                      # 第一次调用（二维方案）定下 z 向体力的单位体积力
-        comps, its = M.solve(E)
-        st = M.stresses(s)
-        mass = float(m.sum()) * M.vox
-        res[nm] = dict(key=keys[nm], comp=comps.tolist(), stress=st, mass_cm3=mass / 1000, petg_g=mass / 1000 * 1.27, cg=its, thin=thin.get(nm),
-                       warp_um={k: [round(v[0] * 1000, 2), round(v[1] * 1000, 2)] for k, v in M.warp_measures().items()})   # 顶面平均 z 位移：全长、后半段
-        print(f"{nm}: 用料 {mass/1000:.2f} cm³（PETG {mass/1000*1.27:.0f} g），CG {sum(its)}", flush=True)
-        if not a.no_buckling:
-            tb = time.time(); lam = {}
-            for k in buck_cases:
-                lam[M.names[k]], _, nit = M.buckling(E, k, nvec=4, iters=20)
-            res[nm]["buckling"] = lam
-            print(f"  线性屈曲载荷系数 {dict((k, round(v, 2)) for k, v in lam.items())}（{time.time()-tb:.0f}s）", flush=True)
-    names = M.names
-    k0 = list(res)[0]
-    opt = [k for k in range(len(names)) if M.imp[k] > 0]
-    orig = [k for k in opt if names[k] != "z向体力"]
-    base = np.array(res[k0]["comp"])
-    table = []
-    for nm in res:
-        rel = np.array(res[nm]["comp"]) / base
-        res[nm]["rel"] = rel.tolist()
-        res[nm]["weighted"] = float((M.imp * rel)[opt].sum() / M.imp[opt].sum())
-        res[nm]["weighted_orig"] = float((M.imp * rel)[orig].sum() / M.imp[orig].sum())
-        if M.beam_rev:      # 不计反向横梁工况的加权柔度：和没加 --beam_rev 的结果可比
-            fw = [k for k in opt if not names[k].endswith("反")]
-            res[nm]["weighted_fwd"] = float((M.imp * rel)[fw].sum() / M.imp[fw].sum())
-    for k, nm in enumerate(names):
-        row = dict(工况=nm)
-        for d in res:
-            st = res[d]["stress"][k]
-            row[d] = dict(柔度比=round(res[d]["rel"][k], 3), VM_99_9=round(st["VM_99_9pct_MPa"], 2), VM_max=round(st["VM_max_MPa"], 2),
-                          面内位移_um=round(st["面内位移_mm"] * 1000, 1), z向位移_um=round(st["z向位移_mm"] * 1000, 1))
-        table.append(row)
-    for nm in res:
-        print(f"  {nm}: 加权柔度 {res[nm]['weighted']:.3f}（不计 z 向体力 {res[nm]['weighted_orig']:.3f}" + (f"，不计反向横梁 {res[nm]['weighted_fwd']:.3f}" if "weighted_fwd" in res[nm] else "") + f"），用料 {res[nm]['petg_g']:.1f} g")
-    for row in table:
-        print("  " + row["工况"] + "：" + "；".join(f"{d[:6]} {v['柔度比']:.3f}/{v['VM_99_9']:.1f}MPa/z{v['z向位移_um']:.0f}µm" for d, v in row.items() if d != "工况"))
+    if a.mesh_only:
+        vsrc = a.verify_from or (f"{md}/verify.json" if os.path.exists(f"{md}/verify.json") else f"{def_md}/verify.json")
+        prev_sum = json.load(open(vsrc))
+        print(f"--mesh-only：复用 {vsrc} 的有限元/屈曲复核数据", flush=True)
+    else:
+        designs = {}; keys = {}
+        E2, m2, s2 = M.baseline_fields()
+        nm = "二维方案（墙+表皮+15%填充）"; designs[nm] = (E2, m2, s2); keys[nm] = "flat"
+        if not a.no_gable:
+            gable_wall, (Eg, mg, sg) = gable_matched(M, float(m2.sum()) * M.vox)
+            print(f"尖拱空腔对照：墙厚 {gable_wall:.2f} mm 时用料相同", flush=True)
+            nm = f"二维方案 + 尖拱空腔（无填充，墙 {gable_wall:.2f} mm）"; designs[nm] = (Eg, mg, sg); keys[nm] = "gable"
+        tmin = a.tmin or ha.get("tmin") or 1.9
+        thin = {}
+        if a.ref:
+            rr = np.load(f"{a.ref}/result.npz")
+            rj = json.load(open(f"{a.ref}/history.json"))["args"].get("joint", "block")
+            if rj != M.joint_mode:
+                print(f"--ref 的横梁接口是 {rj}，本次是 {M.joint_mode}（固定区不同，不能放在同一个模型里比），跳过", flush=True)
+            elif rr["xi"].shape == xi.shape:
+                Bo, info_o = binarize(M, rr["xi"].astype(float))
+                if smooth_on:               # 对照也按同样方法平滑，网格另存一份给预览
+                    fo = smooth_fine(M, np.where(M.design3, Bo, M.E_fix > 0), a.smooth, am=a.am)
+                    Bo = coarse_from_fine(M, fo) & M.design3
+                    to_trimesh(build_mesh(M, None, fine=fo)).export(f"{md}/support_ref_left.stl")
+                    del fo
+                nm = "无填充三维（无约束）"; designs[nm] = M.design_fields(Bo.astype(float)); keys[nm] = "free_old"
+                thin[nm] = thin_stats(M, Bo, tmin)
+            else:
+                print(f"--ref 网格 {rr['xi'].shape} 与本次 {xi.shape} 不同，跳过", flush=True)
+        cons = [f"屈曲 ≥ {ha['buck']:g}" if ha.get("buck") else "", f"最薄 {ha['tmin']:g} mm" if ha.get("tmin") else ""]
+        nm = "无填充三维优化" + (f"（{'，'.join(c for c in cons if c)}）" if any(cons) else "")
+        designs[nm] = M.design_fields(B.astype(float)); keys[nm] = "free"
+        thin[nm] = thin_stats(M, B, tmin)
+        print("薄壁统计：", thin, flush=True)
+        res = {}
+        buck_cases = [k for k, nm in enumerate(M.names) if nm in ("前部误用150N", "后部误用150N")]
+        for nm, (E, m, s) in designs.items():
+            M.U = [None] * len(M.F)
+            M.set_mass(m)                      # 第一次调用（二维方案）定下 z 向体力的单位体积力
+            comps, its = M.solve(E)
+            st = M.stresses(s)
+            mass = float(m.sum()) * M.vox
+            res[nm] = dict(key=keys[nm], comp=comps.tolist(), stress=st, mass_cm3=mass / 1000, petg_g=mass / 1000 * 1.27, cg=its, thin=thin.get(nm),
+                           warp_um={k: [round(v[0] * 1000, 2), round(v[1] * 1000, 2)] for k, v in M.warp_measures().items()})   # 顶面平均 z 位移：全长、后半段
+            print(f"{nm}: 用料 {mass/1000:.2f} cm³（PETG {mass/1000*1.27:.0f} g），CG {sum(its)}", flush=True)
+            if not a.no_buckling:
+                tb = time.time(); lam = {}
+                for k in buck_cases:
+                    lam[M.names[k]], _, nit = M.buckling(E, k, nvec=4, iters=20)
+                res[nm]["buckling"] = lam
+                print(f"  线性屈曲载荷系数 {dict((k, round(v, 2)) for k, v in lam.items())}（{time.time()-tb:.0f}s）", flush=True)
+        names = M.names
+        k0 = list(res)[0]
+        opt = [k for k in range(len(names)) if M.imp[k] > 0]
+        orig = [k for k in opt if names[k] != "z向体力"]
+        base = np.array(res[k0]["comp"])
+        table = []
+        for nm in res:
+            rel = np.array(res[nm]["comp"]) / base
+            res[nm]["rel"] = rel.tolist()
+            res[nm]["weighted"] = float((M.imp * rel)[opt].sum() / M.imp[opt].sum())
+            res[nm]["weighted_orig"] = float((M.imp * rel)[orig].sum() / M.imp[orig].sum())
+            if M.beam_rev:      # 不计反向横梁工况的加权柔度：和没加 --beam_rev 的结果可比
+                fw = [k for k in opt if not names[k].endswith("反")]
+                res[nm]["weighted_fwd"] = float((M.imp * rel)[fw].sum() / M.imp[fw].sum())
+        for k, nm in enumerate(names):
+            row = dict(工况=nm)
+            for d in res:
+                st = res[d]["stress"][k]
+                row[d] = dict(柔度比=round(res[d]["rel"][k], 3), VM_99_9=round(st["VM_99_9pct_MPa"], 2), VM_max=round(st["VM_max_MPa"], 2),
+                              面内位移_um=round(st["面内位移_mm"] * 1000, 1), z向位移_um=round(st["z向位移_mm"] * 1000, 1))
+            table.append(row)
+        for nm in res:
+            print(f"  {nm}: 加权柔度 {res[nm]['weighted']:.3f}（不计 z 向体力 {res[nm]['weighted_orig']:.3f}" + (f"，不计反向横梁 {res[nm]['weighted_fwd']:.3f}" if "weighted_fwd" in res[nm] else "") + f"），用料 {res[nm]['petg_g']:.1f} g")
+        for row in table:
+            print("  " + row["工况"] + "：" + "；".join(f"{d[:6]} {v['柔度比']:.3f}/{v['VM_99_9']:.1f}MPa/z{v['z向位移_um']:.0f}µm" for d, v in row.items() if d != "工况"))
 
     # 网格
     tm = time.time()
-    F = np.where(M.design3, B.astype(float), (M.E_fix > 0).astype(float))   # 用检查过悬空的二值体素（立方体素 + 十字支撑 → 斜面不超过 45°）
-    man = build_mesh(M, F, fine=fine)
+    iso_mode = "smooth" if fine is not None else a.iso
+    if iso_mode == "xi":
+        xi_clean = np.where(B | (xi <= 0.5), xi, 0.0)                      # 保留连续密度场做亚体素等值面，仅把 binarize 剔除的孤岛/碎块/悬空压到 0
+        F = np.where(M.design3, xi_clean, (M.E_fix > 0).astype(float))
+        simp_tol = 0.02
+    else:
+        F = np.where(M.design3, B.astype(float), (M.E_fix > 0).astype(float))
+        simp_tol = None
+    man = build_mesh(M, F, fine=fine, simp_tol=simp_tol)
     if fine is not None:
         del fine["G"]
     left = to_trimesh(man)
     parts = man.decompose()
     cav = sorted([-p.volume() for p in parts if p.volume() < 0])
-    print(f"网格 {len(left.faces)} 面，水密 {left.is_watertight}，体积 {left.volume/1000:.2f} cm³，实体 {sum(p.volume() > 0 for p in parts)} 块，"
+    print(f"网格（iso={iso_mode}）{len(left.faces)} 面，水密 {left.is_watertight}，体积 {left.volume/1000:.2f} cm³，实体 {sum(p.volume() > 0 for p in parts)} 块，"
           f"封闭空腔 {len(cav)} 个（{', '.join(f'{v:.0f}' for v in cav[::-1][:6])} mm³），{time.time()-tm:.0f}s", flush=True)
     left.export(f"{md}/support_noinfill_left.stl")
     right = left.copy(); right.apply_transform(np.diag([-1, 1, 1, 1])); right.apply_translation((float(left.bounds[1][0]), 0, 0))
@@ -454,11 +476,16 @@ def main():
     jv = extrude(M.joint_geom, 0, P.T).volume()
     jm = float(M.m_fix[M.cols["jnt"]].sum()) * M.vox
     mass_mesh = (left.volume - jv + jm) / 1000
-    summary = dict(names=names, binarize=info, mesh=dict(faces=len(left.faces), watertight=bool(left.is_watertight), volume_cm3=left.volume / 1000,
-                   printed_cm3=mass_mesh, petg_g=mass_mesh * 1.27, bodies=int(sum(p.volume() > 0 for p in parts)), cavities_mm3=cav), overhang=oh,
-                   target_cm3=target / 1000, results=res, table=table, args=ha, gable_wall_mm=gable_wall,
-                   overhang_gable=oh_g if gable_wall is not None else None, smooth=fine["info"] if fine is not None else None,
-                   ref_model_dir=(a.ref.replace("noinfill", "model_noinfill") if a.ref and "noinfill" in a.ref else None))
+    mesh_meta = dict(faces=len(left.faces), watertight=bool(left.is_watertight), volume_cm3=left.volume / 1000,
+                     printed_cm3=mass_mesh, petg_g=mass_mesh * 1.27, bodies=int(sum(p.volume() > 0 for p in parts)), cavities_mm3=cav)
+    if a.mesh_only:
+        summary = dict(prev_sum, binarize=info, mesh=mesh_meta, overhang=oh, iso=iso_mode,
+                       smooth=fine["info"] if fine is not None else None)
+    else:
+        summary = dict(names=names, binarize=info, mesh=mesh_meta, overhang=oh, iso=iso_mode,
+                       target_cm3=target / 1000, results=res, table=table, args=ha, gable_wall_mm=gable_wall,
+                       overhang_gable=oh_g if gable_wall is not None else None, smooth=fine["info"] if fine is not None else None,
+                       ref_model_dir=(a.ref.replace("noinfill", "model_noinfill") if a.ref and "noinfill" in a.ref else None))
     json.dump(summary, open(f"{md}/verify.json", "w"), ensure_ascii=False, indent=1)
     np.savez_compressed(f"{md}/binary.npz", B=B, h=M.h, dz=M.dz, NT=M.NT)
     N.fig_sections(M, np.where(M.design3, B, M.E_fix > 0).astype(float), f"{md}/sections_binary.png", "二值化后的剖面（x = 常数，纵轴为打印方向）")
