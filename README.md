@@ -477,6 +477,53 @@ STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/mode
    PADS=1 ./run_all.sh desk40                                                                   # 或者在一键重算的最后带上
    ```
 
+## 走线与路径规划（不改打印模式与速度参数，2026-11-28）
+
+不改变任何打印模式、层高（0.2 mm）、线宽、墙圈数（2 圈）、100% 实心、速度/加速度/Jerk 上限、体积流量上限（18 mm³/s）与外墙悬空降速，仅通过路径生成与排序优化缩减非物理拐角刹车与空驶/抬升开销。
+
+**两阶段架构**：
+1. **阶段 1（Bambu Studio 纯路径选项，`bambu_slice.py`）**：启用 `wall_generator=arachne`（变宽墙消除大量碎裂 `Gap infill`）、`enable_arc_fitting=1` + `resolution=0.05`（用切向连续 `G2/G3` 圆弧替代 0.2 mm 体素微折线，避开经典 Jerk 拐角限速）、`seam_position=nearest`。
+2. **阶段 2A + 阶段 3（内部连通费马螺旋 + 实体内 Combing，`infill_spiral.py`、`toolpath_plan.py`）**：
+   - 第 1 层、第 75 层、全部保留墙段（`Outer wall` 含悬空降速、`Inner wall`、`Overhang wall`）、`Bottom surface`、`Bridge` 以及真正水平外露顶面（面积 ≥ 12 mm²、宽 ≥ 1.5 mm）原样保留。
+   - 将内部被割裂的 `Sparse infill`、`Internal solid infill`、`Floating vertical shell`、`Gap infill` 与斜坡体素台阶 `Top surface` 碎条合并为统一实心内部区域（用 `manifold3d` 精确切出床面实体轮廓扣除已打印墙足迹），按 Slic3r 真实线距 $S = W - h(1 - \pi/4) = 0.4071\text{ mm}$ 逐圈内缩，并在**奇数层首圈采用 0.62 mm 宽道（其余及偶数层保持 0.45 mm）实现奇偶层「砖墙式」半线距错层**（所有内部道间焊缝向内错开 0.17 mm），再用**无交叉缺口拼接**（每层按黄金角 137.5° 错开搭接位）连成单条零内部回抽的连续螺旋，并对残余窄通道（≥ 0.8 mm²）提取骨架中轴线变宽收口。
+   - 对连续螺旋做严格垂直平分线投影 `G2/G3` 圆弧拟合（端点半径误差 < 0.002 mm）与精确体积流量限速（≤ 18 mm³/s）。
+   - 同岛先墙后内、内墙先于外墙约束下做层内 Or-opt 排序与层间起终点衔接；1–20 mm 且路径严格留在 `solid(L)` 内缩 0.55 mm 内的内部跳转采用无 Z-hop 实体内 Combing。
+
+**本机 Bambu Studio 实切对照（`lv020_oct` 左支撑，基线 2h 24m 28s / 69.41 g）**：
+
+| 阶段 / 对照方案 | 时间（Bambu 实切 / 校准模型） | 对比基线 | 关键变化 |
+|---|---|---|---|
+| 基线（classic + zig-zag + 无圆弧 + res=0.012） | 2h 24m 28s（8,668 s） | — | 8,554 次回抽，0 条挤出 `G2/G3` |
+| 仅 `resolution=0.05`（关闭圆弧） | 2h 21m 34s（8,494 s） | −2.0% | 仅减少折点 |
+| `resolution=0.05` + `enable_arc_fitting=1` | 2h 15m 31s（8,131 s） | −6.2% | 75,545 条 `G2/G3` 圆弧 |
+| 仅 `wall_generator=arachne` | 2h 17m 20s（8,240 s） | −4.9% | 回抽降至 7,162 次 |
+| 反例：Bambu 原生 `concentric` 同心填充 | 2h 37m 38s（9,458 s） | **+9.1%（更慢）** | 每圈之间全回抽（14,147 次） |
+| **阶段 1（`arachne + arc(0.05) + nearest seam`）** | **2h 09m 01s（7,741 s）** | **−10.7%** | **零手工干预，省 15m 27s** |
+| **阶段 1 + 2A + 3 左支撑（奇偶半线距错层）** | **1h 44m 48s（模型 1h 47m 54s）** | **−27.4%（−39m 40s）** | **Z-hop 降至 2,265 次 + Combing 1,366 次** |
+| **阶段 1 + 2A + 3 右支撑（奇偶半线距错层）** | **1h 44m 32s（模型 1h 47m 31s）** | **−27.5%（−39m 35s）** | **基线 2h 24m 07s → 1h 44m 32s** |
+
+**校核结果**（`verify_toolpath.py` 全项通过，时间模型 `gcode_time.py` 已按 Bambu 带圆弧实切校准误差 ≤ 3%）：
+- 物理实体覆盖率 98.76%–99.09%，越界 `OOB = 0.000%`，单层实心体积与 CAD 几何（58.56 cm³）之比均值 **0.994**（0.984–1.005；原 Bambu zig-zag 为 95.0% / 55.66 cm³，螺旋版总耗材 72.8 g 更接近 100% 真满实心）。
+- 奇偶半线距错层使第 29–31、49–50 层相邻层微空隙垂直重合面积从未错层时的 **10.8–16.4 mm²** 降至 **6.1–7.3 mm²**（降幅约 60%，接近基线 4.1–4.7 mm²）。
+- 全部运动 `max_Q = 18.03 mm³/s`、`q_viol = 0`、`arc_viol = 0`、`v_viol = 0`，第 1/75 层及全部 `Outer wall` 长度与悬空速度分布 100% 保持原样。
+
+```bash
+# 1. 阶段 1：本机 Bambu Studio 纯路径规划切片
+.venv/bin/python bambu_slice.py out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left_bambu.gcode.3mf \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left.stl \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct/stage1_left
+
+# 2. 阶段 2A + 3：统一内部连通费马螺旋 + 圆弧拟合 + 全局排序与 Combing
+.venv/bin/python toolpath_plan.py out/desk40/model_noinfill_clampfillrev_lv020_oct/stage1_left/sliced.3mf \
+    -o out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left_spiral_planned.gcode.3mf \
+    --report out/desk40/model_noinfill_clampfillrev_lv020_oct/spiral_plan_left.json
+
+# 3. 全项物理/几何/限值校核
+.venv/bin/python verify_toolpath.py out/desk40/model_noinfill_clampfillrev_lv020_oct/stage1_left/sliced.3mf \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left_spiral_planned.gcode.3mf
+```
+生成的 `*_spiral_planned.gcode.3mf` 已重写 `M73`、文件头预计时间与 `slice_info.config`（MD5 同步更新），在 Bambu Studio 中打开后请**直接打印，切勿重新切片**。
+
 ## 重新生成
 
 环境（Python 3.12）：
