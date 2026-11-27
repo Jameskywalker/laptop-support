@@ -29,7 +29,7 @@ import topopt3d_noinfill as N
 
 
 # ---------------- 二值化与清理 ----------------
-def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_connect=False):
+def binarize(M, xi, no_am=False, am_angle=45.0, am_oct=False, ground=False, ground_r=0.0, island_area=0.0, island_connect=False):
     d3 = M.design3
     B = np.where(d3, xi > 0.5, M.E_fix > 0)                # 固定区（含接口区）算有材料
     B00 = B; n_small = 0
@@ -50,7 +50,7 @@ def binarize(M, xi, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, isla
             gi, gj = np.meshgrid(og, og, indexing="ij")
             g0 = binary_dilation(g0, structure=(gi * M.h) ** 2 + (gj * M.h) ** 2 <= ground_r ** 2 + 1e-9)
         B = np.where(d3, B & g0[:, :, None], B)
-    B1 = B if no_am else N.am_binary(B, *N.am_stencil(M.h, M.dz, am_angle))
+    B1 = B if no_am else N.am_binary(B, *N.am_stencil(M.h, M.dz, am_angle), oct=am_oct)
     lab, n = label(B1)                                      # 6 连通
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
     B2 = lab == int(sizes.argmax())
@@ -345,7 +345,7 @@ def main():
         smooth_on = False
     xi = r["xi"].astype(float)
     target = float(r["target"])
-    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0), island_area=float(ha.get("island_area") or 0.0), island_connect=bool(ha.get("island_connect")))
+    B, info = binarize(M, xi, no_am=bool(ha.get("no_am")), am_angle=ha.get("am_angle", 45.0), am_oct=bool(ha.get("am_oct")), ground=bool(ha.get("ground")), ground_r=float(ha.get("ground_r") or 0.0), island_area=float(ha.get("island_area") or 0.0), island_connect=bool(ha.get("island_connect")))
     if not a.mesh_only:
         _S = np.where(M.design3, B, M.E_fix > 0).astype(np.float64)
         sup_est = N.SupportEst(M.h, M.dz, M.NT, angle=ha.get("sup_angle", 30.0), c=ha.get("sup_c", 2.0),

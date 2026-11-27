@@ -288,6 +288,15 @@ def plus_sum(A):
     return out
 
 
+def box3_sum(A):
+    """3×3 九点邻域（自身 + 面内八邻）求和，越界按 0；两步可分离切片加法（4 次加法，同 plus_sum），对称自转置"""
+    t = A.copy()
+    t[1:] += A[:-1]; t[:-1] += A[1:]
+    out = t.copy()
+    out[:, 1:] += t[:, :-1]; out[:, :-1] += t[:, 1:]
+    return out
+
+
 def am_stencil(h, dz, angle=45.0):
     """悬空角 angle（允许的最缓斜面与床面的夹角，度；45 = 常规 45° 规则）→ (m, 面内支撑核)。
     每层允许外扩 g = dz/tan(angle) mm，即 g/h 格：
@@ -355,7 +364,7 @@ class Pipeline:
     厚度只要求一半。打印设计 x̄（阈值 0.5）始终按有效厚度内（0 ≤ k < nt）的邻居归一，否则层向体素细（如 dz = 0.2 mm）
     时床面那层即使全实心 x̃ 也只剩 ~0.55，窄墙掉到 0.5 以下、贴床直接断开并沿 AM 滤波往上整片塌掉。"""
 
-    def __init__(self, shape, h, rmin, fixed, fval, p_am=None, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False, nt=None):
+    def __init__(self, shape, h, rmin, fixed, fval, p_am=None, eps=1e-6, xi0=0.5, pad_void=False, eta_e=None, dz=None, no_am=False, am_angle=45.0, am_oct=False, eta_am=None, ground=False, ground_r=0.0, island_area=0.0, island_beta=0.0, island_soft=0.0, island_connect=False, nt=None):
         dz = dz or h
         R, Rz = int(np.ceil(rmin / h)) - 1, int(np.ceil(rmin / dz)) - 1
         o, oz = np.arange(-R, R + 1), np.arange(-Rz, Rz + 1)
@@ -371,19 +380,23 @@ class Pipeline:
         self.Ks_p = cp.maximum(self._corr(valid), 1e-12)                                        # 打印设计：有效厚度内归一（床面/顶面不吃料）
         self.Ks = float(K.sum()) if pad_void else self.Ks_p                                     # 腐蚀设计（及外部 filt 兼容）：pad_void 时网格外按空
         self.eta_e = eta_e
+        self.eta_am = float(eta_am) if (eta_am is not None and eta_am > 0) else None            # 腐蚀支承双轨阈值（按 Ks_p 归一，堵住亚 tmin 细针传支撑漏洞）
         self.fixed = cp.asarray(fixed); self.fval = cp.asarray(fval, cp.float64)
         self.free = ~self.fixed
         # 悬空：每层最多外扩 dz/tan(angle)（mm），见 am_stencil。45°、体素宽 h = m·dz 时，每层相对下面 1..m 层都最多外扩一格
-        # （十字邻域）：平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法
+        # （十字邻域）：平均每 m 层外扩一格 = 45°，单层最多伸出一格。m = 1（立方体素）就是原来的做法；
+        # am_oct=True 时（仅 m = 1 且用十字核）：每 3 层循环 1 层 3×3 九点 + 2 层十字五点，轴向 45.0° / 对角 46.7° / 最缓 43.5°，近似圆形波前
         self.am_angle = am_angle
         self.m_am, ker = am_stencil(h, dz, am_angle)
         self.am_ker = None if ker is None else cp.asarray(ker.astype(np.float64))
+        self.am_oct = bool(am_oct and ker is None and self.m_am == 1)
         nst = 5 if ker is None else int(ker.sum())
         if p_am is None:
             # 有效外扩步数 nt/m_am 增大（如 0.2³ 时 75 步 vs 0.625³ 的 24 步）时按比例加大 P，
             # 避免单邻居 45° 悬空边沿 (P/Q)^steps 指数衰减及反传梯度爆炸
             p_am = min(150.0, max(40.0, round(40.0 * (nt / self.m_am) / 24.0, 1)))
         self.P = float(p_am); self.Q = self.P + np.log(nst) / np.log(xi0); self.eps = eps     # 邻域格数 nst：均匀 ξ0 时 smax = ξ0
+        self.Q9 = self.P + np.log(9) / np.log(xi0)                                            # 九点层用的 Q（均匀 ξ0 时 smax = ξ0）
         self.no_am = no_am                                       # True：不加悬空限制（对照：打印时靠支撑）
         self.ground = ground or ground_r > 0                     # True：接地，见 ground_forward
         self.h_xy = h; self.isl_A = island_area; self.isl_b = island_beta      # 底面孤岛最小面积 mm²（0 = 不限），见 island_forward
@@ -412,15 +425,19 @@ class Pipeline:
     def filt(self, x):
         return self._corr(x) / self.Ks
 
-    def _ss(self, A):
-        """支撑邻域求和（十字或圆盘，都对称，所以也是自己的转置）"""
-        return plus_sum(A) if self.am_ker is None else cnd.correlate(A, self.am_ker, mode="constant", cval=0.0)
+    def _ss(self, A, k=None):
+        """支撑邻域求和（十字、九点或圆盘，都对称，所以也是自己的转置）"""
+        if self.am_ker is not None:
+            return cnd.correlate(A, self.am_ker, mode="constant", cval=0.0)
+        if self.am_oct and k is not None and (k % 3 == 1):
+            return box3_sum(A)
+        return plus_sum(A)
 
-    def forward(self, x, beta):
-        xf = cp.where(self.fixed, self.fval, x)
-        xt_raw = self._corr(xf)
-        xb, dxb = T2.project(xt_raw / self.Ks_p, float(beta), 0.5)
-        xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
+    def _q(self, k):
+        return self.Q9 if (self.am_oct and (k % 3 == 1)) else self.Q
+
+    def _am_chain_forward(self, xb, beta):
+        """孤岛 → 接地 → AM 滤波一整条支承链，供打印轨和腐蚀支承轨共用"""
         xa, ic = xb, None
         if (self.isl_A > 0 or self.isl_conn) and beta >= self.isl_b:
             xa, ic = (self.island_connect_forward(xa) if self.isl_conn else
@@ -432,15 +449,37 @@ class Pipeline:
         else:
             xi, c = self.am_forward(xa)
         c["isl"] = ic
+        return xi, c
+
+    def _am_chain_backward(self, gxi, c):
+        return self.island_backward(self.ground_backward(self.am_backward(gxi, c), c), c.get("isl"))
+
+    def forward(self, x, beta):
+        xf = cp.where(self.fixed, self.fval, x)
+        xt_raw = self._corr(xf)
+        xt_p = xt_raw / self.Ks_p
+        xb, dxb = T2.project(xt_p, float(beta), 0.5)
+        xb = cp.where(self.fixed, self.fval, xb); dxb = cp.where(self.fixed, 0.0, dxb)
+        xi, c = self._am_chain_forward(xb, beta)
         c["dxb"] = dxb
         if self.eta_e is not None:
-            # 腐蚀设计 ξ_e = x̄_e·s，s = ξ/x̄ 是打印设计里"被下层托住"的比例（AM 滤波只对打印设计做一次：
-            # 腐蚀设计在床面那层会被吃掉，单独做 AM 滤波的话上面全塌）。灰度阶段 ξ_e ≈ x̄_e，不会两个灰度相乘塌成空
+            # 腐蚀设计 ξ_e = x̄_e·s，s = ξ/x̄ 是打印设计里"被下层托住"的比例（AM 滤波不直接跑在 pad_void 的 x̄_e 上：
+            # 否则床面那层被吃掉、上面全塌）。若给了 eta_am（如 0.65，按 Ks_p 归一不吃床面），则额外跑一条腐蚀支承轨
+            # x̄_am = project(x̃_p, β, η_am) → ξ_am = AM(x̄_am)，用 s = ξ_am / max(x̄_am, ξ_am) 堵住亚 tmin 细针传支撑漏洞
             xe, dxe = T2.project(xt_raw / self.Ks, float(beta), self.eta_e)
             xe = cp.where(self.fixed, self.fval, xe); dxe = cp.where(self.fixed, 0.0, dxe)
-            den = cp.maximum(cp.maximum(xb, xi), 1e-12)
-            s = xi / den
-            c.update(xe=xe, dxe=dxe, s=s, br=xb > xi, q=xe / den)
+            if self.eta_am is not None and not self.no_am:
+                xam, dxam = T2.project(xt_p, float(beta), self.eta_am)
+                xam[:, :, 0] = xb[:, :, 0]; dxam[:, :, 0] = dxb[:, :, 0]   # 床面层 k=0 保持 0.5 阈值（保护倒三角底梁贴床窄脊不断连），k ≥ 1 截断细针
+                xam = cp.where(self.fixed, self.fval, xam); dxam = cp.where(self.fixed, 0.0, dxam)
+                xiam, c_am = self._am_chain_forward(xam, beta)
+                den = cp.maximum(cp.maximum(xam, xiam), 1e-12)
+                s = xiam / den
+                c.update(xe=xe, dxe=dxe, s=s, br=xam > xiam, q=xe / den, c_am=c_am, dxam=dxam)
+            else:
+                den = cp.maximum(cp.maximum(xb, xi), 1e-12)
+                s = xi / den
+                c.update(xe=xe, dxe=dxe, s=s, br=xb > xi, q=xe / den, c_am=None)
             c["xie"] = xe * s
         return xi, c
 
@@ -560,25 +599,27 @@ class Pipeline:
         return out
 
     def am_forward(self, xb):
-        """ξ_k = smin(x̄_k, Σ_k)，Σ_k = smin_j S_j，S_j = (十字邻域 Σ ξ_{k−j}^P)^{1/Q}（j = 1..m；k−j < 0 时是床面，S_j = 1）"""
+        """ξ_k = smin(x̄_k, Σ_k)，Σ_k = smin_j S_j，S_j = (支撑邻域 Σ ξ_{k−j}^P)^{1/Q}（j = 1..m；k−j < 0 时是床面，S_j = 1）"""
         if self.no_am:
             return xb, dict(xi=xb)
-        Pp, Q, eps, m = self.P, self.Q, self.eps, self.m_am
+        Pp, eps, m = self.P, self.eps, self.m_am
         se = np.sqrt(eps)
         NZ = xb.shape[2]
         xi = cp.empty_like(xb); dsx = cp.zeros_like(xb); dsS = cp.zeros_like(xb)
-        S = [cp.ones_like(xb) for _ in range(m)]; W = [cp.zeros_like(xb) for _ in range(m)]    # S_j 的 P 次和、∂Σ/∂S_j
+        S = [cp.ones_like(xb) for _ in range(m)]
+        W = None if m == 1 else [cp.zeros_like(xb) for _ in range(m)]    # m = 1 时 W 恒为 1，省一套显存
         xi[:, :, 0] = xb[:, :, 0]
         for k in range(1, NZ):
             fr = self.free[:, :, k]
+            Q = self._q(k)
             Sig = None; wj = []
             for j in range(1, m + 1):
                 if k - j < 0:
                     continue
-                Sk = cp.maximum(self._ss(xi[:, :, k - j] ** Pp), 1e-280); S[j - 1][:, :, k] = Sk
+                Sk = cp.maximum(self._ss(xi[:, :, k - j] ** Pp, k), 1e-280); S[j - 1][:, :, k] = Sk
                 Sg = Sk ** (1.0 / Q)
                 if Sig is None:
-                    Sig = Sg; wj = [(j, cp.ones_like(Sg))]
+                    Sig = Sg; wj = [(j, cp.ones_like(Sg))] if m > 1 else []
                 else:                                           # Σ ← smin(Σ, S_j)，之前各项的 ∂Σ/∂S 跟着乘
                     d = Sig - Sg; r = cp.sqrt(d * d + eps)
                     a1, a2 = 0.5 * (1 - d / r), 0.5 * (1 + d / r)
@@ -589,8 +630,9 @@ class Pipeline:
             xi[:, :, k] = cp.where(fr, v, x)
             dsx[:, :, k] = cp.where(fr, 0.5 * (1 - d / r), 0.0)
             dsS[:, :, k] = cp.where(fr, 0.5 * (1 + d / r), 0.0)
-            for jj, w in wj:
-                W[jj - 1][:, :, k] = w
+            if W is not None:
+                for jj, w in wj:
+                    W[jj - 1][:, :, k] = w
         dsx[:, :, 0] = cp.where(self.free[:, :, 0], 1.0, 0.0)
         return xi, dict(xi=xi, S=S, W=W, dsx=dsx, dsS=dsS)
 
@@ -598,31 +640,38 @@ class Pipeline:
         """dF/dξ → dF/dx̄（从顶层往下传；第 k 层的梯度只来自上面各层，处理到它时已经齐了）"""
         if self.no_am:
             return gxi
-        Pp, Q, m = self.P, self.Q, self.m_am
+        Pp, m = self.P, self.m_am
+        W = c["W"]
         g = gxi.copy(); gxb = cp.zeros_like(gxi)
         for k in range(gxi.shape[2] - 1, 0, -1):
             gk = g[:, :, k]
             gxb[:, :, k] = gk * c["dsx"][:, :, k]
             gS = gk * c["dsS"][:, :, k]
+            Q = self._q(k)
             for j in range(1, m + 1):
                 if k - j < 0:
                     continue
-                A = gS * c["W"][j - 1][:, :, k] * (1.0 / Q) * c["S"][j - 1][:, :, k] ** (1.0 / Q - 1.0)
-                g[:, :, k - j] += Pp * c["xi"][:, :, k - j] ** (Pp - 1) * self._ss(A)
+                wk = 1.0 if W is None else W[j - 1][:, :, k]
+                A = gS * wk * (1.0 / Q) * c["S"][j - 1][:, :, k] ** (1.0 / Q - 1.0)
+                g[:, :, k - j] += Pp * c["xi"][:, :, k - j] ** (Pp - 1) * self._ss(A, k)
         gxb[:, :, 0] = g[:, :, 0] * c["dsx"][:, :, 0]
         return gxb
 
     def backward(self, gxi, c, gxe=None):
         """dF/dξ（打印设计，可为 None）+ dF/dξ_e（腐蚀设计）→ dF/dx"""
-        gdir = 0.0
-        if gxe is not None:                     # ξ_e = x̄_e·ξ/x̄（x̄ > ξ 时；否则 ξ_e = x̄_e）
-            gq = cp.where(c["br"], gxe * c["q"], 0.0)
-            gxi = (0.0 if gxi is None else gxi) + gq
-            gdir = -gq * c["s"]
-        g = self.island_backward(self.ground_backward(self.am_backward(gxi, c), c), c.get("isl"))
-        gt = (g + gdir) * c["dxb"] / self.Ks_p
-        if gxe is not None:
+        gt = cp.zeros_like(self.Ks_p)
+        if gxe is not None:                     # ξ_e = x̄_e·s
             gt = gt + gxe * c["s"] * c["dxe"] / self.Ks
+            gq = cp.where(c["br"], gxe * c["q"], 0.0)
+            if c.get("c_am") is not None:       # 腐蚀支承双轨：s 来自独立支承轨 ξ_am = AM(x̄_am)
+                g_am = self._am_chain_backward(gq, c["c_am"])
+                gt = gt + (g_am - gq * c["s"]) * c["dxam"] / self.Ks_p
+            else:
+                gxi = (0.0 if gxi is None else gxi) + gq
+                gt = gt - gq * c["s"] * c["dxb"] / self.Ks_p
+        if gxi is not None:
+            g = self._am_chain_backward(gxi, c)
+            gt = gt + g * c["dxb"] / self.Ks_p
         return self._corr(gt) * self.free
 
 
@@ -659,10 +708,11 @@ def rmin_for_thickness(tmin, h, eta_e=0.75, dz=None):
     return r, nt_x * h, n_min(r, dz, 2) * dz
 
 
-def am_binary(B, m=1, ker=None):
+def am_binary(B, m=1, ker=None, oct=False):
     """二值模型的悬空检查/修整：从床面往上，没有支撑的体素去掉（每层相对下面 1..m 层的支撑邻域里要有材料，见 am_stencil；
-    ker 为 None 时是十字邻域）"""
+    ker 为 None 时是十字邻域，oct=True 且 m=1 时按每 3 层 1 次 3×3 九点 + 2 次十字交替）"""
     B = B.copy()
+    use_oct = bool(oct and ker is None and m == 1)
     if ker is not None:
         from scipy.ndimage import correlate
         kk = ker.astype(np.int32)
@@ -670,7 +720,12 @@ def am_binary(B, m=1, ker=None):
         for j in range(1, m + 1):
             if k - j >= 0:
                 lo = B[:, :, k - j]
-                s = plus_sum(lo.astype(np.uint8)) if ker is None else correlate(lo.astype(np.int32), kk, mode="constant", cval=0)
+                if ker is not None:
+                    s = correlate(lo.astype(np.int32), kk, mode="constant", cval=0)
+                elif use_oct and (k % 3 == 1):
+                    s = box3_sum(lo.astype(np.uint8))
+                else:
+                    s = plus_sum(lo.astype(np.uint8))
                 B[:, :, k] &= s > 0
     return B
 
@@ -1101,15 +1156,32 @@ class Free3D:
             Li = np.linalg.inv(np.linalg.cholesky(Bm))
             mu, V = np.linalg.eigh(Li @ Am @ Li.T)
             C = Li.T @ V                                          # Cᵀ Bm C = I → Φ = Gᵀ C 是 K 归一化的
-            Phi = cp.asarray(C.T, F32) @ G
-            del G
-            X = [self._store(p / cp.linalg.norm(p), host_bufs[i]) if (step_i == nit - 1) else (p / cp.linalg.norm(p)) for i, p in enumerate(Phi)]
+            if self.offload:
+                # 逐向量线性组合避免同时分配 7.4 GB 的 G 与 7.4 GB 的 Phi，并将最终模态暂存主机内存（省 ~10 GB 显存）
+                X_new = []
+                Phi_out = [] if step_i == nit - 1 else None
+                for i in range(nb):
+                    p = cp.zeros(self.F[0].size, F32)
+                    for j in range(nb):
+                        p += F32(C[j, i]) * G[j]
+                    if step_i == nit - 1:
+                        Phi_out.append(self._store(p))
+                    nrm = cp.linalg.norm(p)
+                    X_new.append(self._store(p / nrm, host_bufs[i]) if (step_i == nit - 1) else (p / nrm))
+                    del p
+                del G
+                X = X_new
+            else:
+                Phi = cp.asarray(C.T, F32) @ G
+                del G
+                X = [p / cp.linalg.norm(p) for p in Phi]
+                Phi_out = [Phi[i] for i in range(nb)] if step_i == nit - 1 else None
             mu0 = mu
             if mu.min() < 0:
                 st["shift"] = max(st["shift"], 1.05 * float(-mu.min()))
         st["X"] = X; st["mu"] = mu0
         o = np.argsort(-mu)
-        return mu[o], [Phi[i] for i in o]
+        return mu[o], [Phi_out[i] for i in o]
 
     def buck_sens(self, l, EG, sig0, mus, Phis, om, tol=1e-4):
         """G = Σ_j om_j μ_j 对单元刚度系数的导数，拆成三部分（每个单元一个数）：
@@ -1121,10 +1193,14 @@ class Free3D:
         A = cp.zeros(nel, F32); gs = cp.zeros(6 * nel, F32)
         Mg = geo_mats(self.h, self.h, self.dz).astype(F32)
         for o, mu, ph in zip(om, mus, Phis):
-            T3._K()["kener"](T3._blocks(nel), (T3._TB,), (ph, A, self.KE0, np.float32(o * mu), *dims))
-            _kfun("kgq")(T3._blocks(nel), (T3._TB,), (ph, gs, Mg, np.float32(o), *dims))
+            ph_d = self._dev(ph)
+            T3._K()["kener"](T3._blocks(nel), (T3._TB,), (ph_d, A, self.KE0, np.float32(o * mu), *dims))
+            _kfun("kgq")(T3._blocks(nel), (T3._TB,), (ph_d, gs, Mg, np.float32(o), *dims))
+            del ph_d
         gs2 = gs.reshape(-1, 6)
-        Bq = (gs2 * sig0.reshape(-1, 6)).sum(1)
+        sig0_d = self._dev(sig0)
+        Bq = (gs2 * sig0_d.reshape(-1, 6)).sum(1)
+        del sig0_d
         t = (gs2 * EG.reshape(-1, 1)).ravel()
         a = cp.empty(3 * L0.nn, F32)
         _kfun("kstrT")(T3._blocks(L0.nn), (T3._TB,), (t, a, self._DB(), self.fms[b], *dims))
@@ -1138,7 +1214,9 @@ class Free3D:
         """模态 φ 的应变能里落在 low（低密度单元）的比例：看有没有空区里的假模态"""
         L0 = self.mg.levels[0]
         e = cp.zeros(L0.nel, F32)
-        T3._K()["kener"](T3._blocks(L0.nel), (T3._TB,), (ph, e, self.KE0, np.float32(1.0), *self._dims()))
+        ph_d = self._dev(ph)
+        T3._K()["kener"](T3._blocks(L0.nel), (T3._TB,), (ph_d, e, self.KE0, np.float32(1.0), *self._dims()))
+        del ph_d
         e = e * L0.g
         return float(e[low.ravel()].sum() / e.sum())
 
@@ -1378,6 +1456,8 @@ def main():
     ap.add_argument("--island_beta", type=float, default=0.0, help="β 达到这个值以后才限制底面孤岛（0 = 从头开始）")
     ap.add_argument("--ground_r", type=float, default=0.0, help="接地放宽：床面那层先在面内膨胀 r mm 再当底面（竖墙可按 45° 外扩到 r）；> 0 时自动打开 --ground")
     ap.add_argument("--am_angle", type=float, default=45.0, help="悬空角：允许的最缓斜面与床面的夹角（度）。45 = 常规；大 = 更陡更严，小 = 更缓更松")
+    ap.add_argument("--am_oct", action="store_true", help="近似圆形八边形 AM 核（仅立方体素 m=1）：每 3 层交替 1 次 3×3 九点 + 2 次十字五点（轴向 45°、对角 46.7°、最缓 43.5°），消除十字菱形锯齿")
+    ap.add_argument("--eta_am", type=float, default=0.0, help="腐蚀支承双轨阈值（如 0.65，配 --tmin 使用，按 Ks_p 归一不吃床面）：宽度不足的细针无法向上传支撑，0 = 关闭")
     ap.add_argument("--time_budget", type=float, default=0, help="优化循环的时间上限（秒，0 = 不限）：到了就停下来照常存盘")
     ap.add_argument("--save_every", type=int, default=0, help="每隔几轮存一次 result.npz（租的机器上防止中途断掉白跑）")
     ap.add_argument("--rmin", type=float, default=1.2, help="密度过滤半径 mm")
@@ -1452,7 +1532,11 @@ def main():
         rmin, tq, tqz = rmin_for_thickness(a.tmin, h, a.eta_e, M.dz)
         print(f"最小厚度 {a.tmin} mm（网格上竖板 {tq:.3f}、平板 {tqz:.3f} mm）→ 过滤半径 {rmin:.3f} mm，腐蚀阈值 η_e={a.eta_e}；刚度、屈曲按腐蚀设计算", flush=True)
     a.rmin_used = rmin
-    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect, nt=M.NT)
+    pipe = Pipeline((NX, NY, NZ), h, rmin, fixed, fval, pad_void=a.tmin > 0, eta_e=a.eta_e if a.tmin > 0 else None, dz=M.dz, no_am=a.no_am, am_angle=a.am_angle, am_oct=a.am_oct, eta_am=a.eta_am if (a.tmin > 0 and a.eta_am > 0) else None, ground=a.ground, ground_r=a.ground_r, island_area=a.island_area, island_beta=a.island_beta, island_soft=a.island_soft, island_connect=a.island_connect, nt=M.NT)
+    if a.am_oct and not pipe.am_oct:
+        print(f"提示：--am_oct 仅用于 m_am=1 的十字核（当前 m_am={pipe.m_am}），已忽略", flush=True)
+    if pipe.eta_am is not None:
+        print(f"腐蚀支承双轨：η_am={pipe.eta_am:g}（按 Ks_p 有效厚度内归一，不吃床面；亚 tmin 细针无法向腐蚀设计传支撑）", flush=True)
     if a.island_connect:
         print("底面孤岛（可导近似）：贴床那层要和主框连通（从固定实心格按 min/max 生长，梯度落在路径最细处）", flush=True)
     elif a.island_soft > 0:
@@ -1463,6 +1547,8 @@ def main():
         print("接地：每柱各层的密度不超过床面那层" + (f"在面内膨胀 {a.ground_r:g} mm 后的形状" if a.ground_r > 0 else "（底面投影非空才能有材料）"), flush=True)
     if not a.no_am and pipe.am_ker is not None:
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：下一层半径 {M.dz/np.tan(np.deg2rad(a.am_angle)):.2f} mm（{int(cp.asnumpy(pipe.am_ker).sum())} 格）的圆盘里有材料就算托住（P={pipe.P:g}）", flush=True)
+    elif not a.no_am and pipe.am_oct:
+        print(f"悬空 {a.am_angle:g}°（近似圆形八边形核）：每 3 层交替 1 次 3×3 九点 + 2 次十字五点（轴向 45.0° / 对角 46.7° / 最缓 43.5°，P={pipe.P:g}）", flush=True)
     elif not a.no_am and (pipe.m_am > 1 or a.am_angle != 45.0 or pipe.P != 40.0):
         print(f"悬空 {a.am_angle:g}°（与床面夹角）：每层相对下面 1..{pipe.m_am} 层都最多外扩一格（{h:g} mm）→ 实际约 {np.degrees(np.arctan(pipe.m_am * M.dz / h)):.1f}°，单层最多伸出 {h:g} mm（P={pipe.P:g}）", flush=True)
     supest = SupportEst(h, M.dz, M.NT, angle=a.sup_angle, c=a.sup_c, e=a.sup_e, r_mm=a.sup_r) if a.sup_mu > 0 else None
@@ -1485,9 +1571,12 @@ def main():
         per = {}
         for l in bcases:
             s0 = M.unit_stress(l)
-            mu, Ph = M.buck_step(l, (s0.reshape(-1, 6) * EG[:, None]).ravel(), nit=10 if bstate["first"] else a.buck_nit)
+            sig = (s0.reshape(-1, 6) * EG[:, None]).ravel()
+            s0_st = M._store(s0); del s0
+            mu, Ph = M.buck_step(l, sig, nit=10 if bstate["first"] else a.buck_nit)
+            del sig
             sel = [j for j in range(len(mu)) if mu[j] > 0][:a.buck_nk]
-            per[l] = (s0, mu[sel], [Ph[j] for j in sel])
+            per[l] = (s0_st, mu[sel], [Ph[j] for j in sel])
         bstate["first"] = False
         mh = a.buck * np.concatenate([per[l][1] for l in bcases])
         mx = mh.max(); KS = mx + np.log(np.exp(a.ks * (mh - mx)).sum()) / a.ks
@@ -1564,6 +1653,11 @@ def main():
         if use_mma:
             fv, dfv = [M.mass(xi) / target - 1.0], [dm[d3] / target]
             if bcases:
+                if M.offload and cache.get("c_am") is not None:
+                    # dc 和 dm 已反传完，屈曲反传只走 c_am，先释放打印轨缓存给 buck_step 留出显存余量
+                    for k_ in ("S", "W", "dsx", "dsS", "dxb", "ga", "gb", "gS", "gx0"):
+                        cache.pop(k_, None)
+                    cp.get_default_memory_pool().free_all_blocks()
                 fG, gG, binfo = buck_con(xa_, it)
                 dG = pipe.backward(None, cache, gG) if robust else pipe.backward(gG, cache)
                 fv.append(fG); dfv.append(dG[d3])
