@@ -544,7 +544,7 @@ def _optimize_inner_wall_atom(atom, solid_poly, fair=True):
     ext_mvs = [(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in all_moves]
     st = (all_moves[0][1], all_moves[0][2])
     en = (all_moves[-1][3], all_moves[-1][4])
-    is_cl = math.hypot(en[0] - st[0], en[1] - st[1]) < 0.05
+    is_cl = math.hypot(en[0] - st[0], en[1] - st[1]) < 0.002
     return dict(
         kind="IW",
         is_wall=True,

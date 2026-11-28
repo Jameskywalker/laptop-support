@@ -492,7 +492,8 @@ STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/mode
 2. **阶段 2A + 阶段 3（内部连通费马螺旋 + 内墙协同 + 实体内 Combing，`infill_spiral.py`、`toolpath_plan.py`）**：
    - 第 1 层、第 N 层、全部 `Outer wall`（含悬空降速）与 `Overhang wall`、`Bottom surface`、`Bridge` 以及真正水平外露顶面（面积 ≥ 12 mm²、宽 ≥ 1.5 mm）几何/速度逻辑保持原样。
    - **内部螺旋光顺与宽空腔兜底**（`infill_spiral.py`）：合并内部 `Sparse infill`、`Internal solid infill`、`Floating vertical shell`、`Gap infill` 与斜坡体素台阶 `Top surface` 碎条，按真实线距 $S = W - h(1 - \pi/4) = 0.4071\text{ mm}$ 逐圈内缩（奇数层首圈在 `r_open = 0.48 mm` 条件满足时用 `0.62 mm` 宽道实现奇偶层半线距错层），再用**无交叉缺口拼接**（黄金角 137.5° 错开搭接位）连成连续螺旋；对内圈做**约束 Taubin 光顺**（`max_disp = 0.06 mm`）并适当放宽内部简化/圆弧误差（`0.06 / 0.07 mm`）减少碎折线，光顺后重算未覆盖区并以**有界宽道吸收**（局部 `0.45 → 0.56 mm`）与**宽空腔自适应骨架补芯**（对含 `≥ 0.70 mm²` 空腔的残余区放宽骨架最短长度至 `1.0 mm`）消除局部细小孔洞，随后做严格垂直平分线投影 `G2/G3` 圆弧拟合与精确体积流量限速（≤ 18 mm³/s）。
-   - **内墙协同优化**（`toolpath_plan.py`）：在严格保持外墙与悬空墙原样的前提下，对 `Inner wall` 合并微幅进给抖动（`±15%`）、以 `0.07 mm` 容差重拟合 `G2/G3` 圆弧，并对闭环内墙按上一原子终点旋转接缝（`fair=False`，不缩径外推），在不产生墙间空隙的前提下消除内墙拐角碎减速。
+   - **内墙协同优化**（`toolpath_plan.py`）：在严格保持外墙与悬空墙原样的前提下，对 `Inner wall` 合并微幅进给抖动（`±15%`）、以 `0.07 mm` 容差重拟合 `G2/G3` 圆弧，并对严格闭环内墙按上一原子终点旋转接缝（`fair=False`，不缩径外推），在不产生墙间空隙的前提下消除内墙拐角碎减速。
+   - **支撑水平截面保角 B-样条拟合**（`support_spline.py`）：不改变 Z 向 `0.2 mm` 打印层高，仅在每层水平面内以 `1.2 mm` 弦窗检测 `≥ 45°` 尖角打断后分段拟合三次 B-样条（`RMS 0.16 mm`），并以 `P.geometry(False)` 外包络与接口固定区/方槽保留缝做精确 CAD 裁剪。75 层轮廓顶点数从 `620,401` 降至 `100,640`（**−6.2×**），宽悬空保持 `0.00 mm²`；经同套 `nz=32`（560 万体素）GPU 有限元 + 20 步屈曲复核：**加权柔度比 `0.5166 → 0.5165`（−0.03%）**、全部 17 个工况在 `−0.31% ~ +0.18%` 内、前后 150 N 屈曲安全系数 `66.00 → 66.05` / `36.17 → 36.26`，实现**零力学损失提速**。
    - **实体内零回抽 Combing 与排序**（`toolpath_plan.py`）：同岛先墙后内、内墙先于外墙约束下做层内 Or-opt 排序与层间衔接；对 `≤ 15 mm`（放宽后内部最高 `15–20 mm`）且跳转连线严格留在 `solid(L)` 内缩 `0.55 mm` 内的内部跳转采用**无回抽、无 Z-hop 实体内 Combing**，仅跨越空区时回抽抬升。
    - **热床方位与合盘协同**（`bambu_slice.py`）：独立 60 g 面板取 **35° 斜摆**（对齐 H3C 330×320 mm 热床对角线并顺应 X 斜撑方向）；面板与后横梁（同为 80 层 / 16 mm 高）另支持 `0°` 摆位下 `15 mm` 间距**同盘单次合拼打印**，额外省去一次开盘预热与调平（约 5–7 分钟）。
 
@@ -507,6 +508,8 @@ STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/mode
 | 反例：Bambu 原生 `concentric` 同心填充 | 2h 37m 38s（9,458 s） | **+9.1%（更慢）** | 每圈之间全回抽（14,147 次） |
 | **阶段 1（`arachne + arc(0.05) + nearest seam`）** | **2h 09m 00s** | **−10.7%** | **零手工干预，省 15m 28s** |
 | **阶段 1 + 2A + 3 左支撑（含内墙与 Combing）** | **1h 42m 16s（模型 1h 45m 17s）** | **−29.2%（−42m 12s）** | **Z-hop 2,461 次 + Combing 1,387 次（`max void 0.68 mm²`）** |
+| **水平样条支撑 + 螺旋规划（左支撑）** | **1h 38m 35s（模型 1h 41m 34s）** | **−31.8%（−45m 53s）** | **Z-hop 2,378 次 + Combing 1,317 次（覆盖 ≥98.62%，空腔 ≤0.63 mm²）** |
+| **水平样条支撑 + 螺旋规划（右支撑）** | **1h 38m 42s（模型 1h 41m 43s）** | **−31.5%（−45m 25s）** | **基线 2h 24m 07s → 1h 38m 42s（覆盖 ≥98.56%，空腔 ≤0.74 mm²）** |
 
 **校核结果**（`verify_toolpath.py` 全项通过，时间模型 `gcode_time.py` 已按 Bambu 带圆弧实切校准误差 ≤ 3%）：
 - 左支撑回归覆盖率 `98.51%–98.89%`，越界 `OOB = 0.000%`，最大空腔 `0.68 mm²`，单层实心体积与 CAD 几何（58.56 cm³）之比均值 **0.993**（0.985–1.001）。
@@ -535,6 +538,19 @@ STAND_VARIANT=desk40 .venv/bin/python make_web_noinfill.py --dir out/desk40/mode
 # 3. 全项物理/几何/限值校核
 .venv/bin/python verify_toolpath.py out/desk40/model_noinfill_clampfillrev_lv020_oct/stage1_left/sliced.3mf \
     out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left_spiral_planned.gcode.3mf
+
+# 3b. 支撑水平截面 B-样条拟合版（不改 Z 层高 → 切片 → 螺旋规划 → 校核）
+STAND_VARIANT=desk40 .venv/bin/python support_spline.py \
+    --src out/desk40/model_noinfill_clampfillrev_lv020_oct \
+    --out out/desk40/model_noinfill_clampfillrev_lv020_oct_spline --rms 0.16
+.venv/bin/python bambu_slice.py out/desk40/model_noinfill_clampfillrev_lv020_oct/support_noinfill_left_bambu.gcode.3mf \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/support_noinfill_left.stl \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/stage1_left
+.venv/bin/python toolpath_plan.py out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/stage1_left/sliced.3mf \
+    -o out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/support_noinfill_left_spiral_planned.gcode.3mf \
+    --report out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/spiral_plan_left.json
+.venv/bin/python verify_toolpath.py out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/stage1_left/sliced.3mf \
+    out/desk40/model_noinfill_clampfillrev_lv020_oct_spline/support_noinfill_left_spiral_planned.gcode.3mf
 
 # 4. 独立 60 g 面板（35° 斜摆）：连续密度场重导 STL → 切片 → 路径规划 → 自动分层校核
 STAND_VARIANT=desk40 .venv/bin/python link3d.py --part panel --out out/desk40/link3d_panel --mesh-only

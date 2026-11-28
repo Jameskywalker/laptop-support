@@ -110,11 +110,13 @@ def main():
         "侧向位移：面内载荷引起的厚度方向（z）位移。误用工况按装配状态算：面板和横梁拉住三个接口的 z 向。",
     ]
     sm = ver.get("smooth")
-    if sm:
+    if sm and "sigma_vox" in sm:
         sv = sm["sigma_vox"]; sv = sv if isinstance(sv, list) else [sv, sv]
         sig = f"{sv[0]:g}" if sv[0] == sv[1] else f"平面内 {sv[0]:g}、厚度方向 {sv[1]:g}"
         notes.insert(1, f"表面：优化网格是 {P.T / int(ha['nz']):.3f} mm 的立方体素，直接导出的话缓坡上是这么高的台阶。STL 先把体素平滑（σ = {sig} 个体素），"
                         f"再按 {sm['layer_mm']:g} mm 打印层重建：伸出超过 45° 的地方在下面补斜坡，再削掉补不到的细边，用料调回原值；复核数据也是按平滑后的形状算的。")
+    elif sm and sm.get("method") == "horizontal_bspline":
+        notes.insert(1, f"表面：在 {sm['layer_mm']:g} mm 打印层水平截面内逐层做保角三次 B-样条拟合（RMS 容差 {sm['rms_tol']:g} mm，转角 ≥ {sm['corner_deg']:g}° 打断保留尖角），消除面内 0.2 mm 体素锯齿（不改 Z 向层高），精确固定区与方槽按 CAD 裁剪。")
     elif ver.get("iso") == "xi":
         notes.insert(1, "表面：直接用优化输出的连续密度场 ξ 取 0.5 等值面（仅把二值清理掉的孤岛/碎块压零），保留亚体素连续轮廓，消除二值体素水平锯齿，同时保留细根与 45° 悬空约束；精确固定区与方槽仍按 CAD 布尔合并。")
     B = np.load(f"{a.dir}/binary.npz")["B"]
