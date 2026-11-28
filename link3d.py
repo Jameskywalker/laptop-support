@@ -729,7 +729,105 @@ def export_field(G, xi, B, iso="xi"):
     return B.astype(float)
 
 
-def export_mesh(G, F, fn, smooth=0.0, simp_tol=0.02):
+def _sdf_layer(f, c, lh, band=3):
+    """一层平面等值线精确有向距离（mm，内部为正），与 export3d_noinfill.py 一致。"""
+    from scipy.ndimage import distance_transform_edt
+    from skimage import measure
+    b = f > c
+    phi = np.where(b, distance_transform_edt(b) - 0.5, 0.5 - distance_transform_edt(~b))
+    segs = [np.stack([cc[:-1], cc[1:]], 1) for cc in measure.find_contours(f, c) if len(cc) >= 2]
+    if segs:
+        segs = np.concatenate(segs)
+        tree = shapely.STRtree(shapely.linestrings(segs))
+        near = np.nonzero(np.abs(phi) <= band)
+        _, d = tree.query_nearest(shapely.points(near[0], near[1]), return_distance=True, all_matches=False)
+        phi[near] = np.where(b[near], d, -d)
+    return (phi * lh).astype(np.float32)
+
+
+def smooth_fine(h, F, sigma=1.0, lh=P.LAYER_H, pad=4, am="fill+trim", angle=45.0, match_volume=True):
+    """粗体素场 F (0..1) → 打印层高 lh 细网格平滑 + 逐层 45° 悬空 fill+trim 重建（同体积校准）。"""
+    from scipy.ndimage import gaussian_filter, spline_filter, map_coordinates, label, grey_dilation
+    NX, NY, NZ = F.shape
+    sxy, sz = (sigma, sigma) if np.isscalar(sigma) else tuple(sigma)
+    G = np.pad(np.asarray(F, np.float32), ((pad, pad), (pad, pad), (0, 0)))
+    G = np.concatenate([G[:, :, pad - 1::-1], G, G[:, :, :-pad - 1:-1]], 2)
+    if sxy > 0 or sz > 0:
+        G = gaussian_filter(G, (sxy, sxy, sz), mode="nearest")
+    C = spline_filter(G, order=3, mode="nearest")
+    nxf, nyf, nzf = (int(round(n * h / lh)) for n in (NX, NY, NZ))
+    X, Y = np.meshgrid(((np.arange(nxf) + 0.5) * lh) / h - 0.5 + pad, ((np.arange(nyf) + 0.5) * lh) / h - 0.5 + pad, indexing="ij")
+    G0 = np.empty((nxf, nyf, nzf), np.float32)
+    for k in range(nzf):
+        G0[:, :, k] = map_coordinates(C, [X, Y, np.full_like(X, ((k + 0.5) * lh) / h - 0.5 + pad)], order=3, prefilter=False, mode="nearest")
+    del C, G, X, Y
+    vc = float(np.sum(F)) * h ** 3
+    dl = lh * np.tan(np.deg2rad(angle))
+
+    def threshold(target):
+        lo, hi = 0.2, 0.8
+        for _ in range(30):
+            t = 0.5 * (lo + hi)
+            if (G0 > t).sum() * lh ** 3 > target:
+                lo = t
+            else:
+                hi = t
+        return t
+
+    def run(target):
+        t = threshold(target)
+        Gf = G0.copy()
+        n0 = int((Gf > t).sum())
+        if am in ("fill", "levelset", "fill+trim"):
+            if am != "levelset":
+                lab, n = label(Gf > t)
+                cnt = np.bincount(lab.ravel())
+                cnt[0] = 0
+                drop = (lab > 0) & (lab != int(cnt.argmax()))
+                del lab
+                Gf[drop] = np.minimum(Gf[drop], t - 0.05)
+            lev = t
+            for ps in {"fill": ["fill"], "levelset": ["trim"], "fill+trim": ["fill", "trim"]}[am]:
+                prev = None
+                for k in (range(nzf - 1, -1, -1) if ps == "fill" else range(nzf)):
+                    phi = _sdf_layer(Gf[:, :, k], lev, lh)
+                    if prev is not None:
+                        phi = np.maximum(phi, prev - dl) if ps == "fill" else np.minimum(phi, prev + dl)
+                        phi = _sdf_layer(phi, 0.0, lh)
+                    Gf[:, :, k] = phi
+                    prev = phi
+                lev = 0.0
+            t1 = 0.0
+        elif am == "cross":
+            cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+            for k in range(1, nzf):
+                Gf[:, :, k] = np.minimum(Gf[:, :, k], grey_dilation(Gf[:, :, k - 1], footprint=cross))
+            t1 = t
+        else:
+            t1 = t
+        L = Gf > t1
+        n1 = int(L.sum())
+        lab, n = label(L)
+        cnt = np.bincount(lab.ravel())
+        cnt[0] = 0
+        drop = L & (lab != int(cnt.argmax()))
+        del lab
+        Gf[drop] = np.minimum(Gf[drop], t1 - 0.05)
+        n2 = n1 - int(drop.sum())
+        return Gf, t1, dict(threshold=round(float(t), 4), 悬空处理增减_mm3=round((n1 - n0) * lh ** 3, 1),
+                            碎块去掉_mm3=round((n1 - n2) * lh ** 3, 1), 碎块数=int(n - 1), 体积_cm3=round(n2 * lh ** 3 / 1000, 3))
+
+    Gf, t1, r1 = run(vc)
+    info = dict(sigma_vox=[sxy, sz], am=am, angle=angle, layer_mm=lh, 体素模型体积_cm3=round(vc / 1000, 3), 第一次=r1)
+    if match_volume and am in ("fill", "fill+trim") and abs(r1["体积_cm3"] * 1000 - vc) > 1.0:
+        del Gf
+        Gf, t1, r2 = run(vc - (r1["体积_cm3"] * 1000 - vc))
+        info["第二次（同体积）"] = r2
+    info["平滑后体积_cm3"] = list(info.values())[-1]["体积_cm3"]
+    return dict(G=Gf, t=float(t1), lh=lh, info=info)
+
+
+def export_mesh(G, F, fn, smooth=0.0, simp_tol=0.02, fine_lh=P.LAYER_H, am="fill+trim"):
     import manifold3d as m3d
     import trimesh
     from scipy.ndimage import gaussian_filter
@@ -742,20 +840,40 @@ def export_mesh(G, F, fn, smooth=0.0, simp_tol=0.02):
             rings = [np.asarray(p.exterior.coords)[:-1]] + [np.asarray(i.coords)[:-1] for i in p.interiors]
             parts.append(m3d.Manifold.extrude(m3d.CrossSection(rings, m3d.FillRule.EvenOdd), z1 - z0).translate((0, 0, z0)))
         return m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
-    h = G.h; pz = 3
-    F = np.asarray(F, np.float32)
-    F = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
-    if smooth > 0:
-        F = gaussian_filter(F, smooth)
-    F = np.pad(F, 2)
-    v, f, _, _ = measure.marching_cubes(F, 0.5, spacing=(h, h, h), allow_degenerate=False)
-    v = v + np.array([G.a0 - 1.5 * h, G.v0 - 1.5 * h, -(pz + 1.5) * h])
+
+    smooth_on = (max(smooth) > 0) if isinstance(smooth, (tuple, list)) else (smooth > 0)
+    fine_info = None
+    h = G.h
+    pz = 3
+    if fine_lh and fine_lh > 0 and fine_lh < h - 1e-6 and smooth_on:
+        nz_nonempty = int(np.nonzero(F.max(axis=(0, 1)) > 0.05)[0].max()) + 1 if np.any(F > 0.05) else G.nzs
+        nz_use = max(G.nzs, nz_nonempty)
+        z_max = nz_use * h
+        fine = smooth_fine(h, F[:, :, :nz_use], sigma=smooth, lh=fine_lh, am=am, angle=45.0, match_volume=True)
+        fine_info = fine["info"]
+        Gf = fine["G"]
+        Gp = np.concatenate([Gf[:, :, pz - 1::-1], Gf, Gf[:, :, :-pz - 1:-1]], 2)
+        Gp = np.pad(Gp, 2, constant_values=float(Gf.min() - 1.0))
+        v, f, _, _ = measure.marching_cubes(Gp.astype(np.float32, copy=False), fine["t"], spacing=(fine_lh, fine_lh, fine_lh), allow_degenerate=False)
+        v = v + np.array([G.a0 - 1.5 * fine_lh, G.v0 - 1.5 * fine_lh, -(pz + 1.5) * fine_lh])
+    else:
+        z_max = G.H
+        F = np.asarray(F, np.float32)
+        F = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
+        if smooth_on:
+            F = gaussian_filter(F, smooth)
+        F = np.pad(F, 2)
+        v, f, _, _ = measure.marching_cubes(F, 0.5, spacing=(h, h, h), allow_degenerate=False)
+        v = v + np.array([G.a0 - 1.5 * h, G.v0 - 1.5 * h, -(pz + 1.5) * h])
     mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f[:, ::-1].astype(np.uint32)))
     if mesh.volume() < 0:
         mesh = m3d.Manifold(m3d.Mesh(vert_properties=v.astype(np.float32), tri_verts=f.astype(np.uint32)))
     pg = G.polys
-    low = pg["body"].difference(pg["cut"]).difference(pg["rec"]); high = pg["body"].difference(pg["cut"]).difference(pg["rec_all"])
-    allowed = extrude(low, 0, TS) + (extrude(high, TS, G.H) if G.H > TS else extrude(low, 0, TS))
+    low = pg["body"].difference(pg["cut"]).difference(pg["rec"])
+    high = pg["body"].difference(pg["cut"]).difference(pg["rec_all"])
+    allowed = extrude(low, 0, min(TS, z_max))
+    if z_max > TS + 1e-6:
+        allowed = allowed + extrude(high, TS, z_max)
     fixed = pg["fing"].union(pg["band"]).difference(pg["cut"])
     mesh = (mesh ^ allowed) + extrude(fixed, 0, TS)
     mesh = mesh.translate((-(HALF + UE), -G.V0, 0.0))
@@ -771,6 +889,8 @@ def export_mesh(G, F, fn, smooth=0.0, simp_tol=0.02):
     meta = dict(volume_cm3=round(mesh.volume() / 1000, 2), mass_g=round(mesh.volume() / 1000 * RHO, 1), watertight=bool(tm.is_watertight),
                 bbox_mm=[round(float(x), 1) for x in (tm.bounds[1] - tm.bounds[0])], genus=int(mesh.genus()),
                 faces=int(len(tm.faces)), bodies=bodies, cavities_mm3=[round(float(v), 1) for v in cav])
+    if fine_info is not None:
+        meta["smooth_fine"] = fine_info
     return meta, oh
 
 
@@ -841,7 +961,9 @@ def main():
     ap.add_argument("--bilateral", action="store_true", help="自检用：接触全按双向")
     ap.add_argument("--post_only", action="store_true", help="跳过优化，读 --out/result.npz 做二值化、复核、导出")
     ap.add_argument("--iso", default="xi", choices=("xi", "binary"), help="等值面用的场：xi = 保留优化连续密度场（平滑亚体素轮廓，默认）；binary = 0/1 二值体素")
-    ap.add_argument("--smooth", type=float, default=None, help="高斯平滑半径（体素）；默认 xi 时 0.0，binary 时 0.6")
+    ap.add_argument("--smooth", default=None, help="高斯平滑半径（体素，可写 σ_xy,σ_z；默认网格粗于 0.2 mm 时为 1.0，否则 0.0）")
+    ap.add_argument("--fine-lh", type=float, default=P.LAYER_H, help="STL 平滑升采样细网格层高 mm（0 = 不升采样，默认 0.2）")
+    ap.add_argument("--am", default="fill+trim", choices=("fill+trim", "fill", "levelset", "cross"), help="细网格平滑后的逐层悬空处理方式")
     ap.add_argument("--simp", type=float, default=0.02, help="manifold 简化容差 mm（0 = 不简化）")
     ap.add_argument("--mesh-only", action="store_true", help="跳过有限元复核，复用已有 report.json，仅按 --iso / --smooth 重导 STL 并做悬空检查")
     ap.add_argument("--report-from", default=None, help="--mesh-only 时读取的 report.json 路径（默认 --out/report.json）")
@@ -854,13 +976,20 @@ def main():
     out = a.out or f"{P.OUT_DIR}/link3d_{a.part}"
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
-    smooth_val = (0.0 if a.iso == "xi" else 0.6) if a.smooth is None else a.smooth
+
+    def parse_smooth(h_cur):
+        if a.smooth is None:
+            return 1.0 if (a.fine_lh and h_cur > a.fine_lh + 1e-6) else 0.0
+        sv = [float(v) for v in str(a.smooth).split(",")]
+        return sv[0] if len(sv) == 1 else tuple(sv)
+
     if a.mesh_only:
         rsrc = a.report_from or f"{out}/report.json"
         rep = json.load(open(rsrc))
         h_val = a.h if a.h is not None else rep["h"]
         H_val = a.H if a.H is not None else rep.get("H")
         G = Geo(a.part, h_val, H_val, a.width)
+        smooth_val = parse_smooth(G.h)
         if os.path.exists(f"{out}/result.npz"):
             xi = np.load(f"{out}/result.npz")["xi"].astype(float)
             B, binfo = binarize(G, xi)
@@ -871,15 +1000,16 @@ def main():
         else:
             raise FileNotFoundError(f"{out}/result.npz 不存在（--iso xi 需要连续密度场 result.npz）")
         F = export_field(G, xi, B, a.iso)
-        stl_meta, oh = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp)
-        rep.update(stl=stl_meta, overhang=oh, iso=a.iso, smooth=smooth_val, binarize=binfo)
+        stl_meta, oh = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp, fine_lh=a.fine_lh, am=a.am)
+        rep.update(stl=stl_meta, overhang=oh, iso=a.iso, smooth=smooth_val, fine_lh=a.fine_lh, am=a.am, binarize=binfo)
         json.dump(rep, open(f"{out}/report.json", "w"), ensure_ascii=False, indent=1, default=float)
-        print(f"--mesh-only ({a.part}, h={G.h}, iso={a.iso}, smooth={smooth_val:g}): STL={stl_meta}", flush=True)
+        print(f"--mesh-only ({a.part}, h={G.h}, iso={a.iso}, smooth={smooth_val}, fine_lh={a.fine_lh:g}): STL={stl_meta}", flush=True)
         print("悬空检查：", oh, flush=True)
         print(f"完成 {time.time() - t0:.1f}s", flush=True)
         return
     a.h = 0.5 if a.h is None else a.h
     G = Geo(a.part, a.h, a.H, a.width)
+    smooth_val = parse_smooth(G.h)
     c = G.contacts(); cases = make_cases(G, a.weights)
     print(f"{a.part}: 网格 {G.NX}×{G.NY}×{G.NZ}（h={G.h} mm，厚 {G.H} mm），{G.NX * G.NY * G.NZ / 1e6:.2f} M 体素；设计 {int(G.design3.sum()) / 1e6:.2f} M，"
           f"固定实心 {G.solid3.sum() * G.vox / 1000:.2f} cm³", flush=True)
@@ -954,9 +1084,11 @@ def main():
     rep.update(new=new, ratio=ratio.tolist(), weighted=float(w @ ratio / w.sum()), mass_g=round(mass / 1000 * RHO, 1), proj_mm2=proj, binarize=binfo)
     try:
         F = export_field(G, xi, B, a.iso)
-        rep["stl"], rep["overhang"] = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp)
+        rep["stl"], rep["overhang"] = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp, fine_lh=a.fine_lh, am=a.am)
         rep["iso"] = a.iso
         rep["smooth"] = smooth_val
+        rep["fine_lh"] = a.fine_lh
+        rep["am"] = a.am
         print("STL:", rep["stl"], flush=True)
         print("悬空检查：", rep["overhang"], flush=True)
     except Exception as e:

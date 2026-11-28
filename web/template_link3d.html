@@ -74,13 +74,54 @@ tr.sum td { font-weight: 600; }
 <script>
 const DATA = /*__DATA__*/null;
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-function decode(m) {
+function creaseNormals(g, deg = 35) {
+  const pos = g.attributes.position.array, idx = g.index.array, nTri = idx.length / 3;
+  const pOut = new Float32Array(idx.length * 3), nOut = new Float32Array(idx.length * 3);
+  const fn = new Float32Array(nTri * 3), vMap = new Map();
+  for (let t = 0; t < nTri; t++) {
+    const a = idx[3 * t], b = idx[3 * t + 1], c = idx[3 * t + 2];
+    const ax = pos[3 * a], ay = pos[3 * a + 1], az = pos[3 * a + 2];
+    const ux = pos[3 * b] - ax, uy = pos[3 * b + 1] - ay, uz = pos[3 * b + 2] - az;
+    const vx = pos[3 * c] - ax, vy = pos[3 * c + 1] - ay, vz = pos[3 * c + 2] - az;
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    fn[3 * t] = nx / l; fn[3 * t + 1] = ny / l; fn[3 * t + 2] = nz / l;
+    for (let k = 0; k < 3; k++) {
+      const vi = idx[3 * t + k];
+      const key = `${Math.round(pos[3 * vi] * 50)},${Math.round(pos[3 * vi + 1] * 50)},${Math.round(pos[3 * vi + 2] * 50)}`;
+      let arr = vMap.get(key); if (!arr) { arr = []; vMap.set(key, arr); }
+      arr.push(t);
+    }
+  }
+  const cosT = Math.cos(deg * Math.PI / 180);
+  for (let t = 0; t < nTri; t++) {
+    const nx0 = fn[3 * t], ny0 = fn[3 * t + 1], nz0 = fn[3 * t + 2];
+    for (let k = 0; k < 3; k++) {
+      const vi = idx[3 * t + k], o = 3 * (3 * t + k);
+      pOut[o] = pos[3 * vi]; pOut[o + 1] = pos[3 * vi + 1]; pOut[o + 2] = pos[3 * vi + 2];
+      const key = `${Math.round(pOut[o] * 50)},${Math.round(pOut[o + 1] * 50)},${Math.round(pOut[o + 2] * 50)}`;
+      let sx = 0, sy = 0, sz = 0;
+      for (const t2 of vMap.get(key)) {
+        const x2 = fn[3 * t2], y2 = fn[3 * t2 + 1], z2 = fn[3 * t2 + 2];
+        if (nx0 * x2 + ny0 * y2 + nz0 * z2 >= cosT) { sx += x2; sy += y2; sz += z2; }
+      }
+      const l = Math.hypot(sx, sy, sz) || 1;
+      nOut[o] = sx / l; nOut[o + 1] = sy / l; nOut[o + 2] = sz / l;
+    }
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute("position", new THREE.BufferAttribute(pOut, 3));
+  out.setAttribute("normal", new THREE.BufferAttribute(nOut, 3));
+  return out;
+}
+function decode(m, crease) {
   const raw = s => Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer;
   const q = new Uint16Array(raw(m.pos)), idx = m.u32 ? new Uint32Array(raw(m.idx)) : new Uint16Array(raw(m.idx));
   const p = new Float32Array(q.length);
   for (let i = 0; i < q.length; i++) { const a = i % 3; p[i] = m.min[a] + q[i] / 65535 * m.size[a]; }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(p, 3)); g.setIndex(new THREE.BufferAttribute(idx, 1));
+  if (crease) return creaseNormals(g, 35);
   g.computeVertexNormals(); return g;
 }
 const fmt = (v, d = 3) => v == null ? "—" : Number(v).toFixed(d);
@@ -106,7 +147,7 @@ function buildPart(P) {
   const plane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 130);
   const meshes = {};
   for (const d of P.designs) {
-    const g = decode(d.mesh);
+    const g = decode(d.mesh, d.key !== "current");
     const col = new THREE.Color(d.key === "current" ? css("--current") : css("--accent"));
     const front = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: col, roughness: 0.65, metalness: 0.0, flatShading: d.key === "current", clippingPlanes: [plane] }));
     const back = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col.clone().multiplyScalar(0.45), side: THREE.BackSide, clippingPlanes: [plane] }));

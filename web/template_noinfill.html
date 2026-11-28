@@ -220,7 +220,47 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const u8 = (s) => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
   const stops = ['--v0', '--v1', '--v2', '--v3', '--v4'].map(n => new THREE.Color(css(n)));
   function ramp(t) { t = Math.min(1, Math.max(0, t)) * 4; const i = Math.min(3, Math.floor(t)); return stops[i].clone().lerp(stops[i + 1], t - i); }
-  function geom(pk) {
+  function creaseNormals(g, deg = 35) {
+    const pos = g.attributes.position.array, idx = g.index.array, nTri = idx.length / 3;
+    const pOut = new Float32Array(idx.length * 3), nOut = new Float32Array(idx.length * 3);
+    const fn = new Float32Array(nTri * 3), vMap = new Map();
+    for (let t = 0; t < nTri; t++) {
+      const a = idx[3 * t], b = idx[3 * t + 1], c = idx[3 * t + 2];
+      const ax = pos[3 * a], ay = pos[3 * a + 1], az = pos[3 * a + 2];
+      const ux = pos[3 * b] - ax, uy = pos[3 * b + 1] - ay, uz = pos[3 * b + 2] - az;
+      const vx = pos[3 * c] - ax, vy = pos[3 * c + 1] - ay, vz = pos[3 * c + 2] - az;
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const l = Math.hypot(nx, ny, nz) || 1;
+      fn[3 * t] = nx / l; fn[3 * t + 1] = ny / l; fn[3 * t + 2] = nz / l;
+      for (let k = 0; k < 3; k++) {
+        const vi = idx[3 * t + k];
+        const key = `${Math.round(pos[3 * vi] * 50)},${Math.round(pos[3 * vi + 1] * 50)},${Math.round(pos[3 * vi + 2] * 50)}`;
+        let arr = vMap.get(key); if (!arr) { arr = []; vMap.set(key, arr); }
+        arr.push(t);
+      }
+    }
+    const cosT = Math.cos(deg * Math.PI / 180);
+    for (let t = 0; t < nTri; t++) {
+      const nx0 = fn[3 * t], ny0 = fn[3 * t + 1], nz0 = fn[3 * t + 2];
+      for (let k = 0; k < 3; k++) {
+        const vi = idx[3 * t + k], o = 3 * (3 * t + k);
+        pOut[o] = pos[3 * vi]; pOut[o + 1] = pos[3 * vi + 1]; pOut[o + 2] = pos[3 * vi + 2];
+        const key = `${Math.round(pOut[o] * 50)},${Math.round(pOut[o + 1] * 50)},${Math.round(pOut[o + 2] * 50)}`;
+        let sx = 0, sy = 0, sz = 0;
+        for (const t2 of vMap.get(key)) {
+          const x2 = fn[3 * t2], y2 = fn[3 * t2 + 1], z2 = fn[3 * t2 + 2];
+          if (nx0 * x2 + ny0 * y2 + nz0 * z2 >= cosT) { sx += x2; sy += y2; sz += z2; }
+        }
+        const l = Math.hypot(sx, sy, sz) || 1;
+        nOut[o] = sx / l; nOut[o + 1] = sy / l; nOut[o + 2] = sz / l;
+      }
+    }
+    const out = new THREE.BufferGeometry();
+    out.setAttribute('position', new THREE.BufferAttribute(pOut, 3));
+    out.setAttribute('normal', new THREE.BufferAttribute(nOut, 3));
+    return out;
+  }
+  function geom(pk, crease) {
     const q = new Uint16Array(u8(pk.pos).buffer), n = q.length / 3, pos = new Float32Array(q.length), col = new Float32Array(q.length);
     for (let i = 0; i < n; i++) {
       for (let d = 0; d < 3; d++) pos[3 * i + d] = pk.min[d] + q[3 * i + d] / 65535 * pk.size[d];
@@ -230,6 +270,8 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
+    if (crease) return creaseNormals(g, 35);
+    g.computeVertexNormals();
     return g;
   }
   const G = {}; D.models.forEach(m => G[m.key] = geom(m.mesh));
@@ -255,8 +297,8 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   const clip = new THREE.Plane(new THREE.Vector3(0, 0, -1), D.T);
   const NL = D.layer ? Math.round(D.T / D.layer) : D.nz;     // 逐层剖切：按打印层（STL 按打印层重建时），否则按体素层
   const matSup = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide, roughness: 0.58, metalness: 0.04 });
-  const matPanel = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
-  const matBeam = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
+  const matPanel = new THREE.MeshStandardMaterial({ flatShading: false, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
+  const matBeam = new THREE.MeshStandardMaterial({ flatShading: false, roughness: 0.58, metalness: 0.04, color: 0xb9c2cc });
   const matPad = new THREE.MeshStandardMaterial({ flatShading: true, side: THREE.DoubleSide, roughness: 0.92, metalness: 0, color: 0x2f3338 });   // TPU 垫：深灰
   const M4 = (a) => new THREE.Matrix4().set(...a);
 
@@ -289,7 +331,7 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
   for (const l of linkSets) {
     alm[l.key] = [];
     for (const [pk, mat, mtrl] of [[l.beam, D.beamMat, matBeam], [l.panel, D.panelMat, matPanel]]) {
-      const o = new THREE.Mesh(geom(pk), mtrl); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); alm[l.key].push(o);
+      const o = new THREE.Mesh(geom(pk, l.key !== 'flat2d'), mtrl); o.matrixAutoUpdate = false; o.matrix.copy(M4(mat)); asm.add(o); alm[l.key].push(o);
     }
   }
   padObjs.slice(1).forEach(o => asm.add(o));
@@ -389,6 +431,11 @@ svg text { font-family: var(--mono); font-size: 10px; fill: var(--muted) }
     for (const k in pm) pm[k].visible = k === S.model;
     for (const k in am) am[k].forEach(o => o.visible = k === S.model);
     for (const k in alm) alm[k].forEach(o => o.visible = k === S.link);
+    const flatLink = S.link === 'flat2d';
+    if (matPanel.flatShading !== flatLink) {
+      matPanel.flatShading = matBeam.flatShading = flatLink;
+      matPanel.needsUpdate = matBeam.needsUpdate = true;
+    }
     matSup.clippingPlanes = S.view === 'print' ? [clip] : [];
     matSup.needsUpdate = true;
     matPad.clippingPlanes = matSup.clippingPlanes; matPad.needsUpdate = true;
