@@ -134,10 +134,10 @@ def main():
         pj = json.load(open(f"{P.OUT_DIR}/pads/pads.json"))
         pads_info = (f"U 形卡套，每片支撑 {len(pj['parts'])} 件（{'、'.join(pj['parts'])}），两片共 {pj['合计_g（两片支撑）']:g} g TPU；"
                      f"顶面垫底厚 {pj['params']['base']:g} mm，脚套底厚 {pj['params']['foot']:g} mm")
-    # 装配视图里的连接件（面板 + 后横梁）：自动收录已生成的三维优化版（正式 0.5 mm、轻量化 1 mm）和二维旧版，可在网页里切换
+    # 装配视图里的连接件（面板 + 后横梁）：自动收录现行三维正式版（60g/29g）、三维旧版（83g/51g）和二维旧版，可在网页里切换
     link_cands = [
-        ("link3d", "三维正式 83g/51g", f"{P.OUT_DIR}/link3d_beam/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel/panel_3d.stl", True),
-        ("link3d_light", "三维轻量 60g/29g", f"{P.OUT_DIR}/link3d_beam_light_h1/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel_light_h1/panel_3d.stl", True),
+        ("link3d", "三维正式 60g/29g", f"{P.OUT_DIR}/link3d_beam/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel/panel_3d.stl", True),
+        ("link3d_legacy", "三维旧版 83g/51g", f"{P.OUT_DIR}/link3d_beam_legacy51/beam_3d.stl", f"{P.OUT_DIR}/link3d_panel_legacy83/panel_3d.stl", True),
         ("flat2d", "二维旧版", f"{P.MODEL_DIR}/beam.stl", f"{P.MODEL_DIR}/panel.stl", False),
     ]
     links = []

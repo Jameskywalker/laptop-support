@@ -171,8 +171,9 @@ def verify(stage1_3mf, planned_3mf, check_layers):
             ok = False
         ET.fromstring(z.read("Metadata/slice_info.config").decode("utf-8"))
         m73_lines = [l for l in gtext.splitlines() if l.startswith("M73 L") or l.startswith("M73 P")]
-        if len(m73_lines) < 150:
-            print(f"FAIL: Insufficient M73 lines ({len(m73_lines)})")
+        n_layers_pl = sum(1 for l in gtext.splitlines() if l.startswith("; CHANGE_LAYER"))
+        if len(m73_lines) < max(20, 2 * n_layers_pl - 6):
+            print(f"FAIL: Insufficient M73 lines ({len(m73_lines)} for {n_layers_pl} layers)")
             ok = False
 
     lines_s1 = GT.load_gcode_lines(stage1_3mf)
@@ -217,6 +218,14 @@ def verify(stage1_3mf, planned_3mf, check_layers):
     man = IS.load_bed_manifold_from_3mf(planned_3mf)
     n_layers = max(ch_pl)
     solids = IS.slice_all_solids(man, [(L - 0.5) * 0.2 for L in range(1, n_layers + 1)])
+
+    if check_layers is None:
+        lo_l = max(2, round(0.05 * n_layers))
+        hi_l = max(lo_l, n_layers - 2)
+        base_ls = [max(2, min(n_layers - 1, round(lo_l + i * (hi_l - lo_l) / 8.0))) for i in range(9)]
+        trans_ls = [k + 1 for k in range(1, n_layers - 1) if solids[k].area - solids[k + 1].area > 200.0]
+        check_layers = sorted(set(base_ls + trans_ls))
+        print(f"Auto-selected check layers ({len(check_layers)}): {check_layers}")
 
     vol_ratios = [vol_pl[L] / max(solids[L - 1].area * 0.2, 1e-6) for L in range(2, n_layers)]
     mean_vr = sum(vol_ratios) / len(vol_ratios)
@@ -272,5 +281,5 @@ if __name__ == "__main__":
     ap.add_argument("planned_3mf")
     ap.add_argument("--layers", default="5,10,20,30,40,50,60,65,70")
     a = ap.parse_args()
-    check_layers = [int(v) for v in a.layers.split(",")]
+    check_layers = None if a.layers == "auto" else [int(v) for v in a.layers.split(",")]
     sys.exit(0 if verify(a.stage1_3mf, a.planned_3mf, check_layers) else 1)

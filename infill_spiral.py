@@ -229,6 +229,23 @@ def compute_kept_footprint(layer_lines, x0, y0, flat_mask, overlap=0.063):
 
 
 # ---------------- Offset Ring Peeling & Non-Crossing Fermat Splice ----------------
+def _fair_closed_pts(pts, iters=6, lam=0.45, mu=-0.47, max_disp=0.12):
+    """Constrained non-shrinking Taubin smoothing on closed ring vertices."""
+    p0 = np.asarray(pts, dtype=np.float64)
+    if len(p0) < 5:
+        return p0
+    p = p0.copy()
+    for _ in range(iters):
+        p = p + lam * (0.5 * (np.roll(p, 1, axis=0) + np.roll(p, -1, axis=0)) - p)
+        p = p + mu * (0.5 * (np.roll(p, 1, axis=0) + np.roll(p, -1, axis=0)) - p)
+        d = p - p0
+        dn = np.hypot(d[:, 0], d[:, 1])
+        m = dn > max_disp
+        if m.any():
+            p[m] = p0[m] + d[m] * (max_disp / dn[m, None])
+    return p
+
+
 def _peel_thick_rings(P_int, S=0.4071, W=0.45, layer_h=0.2, stagger_odd=False, W_odd0=0.62):
     """Peel non-overlapping closed offset rings from thick interior regions using bead spacing S.
 
@@ -242,7 +259,7 @@ def _peel_thick_rings(P_int, S=0.4071, W=0.45, layer_h=0.2, stagger_odd=False, W
     S_odd0 = W_odd0 - layer_h * (1.0 - math.pi / 4.0)
     while not uncov.is_empty and uncov.area > 0.12:
         if depth == 0 and stagger_odd:
-            r_open = 0.34
+            r_open = 0.48  # require >=0.96 mm width so 0.62 mm odd-layer rings do not overlap inside thin walls
             s_cur = S_odd0
             w_cur = W_odd0
         else:
@@ -413,7 +430,7 @@ def _choose_splice_pair(pts_p, pts_c, target_dir, forbid_mask=None, max_bridge=0
     return best_orient
 
 
-def _build_spliced_spirals(rings, layer_num, S=0.4071):
+def _build_spliced_spirals(rings, layer_num, S=0.4071, post_simp=0.09):
     """Splice connected offset rings into continuous non-crossing spiral polylines.
 
     Returns list of (runs_list, is_closed) where runs_list is [(pts_Nx2, width_mm), ...]
@@ -593,11 +610,11 @@ def _build_spliced_spirals(rings, layer_num, S=0.4071):
                 if abs(seg_ws[k] - r_w) < 1e-6:
                     r_pts.append(pts_list[k + 1])
                 else:
-                    ls_r = LineString(r_pts).simplify(0.03, preserve_topology=False)
+                    ls_r = LineString(r_pts).simplify(post_simp, preserve_topology=False)
                     runs.append((np.asarray(ls_r.coords, dtype=np.float64), r_w))
                     r_pts = [pts_list[k], pts_list[k + 1]]
                     r_w = seg_ws[k]
-            ls_r = LineString(r_pts).simplify(0.03, preserve_topology=False)
+            ls_r = LineString(r_pts).simplify(post_simp, preserve_topology=False)
             runs.append((np.asarray(ls_r.coords, dtype=np.float64), r_w))
             spirals.append((runs, is_cl))
         for fb in fbs:
@@ -607,7 +624,7 @@ def _build_spliced_spirals(rings, layer_num, S=0.4071):
 
 
 # ---------------- Narrow Core Skeleton Recovery ----------------
-def _recover_narrow_cores(uncov, px=0.05, min_area=0.80, min_len=2.5):
+def _recover_narrow_cores(uncov, px=0.05, min_area=0.80, min_len=2.5, cav_area_thresh=0.70, cav_min_len=1.0):
     """Extract medial centerlines with adaptive local width from thin residual polygons."""
     if uncov.is_empty or uncov.area < min_area:
         return []
@@ -616,6 +633,14 @@ def _recover_narrow_cores(uncov, px=0.05, min_area=0.80, min_len=2.5):
     for pg in geoms:
         if pg.area < min_area:
             continue
+        cav = pg.buffer(-0.15, join_style=2).buffer(0.15, join_style=2)
+        if cav.is_empty:
+            max_cav_pg = 0.0
+        elif cav.geom_type == "MultiPolygon":
+            max_cav_pg = max((g.area for g in cav.geoms), default=0.0)
+        else:
+            max_cav_pg = cav.area
+        eff_min_len = cav_min_len if max_cav_pg >= cav_area_thresh else min_len
         x0, y0, x1, y1 = pg.bounds
         nx = max(3, int(math.ceil((x1 - x0) / px)) + 3)
         ny = max(3, int(math.ceil((y1 - y0) / px)) + 3)
@@ -677,7 +702,7 @@ def _recover_narrow_cores(uncov, px=0.05, min_area=0.80, min_len=2.5):
             is_spur = (d0 == 1 and d1 >= 3) or (d1 == 1 and d0 >= 3)
             if is_spur and ls.length < 1.0:
                 continue
-            if ls.length < min_len:
+            if ls.length < eff_min_len:
                 continue
             ls_s = ls.simplify(0.05, preserve_topology=False)
             sc = np.asarray(ls_s.coords, dtype=np.float64)
@@ -885,9 +910,13 @@ def generate_layer_interior(
     layer_h=0.2,
     W=0.45,
     q_max=18.0,
-    arc_tol=0.05,
+    arc_tol=0.07,
     stagger_layers=True,
     W_odd0=0.62,
+    fair_rings=True,
+    ring_simp=0.06,
+    max_disp=0.06,
+    absorb_cores=True,
 ):
     """Generate unified interior spiral + core atoms for one layer.
 
@@ -907,7 +936,53 @@ def generate_layer_interior(
     rings, uncov = _peel_thick_rings(
         P_int, S=S, W=W, layer_h=layer_h, stagger_odd=stagger_odd, W_odd0=W_odd0
     )
-    spirals = _build_spliced_spirals(rings, layer_num, S=S)
+    if fair_rings and rings:
+        faired = []
+        for depth, pts, ls, w_cur in rings:
+            pf = _fair_closed_pts(pts, iters=6, max_disp=max_disp)
+            lsf = LineString(list(pf) + [tuple(pf[0])]).simplify(ring_simp, preserve_topology=False)
+            if lsf.length >= 0.8 and len(lsf.coords) >= 4:
+                faired.append((depth, np.asarray(lsf.coords)[:-1], lsf, w_cur))
+            else:
+                faired.append((depth, pts, ls, w_cur))
+        rings = faired
+        cov_polys = [
+            ls.buffer(0.5 * (w - layer_h * (1.0 - math.pi / 4.0)), cap_style=1, join_style=1, quad_segs=2)
+            for _, _, ls, w in rings
+        ]
+        uncov = P_int.difference(unary_union(cov_polys))
+        if not uncov.is_empty:
+            uncov = uncov.buffer(-0.035, join_style=2).buffer(0.035, join_style=2)
+    if absorb_cores and not uncov.is_empty and rings:
+        uc_geoms = list(uncov.geoms) if uncov.geom_type == "MultiPolygon" else [uncov]
+        ring_geoms = [r[2] for r in rings]
+        rtree = shapely.STRtree(ring_geoms)
+        keep_uc = []
+        widened = set()
+        for pg in uc_geoms:
+            if pg.area < 0.80:
+                continue
+            if pg.area < 3.0 and pg.buffer(-0.22).is_empty:
+                hits = rtree.query(pg, predicate="dwithin", distance=0.35)
+                cands = [
+                    int(h)
+                    for h in hits
+                    if rings[int(h)][3] < 0.50 and rings[int(h)][2].length * 0.11 <= 2.5 * pg.area
+                ]
+                if cands:
+                    best_h = max(cands, key=lambda h: rings[h][0])
+                    new_cov = rings[best_h][2].buffer(0.5 * 0.56, cap_style=1, join_style=1, quad_segs=2)
+                    rem = pg.difference(new_cov)
+                    rem_cav = rem.buffer(-0.14, join_style=2).buffer(0.14, join_style=2) if not rem.is_empty else Polygon()
+                    if rem_cav.is_empty or rem_cav.area < 0.25:
+                        widened.add(best_h)
+                        continue
+            keep_uc.append(pg)
+        for idx_w in widened:
+            d_, p_, l_, _ = rings[idx_w]
+            rings[idx_w] = (d_, p_, l_, 0.56)
+        uncov = unary_union(keep_uc) if keep_uc else Polygon()
+    spirals = _build_spliced_spirals(rings, layer_num, S=S, post_simp=0.06)
     cores = _recover_narrow_cores(uncov)
 
     def _flow_params(w_val):
@@ -954,6 +1029,10 @@ def generate_layer_interior(
         )
 
     for pts_c, w_loc in cores:
+        if len(pts_c) >= 3:
+            ls_c = LineString(pts_c).simplify(0.08, preserve_topology=False)
+            if len(ls_c.coords) >= 2:
+                pts_c = np.asarray(ls_c.coords, dtype=np.float64)
         arc_moves = fit_arcs_to_polyline(pts_c, tol=arc_tol)
         if not arc_moves:
             continue

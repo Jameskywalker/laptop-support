@@ -35,6 +35,8 @@ def slice_with_bambu(
     raw=False,
     rot=None,
     bed="165,160",
+    extra_stls=None,
+    gap=15.0,
 ):
     """Replace mesh in template 3MF, apply config overrides, and slice with local Bambu Studio."""
     if bambu_dir is None:
@@ -42,6 +44,21 @@ def slice_with_bambu(
     os.makedirs(outdir, exist_ok=True)
 
     m = trimesh.load(stl_path, force="mesh")
+    if extra_stls:
+        meshes = []
+        m0 = m.copy()
+        b0 = m0.bounds
+        m0.apply_translation((-(b0[0][0] + b0[1][0]) / 2.0, -b0[0][1], -b0[0][2]))
+        meshes.append(m0)
+        cur_ymax = float(m0.bounds[1][1])
+        for ep in extra_stls:
+            me = trimesh.load(ep, force="mesh")
+            be = me.bounds
+            me.apply_translation((-(be[0][0] + be[1][0]) / 2.0, cur_ymax + gap - be[0][1], -be[0][2]))
+            meshes.append(me)
+            cur_ymax = float(me.bounds[1][1])
+        m = trimesh.util.concatenate(meshes)
+        m.export(os.path.join(outdir, "combined.stl"))
     lo, hi = m.bounds
     c = (lo + hi) / 2.0
 
@@ -61,24 +78,34 @@ def slice_with_bambu(
         tail = obj[obj.index("</triangles>") :]
         newobj = head + "\n" + verts + "\n    </vertices>\n    <triangles>\n" + tris + "\n    " + tail
 
+        has_comp_off = off is not None and any(abs(float(g)) > 1e-6 for g in off.groups()[1:4])
         tm2 = tm
-        if off is not None and any(abs(float(g)) > 1e-6 for g in off.groups()[1:4]):
+        if has_comp_off:
             tm2 = tm.replace(
                 off.group(0),
                 "%s%.6f %.6f %.6f%s" % (off.group(1), c[0], c[1], c[2], off.group(5)),
             )
+            V_eff = V + c
+        else:
+            V_eff = V
+        tz = float(-V_eff[:, 2].min())
 
+        item = re.search(r'(<item [^>]*transform=")([^"]+)(")', tm2)
         if rot is not None:
             th = np.radians(rot)
             C, S = np.cos(th), np.sin(th)
-            Pxy = m.vertices[:, :2] @ np.array([[C, S], [-S, C]])
+            Pxy = V_eff[:, :2] @ np.array([[C, S], [-S, C]])
             mid = (Pxy.min(0) + Pxy.max(0)) / 2.0
             bx, by = map(float, bed.split(","))
-            item = re.search(r'(<item [^>]*transform=")([^"]+)(")', tm2)
-            new_t = "%.9f %.9f 0 %.9f %.9f 0 0 0 1 %.5f %.5f 0" % (
-                C, S, -S, C, bx - mid[0], by - mid[1]
+            new_t = "%.9f %.9f 0 %.9f %.9f 0 0 0 1 %.5f %.5f %.6f" % (
+                C, S, -S, C, bx - mid[0], by - mid[1], tz
             )
             tm2 = tm2.replace(item.group(0), item.group(1) + new_t + item.group(3))
+        elif item is not None:
+            vals = item.group(2).split()
+            if len(vals) == 12:
+                vals[11] = "%.6f" % tz
+                tm2 = tm2.replace(item.group(0), item.group(1) + " ".join(vals) + item.group(3))
 
         ms2 = re.sub(r'face_count="\d+"', 'face_count="%d"' % len(m.faces), ms)
         ms2 = re.sub(
@@ -176,6 +203,8 @@ def main():
     ap.add_argument("--raw", action="store_true", help="Do not apply Stage 1 path-planning overrides")
     ap.add_argument("--rot", type=float, default=None)
     ap.add_argument("--bed", default="165,160")
+    ap.add_argument("--extra-stl", action="append", default=[], help="Additional STL(s) to pack onto the same plate along Y")
+    ap.add_argument("--gap", type=float, default=15.0, help="Y gap (mm) between packed STLs")
     ap.add_argument("--set", action="append", default=[], help="Override key=value")
     a = ap.parse_args()
 
@@ -185,7 +214,8 @@ def main():
         overrides[k] = v
 
     info = slice_with_bambu(
-        a.template, a.stl, a.outdir, bambu_dir=a.bambu, overrides=overrides, raw=a.raw, rot=a.rot, bed=a.bed
+        a.template, a.stl, a.outdir, bambu_dir=a.bambu, overrides=overrides, raw=a.raw, rot=a.rot, bed=a.bed,
+        extra_stls=a.extra_stl, gap=a.gap,
     )
     t = info["pred_s"]
     print(

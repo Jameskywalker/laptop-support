@@ -46,7 +46,7 @@ TRAVEL_F = 84000
 TRAVEL_ACC = 25000
 SHORT_OUTER_ACC = 250
 T_ZHOP_PENALTY = 0.14
-T_COMB_PENALTY = 0.03
+T_COMB_PENALTY = 0.005
 
 
 def fmt_num(v, nd=3):
@@ -191,6 +191,7 @@ def _extract_kept_atoms(body, x0, y0, F0, acc0, fan0, flat_mask):
             start=(ax, ay),
             end=(ax, ay),
             ext_moves=[],
+            ext_moves_full=[],
             is_closed=False,
             in_F=a_F,
             in_acc=a_acc,
@@ -310,6 +311,8 @@ def _extract_kept_atoms(body, x0, y0, F0, acc0, fan0, flat_mask):
                 if flat_mask.distance(Point(mx, my)) < 0.35:
                     keep = True
             if keep:
+                if cur is not None and (feat == "Inner wall") != (cur["cur_feat"] == "Inner wall"):
+                    close_atom()
                 if cur is None:
                     cur = start_atom(x, y, feat, lw, F, acc, fan)
                     cur["raw_prefix"] = [
@@ -329,6 +332,7 @@ def _extract_kept_atoms(body, x0, y0, F0, acc0, fan0, flat_mask):
                         cur["cur_lw"] = lw
                 cur["lines"].append(raw)
                 cur["ext_moves"].append((w, x, y, nx, ny, pr.get("I", 0.0), pr.get("J", 0.0)))
+                cur["ext_moves_full"].append((w, x, y, nx, ny, pr.get("I", 0.0), pr.get("J", 0.0), de, F, float(lw)))
                 cur["end"] = (nx, ny)
                 cur["out_F"] = F
                 cur["out_acc"] = acc
@@ -341,8 +345,13 @@ def _extract_kept_atoms(body, x0, y0, F0, acc0, fan0, flat_mask):
         else:
             # Pure travel or Z-move or pure-E deretract
             if abs(de) < 1e-9 and not has_z and (nx != x or ny != y):
-                # Short in-run non-retract travel (e.g. Inner -> Outer wall < 1mm)
-                if cur is not None and math.hypot(nx - x, ny - y) < RETRACT_MIN and feat in KEPT_ALWAYS:
+                # Short in-run non-retract travel (e.g. Inner -> Inner < 1mm)
+                if (
+                    cur is not None
+                    and math.hypot(nx - x, ny - y) < RETRACT_MIN
+                    and feat in KEPT_ALWAYS
+                    and (feat == "Inner wall") == (cur["cur_feat"] == "Inner wall")
+                ):
                     for pl in pending_lines:
                         if pl.strip().startswith(("; FEATURE:", "; LINE_WIDTH:")):
                             cur["lines"].append(pl)
@@ -436,6 +445,161 @@ def _rotate_closed_moves(moves, target_xy):
     return moves[k:] + moves[:k]
 
 
+def _optimize_inner_wall_atom(atom, solid_poly, fair=True):
+    """Merge micro-F jitter, apply constrained fairing inside solid, and refit G2/G3 arcs on pure Inner wall atoms."""
+    mvs_full = atom.get("ext_moves_full", [])
+    if atom["kind"] != "K" or atom["feats"] != {"Inner wall"} or len(mvs_full) < 3:
+        return atom
+
+    # Partition into contiguous sub-runs of consistent speed (+-15%) and line width
+    runs = []
+    cur_run = [mvs_full[0]]
+    ref_F = mvs_full[0][8]
+    ref_lw = mvs_full[0][9]
+    for mv in mvs_full[1:]:
+        prev = cur_run[-1]
+        gap = math.hypot(mv[1] - prev[3], mv[2] - prev[4])
+        if gap >= 0.05:
+            return atom  # keep atoms with internal travel jumps verbatim
+        if abs(mv[8] - ref_F) / max(ref_F, 1.0) >= 0.15 or abs(mv[9] - ref_lw) >= 0.02:
+            runs.append(cur_run)
+            cur_run = [mv]
+            ref_F = mv[8]
+            ref_lw = mv[9]
+        else:
+            cur_run.append(mv)
+    runs.append(cur_run)
+
+    safe_zone = solid_poly.buffer(-0.42) if (fair and solid_poly is not None and not solid_poly.is_empty) else Polygon()
+    all_moves = []
+    for r_idx, run in enumerate(runs):
+        pts = []
+        tot_e = 0.0
+        tot_l = 0.0
+        for w, x0, y0, x1, y1, I, J, de, f_mv, lw_mv in run:
+            tot_e += de
+            if w in ("G2", "G3") and (abs(I) > 1e-9 or abs(J) > 1e-9):
+                dl, *_ = GT._planar_arc_geom(w, x0, y0, x1, y1, I, J)
+                spts = IS._sample_arc(w, x0, y0, x1, y1, I, J, step=0.25)
+            else:
+                dl = math.hypot(x1 - x0, y1 - y0)
+                spts = [(x0, y0), (x1, y1)]
+            tot_l += dl
+            if not pts:
+                pts.extend(spts)
+            else:
+                pts.extend(spts[1:])
+        if len(pts) < 2 or tot_l < 1e-4:
+            return atom
+
+        med_F = float(np.median([m[8] for m in run]))
+        med_lw = round(float(np.median([m[9] for m in run])), 3)
+        e_per_mm = tot_e / tot_l
+        v_cap = min(med_F / 60.0, 350.0, 17.95 / max(e_per_mm * IS.FILA_AREA, 1e-9))
+        f_run = round(v_cap * 60.0)
+
+        pts_arr = np.asarray(pts, dtype=np.float64)
+        if fair and len(pts_arr) >= 5 and not safe_zone.is_empty:
+            p0 = pts_arr.copy()
+            p = p0.copy()
+            is_cl_run = math.hypot(p0[-1, 0] - p0[0, 0], p0[-1, 1] - p0[0, 1]) < 0.05
+            for _ in range(4):
+                if is_cl_run and len(p) >= 6:
+                    q = p[:-1]
+                    q = q + 0.40 * (0.5 * (np.roll(q, 1, 0) + np.roll(q, -1, 0)) - q)
+                    q = q - 0.42 * (0.5 * (np.roll(q, 1, 0) + np.roll(q, -1, 0)) - q)
+                    p = np.vstack([q, q[0:1]])
+                else:
+                    p[1:-1] = p[1:-1] + 0.40 * (0.5 * (p[:-2] + p[2:]) - p[1:-1])
+                    p[1:-1] = p[1:-1] - 0.42 * (0.5 * (p[:-2] + p[2:]) - p[1:-1])
+                d = p - p0
+                dn = np.hypot(d[:, 0], d[:, 1])
+                m = dn > 0.06
+                if m.any():
+                    p[m] = p0[m] + d[m] * (0.06 / dn[m, None])
+            # Clamp any vertex that stepped outside safe_zone back to p0
+            inside = shapely.contains_xy(safe_zone, p[:, 0], p[:, 1])
+            if not np.all(inside):
+                p[~inside] = p0[~inside]
+            pts_arr = p
+
+        if len(pts_arr) >= 3:
+            ls_s = LineString(pts_arr).simplify(0.05, preserve_topology=False)
+            if len(ls_s.coords) >= 2:
+                pts_arr = np.asarray(ls_s.coords, dtype=np.float64)
+
+        arc_mvs = IS.fit_arcs_to_polyline(pts_arr, tol=0.07)
+        if not arc_mvs:
+            return atom
+        for mv in arc_mvs:
+            if mv[0] == "G1":
+                _, x0, y0, x1, y1, dl = mv
+                all_moves.append(("G1", x0, y0, x1, y1, 0.0, 0.0, dl * e_per_mm, dl, med_lw, f_run))
+            else:
+                cmd, x0, y0, x1, y1, I, J, dl = mv
+                all_moves.append((cmd, x0, y0, x1, y1, I, J, dl * e_per_mm, dl, med_lw, f_run))
+
+    if not all_moves:
+        return atom
+    ext_mvs = [(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in all_moves]
+    st = (all_moves[0][1], all_moves[0][2])
+    en = (all_moves[-1][3], all_moves[-1][4])
+    is_cl = math.hypot(en[0] - st[0], en[1] - st[1]) < 0.05
+    return dict(
+        kind="IW",
+        is_wall=True,
+        start_feat="Inner wall",
+        feats={"Inner wall"},
+        moves=all_moves,
+        ext_moves=ext_mvs,
+        start=st,
+        end=en,
+        is_closed=is_cl,
+        width=float(all_moves[0][9]),
+        feed_F=float(all_moves[0][10]),
+        in_F=float(all_moves[0][10]),
+        in_acc=atom["in_acc"],
+        in_fan=dict(atom["in_fan"]),
+        out_F=float(all_moves[-1][10]),
+        out_acc=atom["in_acc"],
+        out_fan=dict(atom["out_fan"]),
+        wipe_trail=_wipe_trail_from_moves(ext_mvs),
+    )
+
+
+def _kept_footprint_from_atoms(kept_atoms, overlap=0.063):
+    """Build exact kept polygon footprint from finalized kept atoms (K and IW)."""
+    by_r = collections.defaultdict(list)
+    for a in kept_atoms:
+        mvs = a.get("moves") if a["kind"] == "IW" else a.get("ext_moves_full", [])
+        cur_pts = []
+        cur_r = None
+        for mv in mvs:
+            cmd, x0, y0, x1, y1, I, J = mv[:7]
+            lw = mv[9]
+            r = round(max(0.5 * lw - overlap, 0.05), 3)
+            pts = (
+                IS._sample_arc(cmd, x0, y0, x1, y1, I, J)
+                if (cmd in ("G2", "G3") and (abs(I) > 1e-9 or abs(J) > 1e-9))
+                else [(x0, y0), (x1, y1)]
+            )
+            if cur_r == r and cur_pts and math.hypot(cur_pts[-1][0] - pts[0][0], cur_pts[-1][1] - pts[0][1]) < 0.05:
+                cur_pts.extend(pts[1:])
+            else:
+                if len(cur_pts) >= 2 and cur_r is not None:
+                    by_r[cur_r].append(LineString(cur_pts))
+                cur_r = r
+                cur_pts = list(pts)
+        if len(cur_pts) >= 2 and cur_r is not None:
+            by_r[cur_r].append(LineString(cur_pts))
+    polys = [
+        shapely.MultiLineString(llist).buffer(r, cap_style=1, join_style=1, quad_segs=2)
+        for r, llist in by_r.items()
+        if llist
+    ]
+    return shapely.ops.unary_union(polys) if polys else Polygon()
+
+
 # ---------------- Worker for Parallel Layer Geometry Generation ----------------
 def _process_layer_geom(task):
     L, seg, x_st, y_st, F_st, acc_st, fan_st, solid_wkb, flat_wkb, stagger_layers = task
@@ -444,7 +608,13 @@ def _process_layer_geom(task):
     kept_atoms, end_xy, end_F, end_acc, end_fan, base_fan = _extract_kept_atoms(
         seg, x_st, y_st, F_st, acc_st, fan_st, flat_mask
     )
-    kept_foot = IS.compute_kept_footprint(seg, x_st, y_st, flat_mask, overlap=0.063)
+    kept_atoms = [
+        _optimize_inner_wall_atom(a, solid_poly, fair=False)
+        if (a["kind"] == "K" and a["feats"] == {"Inner wall"} and len(a.get("ext_moves_full", [])) >= 3)
+        else a
+        for a in kept_atoms
+    ]
+    kept_foot = _kept_footprint_from_atoms(kept_atoms, overlap=0.063)
     res = IS.generate_layer_interior(solid_poly, kept_foot, L, stagger_layers=stagger_layers)
     spiral_atoms = [_wrap_spiral_atom(sa, base_fan) for sa in res["atoms"]]
     return L, kept_atoms, spiral_atoms, end_xy, end_F, end_acc, end_fan
@@ -484,7 +654,7 @@ def _assign_islands_and_precedence(atoms, solid_poly):
     iw = []
     iw_geos = []
     for i, a in enumerate(atoms):
-        if a["kind"] == "K" and "Inner wall" in a["feats"] and not (OUTER_FEATS & a["feats"]):
+        if a["kind"] in ("K", "IW") and "Inner wall" in a["feats"] and not (OUTER_FEATS & a["feats"]):
             segs = [
                 ((m[1], m[2]), (m[3], m[4]))
                 for m in a["ext_moves"]
@@ -526,7 +696,7 @@ def _can_comb(p0, p1, prev_is_wall, next_is_wall, shrunk_solid):
     if prev_is_wall or next_is_wall or shrunk_solid is None or shrunk_solid.is_empty:
         return False
     d = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-    if not (RETRACT_MIN <= d <= 20.0):
+    if not (RETRACT_MIN <= d <= 15.0):
         return False
     return bool(shrunk_solid.contains(LineString([p0, p1])))
 
@@ -563,7 +733,7 @@ def _order_layer_atoms(atoms, p0, shrunk_solid, use_combing):
         best_c = 1e18
         for i in avail:
             a = atoms[i]
-            if a["kind"] == "S" and a["is_closed"]:
+            if a["kind"] in ("S", "IW") and a["is_closed"]:
                 # Closest vertex on closed loop
                 mvs = a["moves"]
                 pts = np.array([(m[1], m[2]) for m in mvs], dtype=np.float64)
@@ -574,7 +744,7 @@ def _order_layer_atoms(atoms, p0, shrunk_solid, use_combing):
                 if c < best_c:
                     best_c = c
                     best = (i, False, st, st)
-            elif a["kind"] == "S" and not a["is_closed"]:
+            elif a["kind"] in ("S", "IW") and not a["is_closed"]:
                 for rev in (False, True):
                     st = a["end"] if rev else a["start"]
                     en = a["start"] if rev else a["end"]
@@ -604,7 +774,7 @@ def _order_layer_atoms(atoms, p0, shrunk_solid, use_combing):
         pts_list = []
         for idx, rev, st in seq_list:
             a = atoms[idx]
-            if a["kind"] == "S" and a["is_closed"]:
+            if a["kind"] in ("S", "IW") and a["is_closed"]:
                 pts_list.append((st, st))
             elif rev:
                 pts_list.append((a["end"], a["start"]))
@@ -723,12 +893,10 @@ class _Emitter:
         self.f = 1800.0
 
     def comb_travel(self, dst):
-        self.w(f"G1 E-{fmt_num(WIPE_E + RET_E, 5)} F1800")
         self.set_acc(TRAVEL_ACC)
         self.w(f"G1 X{fmt_num(dst[0])} Y{fmt_num(dst[1])} F{TRAVEL_F}")
-        self.w(f"G1 E{fmt_num(DER_E, 5)} F1800")
         self.x, self.y = dst[0], dst[1]
-        self.f = 1800.0
+        self.f = float(TRAVEL_F)
 
     def short_travel(self, dst, to_outer):
         self.set_acc(SHORT_OUTER_ACC if to_outer else TRAVEL_ACC)
@@ -750,7 +918,7 @@ class _Emitter:
             self.fan = dict(atom["out_fan"])
             return
 
-        # Spiral / core atom
+        # Spiral / core / optimized Inner wall atom
         self.set_fan(atom["in_fan"])
         self.ensure_g17()
         self.w(f"; FEATURE: {atom['start_feat']}")
@@ -761,7 +929,7 @@ class _Emitter:
             mvs = _reverse_moves(mvs)
 
         cur_w = None
-        self.set_acc(20000.0)
+        self.set_acc(atom["in_acc"] if atom["kind"] == "IW" else 20000.0)
         for cmd, x0, y0, x1, y1, I, J, de, _, w_mv, f_mv in mvs:
             if cur_w is None or abs(w_mv - cur_w) > 1e-4:
                 self.w(f"; LINE_WIDTH: {fmt_num(w_mv, 3)}")
@@ -772,6 +940,20 @@ class _Emitter:
             else:
                 self.w(f"{cmd} X{fmt_num(x1)} Y{fmt_num(y1)} I{fmt_num(I)} J{fmt_num(J)} E{fmt_num(de, 5)}")
             self.x, self.y = x1, y1
+
+
+def _atom_wipe_trail(atom, rev, rot_xy):
+    """Compute backward wipe trail from the actual end of an emitted (possibly rotated/reversed) atom."""
+    if atom["kind"] in ("S", "IW"):
+        mvs = atom["moves"]
+        if atom["is_closed"] and rot_xy is not None:
+            mvs = _rotate_closed_moves(mvs, rot_xy)
+        elif rev:
+            mvs = _reverse_moves(mvs)
+        else:
+            return atom["wipe_trail"]
+        return _wipe_trail_from_moves([(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in mvs])
+    return atom["wipe_trail"]
 
 
 def _rewrite_metadata(lines, sim_scale, total_e_mm):
@@ -813,9 +995,9 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
 
     # Baseline Stage-1 timing and Bambu prediction
     t_stage1_sim, _, cat_before, _ = GT.simulate(lines)
-    m_bambu = re.search(r"model printing time: (\d+)h (\d+)m (\d+)s", raw_text[:3000])
+    m_bambu = re.search(r"model printing time: (?:(\d+)h\s*)?(?:(\d+)m\s*)?(\d+)s", raw_text[:3000])
     bambu_s = (
-        int(m_bambu.group(1)) * 3600 + int(m_bambu.group(2)) * 60 + int(m_bambu.group(3))
+        int(m_bambu.group(1) or 0) * 3600 + int(m_bambu.group(2) or 0) * 60 + int(m_bambu.group(3))
         if m_bambu
         else t_stage1_sim
     )
@@ -959,6 +1141,7 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
     prev_planned = False
     prev_last_atom = None
     prev_last_rev = False
+    prev_last_rot = None
     stats = []
     tot_zhop = 0
     tot_comb = 0
@@ -969,17 +1152,22 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
         head, init_wipe, keep_hdr, first_travel, body, tail_meta = layer_sections[k]
         z_cur = layer_zs[k]
 
-        if L not in layer_plans:
-            # Unmodified layer (Layer 1 or Layer N)
+        order = None
+        if L in layer_plans:
+            kept_atoms, spiral_atoms = layer_plans[L]
+            all_atoms = kept_atoms + spiral_atoms
+            if all_atoms:
+                _assign_islands_and_precedence(all_atoms, solids[k])
+                shrunk = solids[k].buffer(-0.55) if not solids[k].is_empty else Polygon()
+                order = _order_layer_atoms(all_atoms, (em.x, em.y), shrunk, use_combing)
+
+        if not order:
+            # Unmodified layer (Layer 1, Layer N, or empty degenerate layer)
             for ln in head:
                 em.w(ln)
             if prev_planned and prev_last_atom is not None:
                 # Replace original init_wipe with planned Layer N-1 wipe+retract, then lift to Stage1's first XY!
-                trail = prev_last_atom["wipe_trail"]
-                if prev_last_rev and prev_last_atom["kind"] == "S":
-                    # Reversed atom wipe trail from start instead of end
-                    mvs_r = _reverse_moves(prev_last_atom["moves"])
-                    trail = _wipe_trail_from_moves([(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in mvs_r])
+                trail = _atom_wipe_trail(prev_last_atom, prev_last_rev, prev_last_rot)
                 em.wipe_retract(trail, prev_last_atom["out_F"])
                 for ln in keep_hdr:
                     em.w(ln)
@@ -1035,19 +1223,10 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
             prev_planned = False
             continue
 
-        kept_atoms, spiral_atoms = layer_plans[L]
-        all_atoms = kept_atoms + spiral_atoms
-        _assign_islands_and_precedence(all_atoms, solids[k])
-        shrunk = solids[k].buffer(-0.55) if not solids[k].is_empty else Polygon()
-        order = _order_layer_atoms(all_atoms, (em.x, em.y), shrunk, use_combing)
-
         for ln in head:
             em.w(ln)
         if prev_planned and prev_last_atom is not None:
-            trail = prev_last_atom["wipe_trail"]
-            if prev_last_rev and prev_last_atom["kind"] == "S":
-                mvs_r = _reverse_moves(prev_last_atom["moves"])
-                trail = _wipe_trail_from_moves([(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in mvs_r])
+            trail = _atom_wipe_trail(prev_last_atom, prev_last_rev, prev_last_rot)
             em.wipe_retract(trail, prev_last_atom["out_F"])
         else:
             for ln in init_wipe:
@@ -1073,7 +1252,7 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
                 prev_a = all_atoms[order[q - 1][0]]
                 st_xy = (
                     rot_xy
-                    if (a["kind"] == "S" and a["is_closed"])
+                    if (a["kind"] in ("S", "IW") and a["is_closed"])
                     else (a["end"] if rev else a["start"])
                 )
                 d = math.hypot(st_xy[0] - em.x, st_xy[1] - em.y)
@@ -1085,10 +1264,7 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
                     em.comb_travel(st_xy)
                     l_comb += 1
                 else:
-                    trail = prev_a["wipe_trail"]
-                    if order[q - 1][1] and prev_a["kind"] == "S":
-                        mvs_r = _reverse_moves(prev_a["moves"])
-                        trail = _wipe_trail_from_moves([(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in mvs_r])
+                    trail = _atom_wipe_trail(prev_a, order[q - 1][1], order[q - 1][2])
                     em.wipe_retract(trail, prev_a["out_F"])
                     em.lift_travel(z_cur, st_xy, z_cur)
                     l_zhop += 1
@@ -1100,6 +1276,7 @@ def plan_3mf(src_3mf, out_3mf, report_path=None, use_combing=True, stagger_layer
         prev_planned = True
         prev_last_atom = all_atoms[order[-1][0]]
         prev_last_rev = order[-1][1]
+        prev_last_rot = order[-1][2]
         tot_zhop += l_zhop
         tot_comb += l_comb
         tot_short += l_short

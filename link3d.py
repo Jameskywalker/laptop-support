@@ -692,24 +692,58 @@ def to_print(G, v):
     return v - np.array([HALF + UE, G.V0, 0.0])
 
 
-def export_mesh(G, B, fn, smooth=0.6):
+def _polys(g):
+    if g.is_empty:
+        return []
+    return [g] if g.geom_type == "Polygon" else [p for p in getattr(g, "geoms", []) if p.geom_type == "Polygon"]
+
+
+def overhang_check(man, zmax, lh=P.LAYER_H, ang=45.0, bridge=2.0, tol=0.05):
+    """按层高切片：每层超出下一层外扩 lh·tan(ang) + tol 的部分算悬空（窄于 bridge 的短桥单独统计）"""
+    off = lh * np.tan(np.deg2rad(ang)) + tol
+    zs = np.arange(lh / 2, zmax, lh)
+    prev = None; tot = 0.0; tot_b = 0.0; worst = (0.0, 0.0); per = []
+    for z in zs:
+        cs = man.slice(float(z))
+        rings = [Polygon(r).buffer(0) for r in cs.to_polygons() if len(r) >= 3]
+        g = Polygon()
+        for r in rings:
+            g = g.symmetric_difference(r)
+        if prev is not None:
+            un = [p for p in _polys(g.difference(prev.buffer(off, join_style="round", quad_segs=4))) if p.area > 0.05]
+            wide = [p for p in un if not p.buffer(-bridge / 2).is_empty]
+            a = [p.area for p in wide]
+            tot += sum(a); per.append(sum(a)); tot_b += sum(p.area for p in un) - sum(a)
+            if a and max(a) > worst[0]:
+                worst = (max(a), float(z))
+        prev = g
+    return dict(悬空总面积_mm2=round(tot, 2), 最大单块_mm2=round(worst[0], 3), 最大单块高度_mm=round(worst[1], 2),
+                有悬空的层数=int(sum(1 for a in per if a > 0)), 短桥面积_mm2=round(tot_b, 2), 层数=len(zs))
+
+
+def export_field(G, xi, B, iso="xi"):
+    """生成等值面导出用的三维场：iso='xi' 保留连续密度场（只把 binarize 剔除的悬空/碎块压零），iso='binary' 用二值体素"""
+    if iso == "xi":
+        xi_clean = np.where(B | (xi <= 0.5), xi, 0.0)
+        return np.where(G.design3, xi_clean, G.solid3.astype(float))
+    return B.astype(float)
+
+
+def export_mesh(G, F, fn, smooth=0.0, simp_tol=0.02):
     import manifold3d as m3d
     import trimesh
     from scipy.ndimage import gaussian_filter
     from skimage import measure
 
-    def polys(g):
-        return [g] if g.geom_type == "Polygon" else [p for p in getattr(g, "geoms", []) if p.geom_type == "Polygon"]
-
     def extrude(geom, z0, z1):
         parts = []
-        for p in polys(geom):
+        for p in _polys(geom):
             p = shapely.geometry.polygon.orient(p, 1.0)
             rings = [np.asarray(p.exterior.coords)[:-1]] + [np.asarray(i.coords)[:-1] for i in p.interiors]
             parts.append(m3d.Manifold.extrude(m3d.CrossSection(rings, m3d.FillRule.EvenOdd), z1 - z0).translate((0, 0, z0)))
         return m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
     h = G.h; pz = 3
-    F = B.astype(np.float32)
+    F = np.asarray(F, np.float32)
     F = np.concatenate([F[:, :, pz - 1::-1], F, F[:, :, :-pz - 1:-1]], 2)
     if smooth > 0:
         F = gaussian_filter(F, smooth)
@@ -725,11 +759,19 @@ def export_mesh(G, B, fn, smooth=0.6):
     fixed = pg["fing"].union(pg["band"]).difference(pg["cut"])
     mesh = (mesh ^ allowed) + extrude(fixed, 0, TS)
     mesh = mesh.translate((-(HALF + UE), -G.V0, 0.0))
+    if simp_tol and simp_tol > 0:
+        mesh = mesh.simplify(simp_tol)
+    parts = mesh.decompose()
+    cav = sorted([-p.volume() for p in parts if p.volume() < 0])
+    bodies = int(sum(p.volume() > 0 for p in parts))
     mm = mesh.to_mesh()
     tm = trimesh.Trimesh(np.asarray(mm.vert_properties)[:, :3], np.asarray(mm.tri_verts), process=False)
     tm.export(fn)
-    return dict(volume_cm3=round(mesh.volume() / 1000, 2), mass_g=round(mesh.volume() / 1000 * RHO, 1), watertight=bool(tm.is_watertight),
-                bbox_mm=[round(float(x), 1) for x in (tm.bounds[1] - tm.bounds[0])], genus=int(mesh.genus()))
+    oh = overhang_check(mesh, float(tm.bounds[1][2]))
+    meta = dict(volume_cm3=round(mesh.volume() / 1000, 2), mass_g=round(mesh.volume() / 1000 * RHO, 1), watertight=bool(tm.is_watertight),
+                bbox_mm=[round(float(x), 1) for x in (tm.bounds[1] - tm.bounds[0])], genus=int(mesh.genus()),
+                faces=int(len(tm.faces)), bodies=bodies, cavities_mm3=[round(float(v), 1) for v in cav])
+    return meta, oh
 
 
 # ======================= 图 =======================
@@ -765,7 +807,7 @@ def fig_check(G, cases, ref, fn):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--part", choices=("panel", "beam"), required=True)
-    ap.add_argument("--h", type=float, default=0.5)
+    ap.add_argument("--h", type=float, default=None, help="体素边长 mm（默认 0.5；--mesh-only 时默认取 report.json 的 h）")
     ap.add_argument("--H", type=float, default=None, help="杆身最大厚度 mm（面板默认 16，后横梁默认 32）")
     ap.add_argument("--width", type=float, default=None, help="后横梁设计范围前后总宽（默认 80）")
     ap.add_argument("--mass_g", type=float, default=None, help="用料目标 g（面板默认 60，后横梁 30；按 1.24 g/cm³ 实心）")
@@ -798,6 +840,11 @@ def main():
     ap.add_argument("--test_L", type=float, default=None, help="自检用：把两支撑内侧面间距改小（mm），网格小一点")
     ap.add_argument("--bilateral", action="store_true", help="自检用：接触全按双向")
     ap.add_argument("--post_only", action="store_true", help="跳过优化，读 --out/result.npz 做二值化、复核、导出")
+    ap.add_argument("--iso", default="xi", choices=("xi", "binary"), help="等值面用的场：xi = 保留优化连续密度场（平滑亚体素轮廓，默认）；binary = 0/1 二值体素")
+    ap.add_argument("--smooth", type=float, default=None, help="高斯平滑半径（体素）；默认 xi 时 0.0，binary 时 0.6")
+    ap.add_argument("--simp", type=float, default=0.02, help="manifold 简化容差 mm（0 = 不简化）")
+    ap.add_argument("--mesh-only", action="store_true", help="跳过有限元复核，复用已有 report.json，仅按 --iso / --smooth 重导 STL 并做悬空检查")
+    ap.add_argument("--report-from", default=None, help="--mesh-only 时读取的 report.json 路径（默认 --out/report.json）")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     global HALF, L, BILATERAL
@@ -807,6 +854,31 @@ def main():
     out = a.out or f"{P.OUT_DIR}/link3d_{a.part}"
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
+    smooth_val = (0.0 if a.iso == "xi" else 0.6) if a.smooth is None else a.smooth
+    if a.mesh_only:
+        rsrc = a.report_from or f"{out}/report.json"
+        rep = json.load(open(rsrc))
+        h_val = a.h if a.h is not None else rep["h"]
+        H_val = a.H if a.H is not None else rep.get("H")
+        G = Geo(a.part, h_val, H_val, a.width)
+        if os.path.exists(f"{out}/result.npz"):
+            xi = np.load(f"{out}/result.npz")["xi"].astype(float)
+            B, binfo = binarize(G, xi)
+        elif a.iso == "binary" and os.path.exists(f"{out}/binary.npz"):
+            B = np.load(f"{out}/binary.npz")["B"].astype(bool)
+            xi = B.astype(float)
+            binfo = rep.get("binarize", {})
+        else:
+            raise FileNotFoundError(f"{out}/result.npz 不存在（--iso xi 需要连续密度场 result.npz）")
+        F = export_field(G, xi, B, a.iso)
+        stl_meta, oh = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp)
+        rep.update(stl=stl_meta, overhang=oh, iso=a.iso, smooth=smooth_val, binarize=binfo)
+        json.dump(rep, open(f"{out}/report.json", "w"), ensure_ascii=False, indent=1, default=float)
+        print(f"--mesh-only ({a.part}, h={G.h}, iso={a.iso}, smooth={smooth_val:g}): STL={stl_meta}", flush=True)
+        print("悬空检查：", oh, flush=True)
+        print(f"完成 {time.time() - t0:.1f}s", flush=True)
+        return
+    a.h = 0.5 if a.h is None else a.h
     G = Geo(a.part, a.h, a.H, a.width)
     c = G.contacts(); cases = make_cases(G, a.weights)
     print(f"{a.part}: 网格 {G.NX}×{G.NY}×{G.NZ}（h={G.h} mm，厚 {G.H} mm），{G.NX * G.NY * G.NZ / 1e6:.2f} M 体素；设计 {int(G.design3.sum()) / 1e6:.2f} M，"
@@ -881,8 +953,12 @@ def main():
     np.savez_compressed(f"{out}/binary.npz", B=B, h=G.h, a0=G.a0, v0=G.v0)
     rep.update(new=new, ratio=ratio.tolist(), weighted=float(w @ ratio / w.sum()), mass_g=round(mass / 1000 * RHO, 1), proj_mm2=proj, binarize=binfo)
     try:
-        rep["stl"] = export_mesh(G, B, f"{out}/{a.part}_3d.stl")
+        F = export_field(G, xi, B, a.iso)
+        rep["stl"], rep["overhang"] = export_mesh(G, F, f"{out}/{a.part}_3d.stl", smooth=smooth_val, simp_tol=a.simp)
+        rep["iso"] = a.iso
+        rep["smooth"] = smooth_val
         print("STL:", rep["stl"], flush=True)
+        print("悬空检查：", rep["overhang"], flush=True)
     except Exception as e:
         print("导出 STL 失败:", e, flush=True)
     fig_layers(G, B.astype(float), f"{out}/layers_binary.png", f"{a.part} 二值化，加权柔度比 {rep['weighted']:.3f}")

@@ -58,13 +58,13 @@ tr.sum td { font-weight: 600; }
   <header>
     <div class="eyebrow">desk40 · 插指 + U 形卡子端头</div>
     <h1>面板与后横梁的三维无填充优化</h1>
-    <p class="lead">两件都改成全实心、不加填充打印，悬空不超过 45°，最薄 1.9 mm。和现在的插指版（二维轮廓拉伸 16 mm，3 圈墙 + 15% 填充）比各工况柔度，比值越小越硬。数字都是用非线性单向接触在同一张 0.5 mm 网格上复核的。</p>
+    <p class="lead">两件都改成全实心、不加填充打印，悬空不超过 45°，最薄 1.9 mm。和现在的插指版（二维轮廓拉伸 16 mm，3 圈墙 + 15% 填充）比各工况柔度，比值越小越硬。数字都是用非线性单向接触在同一张三维体素网格上复核的。</p>
   </header>
   <div id="parts"></div>
   <div class="notes" id="notes">
-    <p>柔度比 = 三维版柔度 / 现在零件柔度，每个工况按 10 N 或 2 N·m 加在一侧支撑上，另一侧固定。面内、面外两组权重之和相同。</p>
+    <p>柔度比 = 三维版柔度 / 现在零件柔度，每个工况按 10 N 或 2 N·m 加在一侧支撑上，另一侧固定。现行正式版采用 relaxed 权重（面内 ~85% / 面外保底 ~15%）；旧版采用面内、面外各 50% 权重。</p>
     <p>接触按零间隙算：方槽单边 0.2 mm、卡子腿 0.2 mm 的间隙没计入，真实接头先要走完间隙才开始受力。</p>
-    <p>STL 是体素等值面平滑后导出的显示用网格，还不是最终打印件；插指、台肩、缺口按精确几何拼上。</p>
+    <p>STL 默认由优化输出的连续密度场 ξ 取 0.5 等值面并按 0.2 mm 层高做 45° 悬空检查后导出；插指、台肩、缺口按精确几何拼上。</p>
     <p>剖切滑块沿横向（X）切开零件，看杆身截面。剖面露出的是零件内壁，颜色较深。</p>
   </div>
 </div>
@@ -89,8 +89,8 @@ const tint = r => r < 0.95 ? "good" : r > 1.05 ? "bad" : "";
 function buildPart(P) {
   const sec = document.createElement("section"); sec.className = "part";
   const best = P.designs.slice(1).reduce((a, b) => (b.weighted < a.weighted ? b : a));
-  const LEAD = { beam: "杆身中段长成一根闭口尖顶管（宽约 32、高约 24 mm，屋脊 45°，打印时不用支撑），快到两端时分成两条臂接到插指上。两个三维版只是起步形状不同。",
-    panel: "外框是 16 mm 满高的前缘、顶缘边梁，中间是竖立的薄片 X 斜撑。83 g 是你选的重量；107 g 和现在的面板同重，用来看三维本身好多少。" };
+  const LEAD = { beam: "现行正式版为 29 g 轻量化均衡版（高 16 mm 的底面 X 桁架 + 两侧贯通立肋，不超槽高）；旧版 51 g 为 26 mm 高闭口尖顶管（legacy 权重），留作对照。",
+    panel: "现行正式版为 60 g 轻量化窄 X 撑版（深腹 X 斜撑 + 四角三角撑，约 90% 透空，核心侧向错动比旧版更硬）；旧版 83 g（legacy 权重）留作对照。" };
   sec.innerHTML = '<div class="eyebrow">' + (P.part === "beam" ? "rear beam" : "panel") + '</div><h2>' + P.name + '</h2><p class="lead">' + (LEAD[P.part] || "") + '</p>' +
     '<div class="grid"><div class="viewer"><canvas></canvas><div class="controls"><div class="chips"></div>' +
     '<label class="cut">剖切 X<input type="range" min="-130" max="130" step="0.5" value="130"><output></output></label></div>' +
